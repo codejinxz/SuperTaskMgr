@@ -5,6 +5,7 @@
 #include "app/Theme.h"
 #include "app/Win32Window.h"
 #include "app/ui/Pages.h"
+#include "app/ui/Tray.h"
 #include "core/FsUtil.h"
 #include "core/Log.h"
 #include "core/Str.h"
@@ -47,7 +48,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     const int smokeFrames = ParseSmokeFrames();
 
     LogInit(LogDir());
-    STM_LOG_INFO("app", L"启动（phase2 skeleton, elevated=%s, smoke=%d）",
+    STM_LOG_INFO("app", L"启动（phase2 UI, elevated={}, smoke={}）",
                  IsProcessElevated() ? L"1" : L"0", smokeFrames);
 
     ops::SingleInstance si;
@@ -67,6 +68,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
 
     RegisterPages(ctx);
+    if (hasSession) ApplySession(ctx, session);
     if (!ctx.collect.Start(hasSession ? ClampInterval(session.intervalMs)
                                       : ClampInterval(ctx.cfg.GetInt(L"intervalMs", 1000)))) {
         MessageBoxW(nullptr, L"采集服务启动失败。", L"错误", MB_OK | MB_ICONERROR);
@@ -84,6 +86,12 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     WindowCallbacks cbs;
     cbs.quit = &ctx.wantExit;
     cbs.onResize = [](void* ud, int w, int h) { static_cast<D3DRenderer*>(ud)->Resize(w, h); };
+    ui::Tray tray;
+    // Tray messages ride the window-proc hook (Win32Window exposes no other way in).
+    cbs.onMessage = [&tray](HWND h, UINT msg, WPARAM wParam, LPARAM lParam,
+                            bool* handled) -> LRESULT {
+        return tray.HandleMessage(h, msg, wParam, lParam, handled);
+    };
     cbs.ud = &renderer;
     if (!win.Create(inst, L"超级任务管理器", 1280, 800, cmdShow, cbs)) {
         STM_LOG_ERROR("app", L"窗口创建失败");
@@ -96,6 +104,28 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     ImGuiLayer ui;
     if (!ui.Init(win.Hwnd(), &renderer)) return 1;
     Theme::Apply();
+
+    // Tray icon: skipped under --smoke (CI renders headless-ish, no shell icon churn).
+    if (smokeFrames == 0 && tray.Create(win.Hwnd(), ctx.elevated)) {
+        const HWND hwnd = win.Hwnd();
+        tray.onToggleWindow = [hwnd]() {
+            if (IsWindowVisible(hwnd)) {
+                ShowWindow(hwnd, SW_HIDE);
+            } else {
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            }
+        };
+        tray.onShowWindow = [hwnd]() {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        };
+        tray.onRestartElevated = [&ctx, &win]() {
+            SaveSessionFromCtx(ctx, win.Hwnd());
+            if (ops::RelaunchAsAdmin(L"--relaunched")) ctx.wantExit = true;
+        };
+        tray.onExit = [&ctx]() { ctx.wantExit = true; };
+    }
 
     if (hasSession && session.winW > 100 && session.winH > 100) {
         MoveWindow(win.Hwnd(), session.winX, session.winY, session.winW, session.winH, FALSE);
@@ -116,10 +146,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         QueryPerformanceCounter(&t0);
         renderer.BeginFrame();
         ui.NewFrame();
-        DrawShell(ctx);
-        // notifications -> status toasts are a phase-2 UI task; drain to keep queue clean
-        std::vector<Notification> drained;
-        ctx.notes.Drain(&drained);
+        DrawShell(ctx);  // drains notifications into toasts; one snapshot read per frame
         ui.Render();
         renderer.Present();
         QueryPerformanceCounter(&t1);
@@ -129,8 +156,10 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
 
     if (smokeFrames == 0) {
+        SaveSessionFromCtx(ctx, win.Hwnd());  // window rect / page / selection handoff
         ctx.cfg.Save(ConfigPath());
     }
+    tray.Remove();
     ctx.collect.Stop();
     ctx.jobs.Shutdown(2000);
     ui.Shutdown();

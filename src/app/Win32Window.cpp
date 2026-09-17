@@ -15,6 +15,11 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return 1;
 
     MainWindow* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    if (self && self->cbs_.onMessage) {
+        bool handled = false;
+        const LRESULT r = self->cbs_.onMessage(hWnd, msg, wParam, lParam, &handled);
+        if (handled) return r;
+    }
     switch (msg) {
         case WM_SIZE:
             if (self && self->cbs_.onResize && wParam != SIZE_MINIMIZED) {

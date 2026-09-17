@@ -1,13 +1,17 @@
 #pragma once
 // Win32 top-level window hosting the D3D11 swap chain (thin shell; no business logic).
 #include <windows.h>
+#include <functional>
 
 namespace stm {
 
 struct WindowCallbacks {
-    bool* quit = nullptr;                                    // set on WM_DESTROY
-    void (*onResize)(void* ud, int w, int h) = nullptr;      // WM_SIZE (w/h may be 0 while minimizing)
+    bool* quit = nullptr;                                // set on WM_DESTROY
+    void (*onResize)(void* ud, int w, int h) = nullptr;  // WM_SIZE (w/h may be 0 while minimizing)
     void* ud = nullptr;
+    // Optional custom-message hook (tray icon etc.). Runs before the built-in switch;
+    // set *handled=true (and return the result) to skip the default handling.
+    std::function<LRESULT(HWND, UINT, WPARAM, LPARAM, bool* handled)> onMessage;
 };
 
 class MainWindow {

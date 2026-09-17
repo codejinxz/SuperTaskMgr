@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
+#include "implot.h"
 
 namespace stm {
 
@@ -23,6 +24,7 @@ bool ImGuiLayer::Init(HWND hwnd, D3DRenderer* renderer, float fontSizePx) {
     hwnd_ = hwnd;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext();  // performance page charts
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;  // we persist layout in our own config
@@ -54,6 +56,7 @@ bool ImGuiLayer::Init(HWND hwnd, D3DRenderer* renderer, float fontSizePx) {
 }
 
 void ImGuiLayer::Shutdown() {
+    ImPlot::DestroyContext();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
