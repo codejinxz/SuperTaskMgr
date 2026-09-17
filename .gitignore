@@ -1,0 +1,9 @@
+build*/
+out/
+.vs/
+*.user
+vcpkg_installed/
+*.pdb
+*.ilk
+*.obj
+*.log
