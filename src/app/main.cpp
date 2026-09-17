@@ -6,6 +6,7 @@
 #include "app/Win32Window.h"
 #include "app/ui/Pages.h"
 #include "app/ui/Tray.h"
+#include "app/ui3/Pages3.h"
 #include "core/FsUtil.h"
 #include "core/Log.h"
 #include "core/Str.h"
@@ -76,6 +77,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     RegisterPages(*ctx);
     if (hasSession) ApplySession(*ctx, session);
     BindAppContext(ctx);
+    ui3::BindPhase3Context(ctx);  // phase-3 pages use the same lifetime pattern
     if (!ctx->collect.Start(hasSession ? ClampInterval(session.intervalMs)
                                        : ClampInterval(ctx->cfg.GetInt(L"intervalMs", 1000)))) {
         MessageBoxW(nullptr, L"采集服务启动失败。", L"错误", MB_OK | MB_ICONERROR);
@@ -134,7 +136,14 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
             if (ops::RelaunchAsAdmin(L"--relaunched")) ctx->wantExit = true;
         };
         tray.onExit = [ctx]() { ctx->wantExit = true; };
+        // Phase-3 alerts fire tray balloons through the same icon (additive).
+        ui3::SetBalloonSink([&tray](const std::wstring& title, const std::wstring& text) {
+            tray.ShowBalloon(title, text);
+        });
     }
+    // Under --smoke every page's Draw is exercised in an offscreen window so
+    // the new tabs' empty/error states are covered by the CI smoke run.
+    ui3::SetSmokeDrawAll(smokeFrames > 0);
 
     if (hasSession && session.winW > 100 && session.winH > 100) {
         MoveWindow(win.Hwnd(), session.winX, session.winY, session.winW, session.winH, FALSE);
@@ -169,6 +178,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         ctx->cfg.Save(ConfigPath());
     }
     tray.Remove();
+    ui3::SetBalloonSink(nullptr);  // P2-7: sink captured &tray; drop before teardown
     // Stops collection and gives in-flight ops jobs up to 2 s; anything still
     // running afterwards survives on ctx's shared_ptr (see comment above).
     ctx->collect.Stop();

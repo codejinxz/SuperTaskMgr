@@ -20,6 +20,9 @@ public:
     bool Create(HWND owner, bool elevated);
     void Remove();  // idempotent
     void SetTip(const std::wstring& tip);
+    // Phase-3 alerts: Shell_NotifyIconW balloon (NIF_INFO). No-op while the
+    // icon is not installed (e.g. under --smoke).
+    void ShowBalloon(const std::wstring& title, const std::wstring& text);
 
     // Plug into MainWindow's onMessage hook. Sets *handled=true for messages this
     // class consumes (callback message, TaskbarCreated); caller must then return

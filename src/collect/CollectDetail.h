@@ -3,12 +3,16 @@
 // Only src/collect/CollectService.h is architect-owned and frozen; everything
 // declared here is private to the collection library and may change freely.
 #include <windows.h>
+#include <evntcons.h>  // EVENT_RECORD (ETW consumer callback payload)
+#include <evntrace.h>  // TRACEHANDLE / session APIs
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "core/ProcData.h"
@@ -180,6 +184,50 @@ private:
     PDH_HQUERY query_ = nullptr;
     PDH_HCOUNTER utilCounter_ = nullptr, dedCounter_ = nullptr, shrCounter_ = nullptr;
     bool pdhFailed_ = false, pdhLogged_ = false;
+};
+
+// ---------------------------------------------------------------------------
+// EtwNetCollector (phase 3, R5 #10b): a private real-time ETW session on the
+// manifest provider Microsoft-Windows-Kernel-Network, aggregating cumulative
+// per-pid recv/send bytes from the recvdata(10)/senddata(11) events. Admin
+// only — Start() fails with a logged error otherwise (feature stays disabled,
+// default OFF). Resource charter (arch §5): session name carries our pid to
+// avoid orphans, a stale same-name session is stopped before start, and the
+// destructor always stops the session and joins the consumer thread.
+// Payload fields are decoded BY NAME via tdh.dll (dynamically bound), never by
+// guessed structure offsets.
+// ---------------------------------------------------------------------------
+class EtwNetCollector {
+public:
+    EtwNetCollector() = default;
+    ~EtwNetCollector();  // Stop()
+    EtwNetCollector(const EtwNetCollector&) = delete;
+    EtwNetCollector& operator=(const EtwNetCollector&) = delete;
+
+    bool Start();   // idempotent; false + err log on failure (non-admin etc.)
+    void Stop();    // idempotent; stops the session and joins the consumer
+    bool Running(); // true while the ETW session is alive
+    // pid -> cumulative recv+send bytes since Start (thread-safe copy).
+    void CopyCumulative(std::unordered_map<uint32_t, uint64_t>* out) const;
+    uint64_t TotalEvents() const;  // recv/send events parsed since Start
+    // True when an ETW session with this name exists (selftest cleanup check).
+    static bool SessionExists(const wchar_t* name);
+
+private:
+    struct Agg { uint64_t recv = 0, send = 0; };
+    static void WINAPI OnEvent(PEVENT_RECORD rec);  // trampoline via .Context
+    void HandleEvent(PEVENT_RECORD rec);
+    void Consume();  // consumer thread: OpenTrace -> ProcessTrace -> CloseTrace
+
+    TRACEHANDLE session_ = 0;       // from StartTraceW
+    TRACEHANDLE openTrace_ = 0;     // from OpenTraceW (closed by the consumer)
+    std::wstring sessionName_;      // L"SuperTaskMgr-Net-<pid>"
+    std::vector<BYTE> stopProps_;   // ControlTraceW buffer (guarded by mu_)
+    std::thread consumer_;
+    mutable std::mutex mu_;  // guards everything below (callback + owner)
+    std::unordered_map<uint32_t, Agg> bytes_;
+    uint64_t totalEvents_ = 0;
+    uint64_t parseFails_ = 0;
 };
 
 // ---------------------------------------------------------------------------

@@ -87,7 +87,13 @@ void JobQueue::Run() {
             jobs_.pop_front();
             busy_ = true;
         }
-        job();
+        try {
+            job();  // producer exceptions must not kill the worker (phase-3 review V10-P2)
+        } catch (const std::exception& e) {
+            STM_LOG_ERROR("jobs", L"任务 seq={} 抛出异常: {}", seq, Utf8ToWide(e.what()));
+        } catch (...) {
+            STM_LOG_ERROR("jobs", L"任务 seq={} 抛出未知异常", seq);
+        }
         {
             std::lock_guard<std::mutex> lock(mu_);
             busy_ = false;

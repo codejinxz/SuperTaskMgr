@@ -59,6 +59,19 @@ void Tray::SetTip(const std::wstring& tip) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+void Tray::ShowBalloon(const std::wstring& title, const std::wstring& text) {
+    if (!added_) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = owner_;
+    nid.uID = kIconId;
+    nid.uFlags = NIF_INFO;
+    wcsncpy_s(nid.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(nid.szInfo, text.c_str(), _TRUNCATE);
+    nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
 LRESULT Tray::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, bool* handled) {
     (void)wParam;
     *handled = false;

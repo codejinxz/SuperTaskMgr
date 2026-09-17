@@ -7,6 +7,7 @@
 #include "app/ui/SortKey.h"
 #include "app/ui/UiText.h"
 #include "app/ui/VersionInfo.h"
+#include "app/ui3/Pages3.h"  // phase-3 extension tabs + shell hooks (additive)
 #include "core/ProcData.h"
 #include "core/ProtectedList.h"
 #include "core/Str.h"
@@ -1077,6 +1078,7 @@ public:
 
         const SystemInfo& sys = Ui().snap ? Ui().snap->sys : SystemInfo{};
         DrawMemoryBars(sys);
+        ui3::DrawAlertControls(ctx);  // phase-3: threshold alert controls (additive row)
     }
 
 private:
@@ -1262,6 +1264,7 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
 void RegisterPages(AppContext& ctx) {
     ctx.pages.push_back(std::make_unique<ProcessesPage>());
     ctx.pages.push_back(std::make_unique<PerfPage>());
+    ui3::RegisterPhase3Pages(ctx);  // phase-3: 网络/启动项/服务/驱动/传感器
 }
 
 void BindAppContext(std::shared_ptr<AppContext> ctx) {
@@ -1308,6 +1311,7 @@ void DrawShell(AppContext& ctx) {
     Ui().snap = ctx.collect.Store().Get();
     AppendHistory(*Ui().snap);
     DrainNotifications(ctx);
+    ui3::AlertTick(ctx);  // phase-3: threshold alert watcher (default off)
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
@@ -1336,6 +1340,7 @@ void DrawShell(AppContext& ctx) {
     ImGui::End();
     ImGui::PopStyleVar();
 
+    ui3::DrawSmokeAllPages(ctx);  // phase-3: --smoke exercises every page offscreen
     DrawToasts();
     DrawConfirmDialogs();
 }

@@ -81,6 +81,9 @@ struct CollectService::Impl {
     cd::ProcessCollector procCol;
     cd::SystemCollector sysCol;
     cd::GpuCollector gpuCol;
+    // ---- ETW per-pid network rates (phase 3; default OFF, admin only) ------
+    cd::EtwNetCollector netEtw;
+    std::unordered_map<uint32_t, uint64_t> prevNetBytes_;  // pid -> cumulative bytes at prev tick
     // ---- self-check gate (runs once, on the first tick) ----
     bool gateDone = false;
     bool degraded = false;
@@ -146,7 +149,7 @@ struct CollectService::Impl {
         snap->tickId = tickId;
         snap->degraded = degraded;
         snap->degradeReason = degradeReason;
-        snap->caps = 0;  // CAP_NET_ETW only when ETW actually runs (phase 3)
+        snap->caps = 0;  // CAP_NET_ETW set below only while ETW actually runs
 
         cd::ProcessCollector::TickOut pt;
         procCol.Collect(tickId, degraded, &pt);
@@ -157,6 +160,39 @@ struct CollectService::Impl {
             snap->degraded = true;
             snap->degradeReason = L"NtQuerySystemInformation 本次调用失败，本 tick 使用兼容路径";
         }
+
+        // --- ETW per-process net rates (phase 3, R5 #10b) -------------------
+        // EtwNetCollector accumulates CUMULATIVE per-pid recv+send bytes on its
+        // consumer thread; the (pid -> bytes/s) differential happens HERE in
+        // the synthesis phase rather than inside ProcessCollector: the ETW
+        // state lives in this Impl, so this is the smallest change and leaves
+        // the ProcessCollector fast path untouched. ETW events carry pids only
+        // (no createTime): a pid recycled mid-window is a phase-3 approximation.
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            const bool etwOn = netEtwEnabled;
+            if (etwOn && netEtw.Running()) {
+                std::unordered_map<uint32_t, uint64_t> cum;
+                netEtw.CopyCumulative(&cum);
+                if (!prevNetBytes_.empty() && pt.elapsedSec > 0.0) {
+                    for (ProcInfo& p : snap->procs) {
+                        const auto it = cum.find(p.key.pid);
+                        const auto pit = prevNetBytes_.find(p.key.pid);
+                        if (it == cum.end() || pit == prevNetBytes_.end()) continue;
+                        const uint64_t now = it->second;
+                        const uint64_t was = pit->second;
+                        if (now >= was) {  // counter regression (restart) -> skip tick
+                            p.netBytesPerSec = static_cast<double>(now - was) / pt.elapsedSec;
+                        }
+                    }
+                }
+                prevNetBytes_ = std::move(cum);
+                snap->caps |= CAP_NET_ETW;
+            } else {
+                prevNetBytes_.clear();
+            }
+        }
+
         sysCol.Collect(pt, &snap->sys);
 
         // GPU on its own cadence; ticks in between reuse the last result.
@@ -272,13 +308,28 @@ bool CollectService::GpuEnabled() const {
 }
 
 void CollectService::SetNetEtwEnabled(bool on) {
+    // Start/Stop block briefly (session control + consumer join) but never call
+    // back into the service, so holding mu_ is safe; lock order is always
+    // Impl::mu_ -> EtwNetCollector::mu_.
     std::lock_guard<std::mutex> lock(impl_->mu);
-    impl_->netEtwEnabled = on;  // ETW kernel-network arrives in phase 3
+    if (impl_->netEtwEnabled == on) return;
+    if (on) {
+        // Failure (non-admin etc.) is logged inside Start and the feature
+        // stays disabled — honest, never half-enabled.
+        if (impl_->netEtw.Start()) impl_->netEtwEnabled = true;
+    } else {
+        impl_->netEtw.Stop();
+        impl_->netEtwEnabled = false;
+    }
 }
 
 bool CollectService::NetEtwEnabled() const {
+    // V9 P0-4: readback must be the REAL state, not just the request flag —
+    // start-failure (flag never set) and a session that died after a
+    // successful start (flag stale) both report false so the UI can roll the
+    // toggle back honestly.
     std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->netEtwEnabled;
+    return impl_->netEtwEnabled && impl_->netEtw.Running();
 }
 
 }  // namespace stm
