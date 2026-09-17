@@ -62,6 +62,11 @@ struct ConfirmRequest {
 
 struct UiState {
     std::shared_ptr<const Snapshot> snap;  // one Store().Get() per frame (shell owns it)
+    // Owning handle registered by main (BindAppContext). Job lambdas capture it BY
+    // VALUE so an in-flight job outlives main's teardown: JobQueue::Shutdown detaches
+    // a timed-out worker, and this capture keeps notes/jobs/details alive until the
+    // job finishes, whichever thread drops the last reference.
+    std::shared_ptr<AppContext> liveCtx;
     std::deque<Toast> toasts;
     std::wstring lastNote;                  // survives toast expiry for the status bar
     ConfirmRequest confirm;
@@ -103,30 +108,36 @@ std::wstring FailSuffix(bool elevated) {
                     : std::wstring(L"（可能需要管理员权限，可尝试提权重启）");
 }
 
-void SubmitKill(AppContext& ctx, const ProcKey& key, const std::wstring& name) {
-    NotificationQueue* notes = &ctx.notes;
-    const bool elevated = ctx.elevated;
-    ctx.jobs.Submit([notes, elevated, key, name] {
+// Every job captures the shared AppContext by value: the capture holds notes/jobs/
+// details alive even if main tears down while this job is still in flight
+// (JobQueue::Shutdown detaches after its wait timeout). Never touch the raw
+// AppContext& from inside a job.
+void SubmitKill(const ProcKey& key, const std::wstring& name) {
+    std::shared_ptr<AppContext> app = Ui().liveCtx;
+    if (!app) return;
+    const bool elevated = app->elevated;
+    app->jobs.Submit([app, elevated, key, name] {
         std::wstring err;
         if (ops::TerminateProcessById(key, &err)) {
-            PostNote(*notes, Notification::Kind::JobDone,
+            PostNote(app->notes, Notification::Kind::JobDone,
                      Fmt(L"已终止进程 {} ({})", name, key.pid));
         } else {
-            PostNote(*notes, Notification::Kind::JobFailed,
+            PostNote(app->notes, Notification::Kind::JobFailed,
                      Fmt(L"终止 {} ({}) 失败：{}{}", name, key.pid,
                          err.empty() ? std::wstring(L"未知错误") : err, FailSuffix(elevated)));
         }
     });
 }
 
-void SubmitKillTree(AppContext& ctx, const ProcKey& key, const std::wstring& name) {
-    NotificationQueue* notes = &ctx.notes;
-    const bool elevated = ctx.elevated;
-    ctx.jobs.Submit([notes, elevated, key, name] {
+void SubmitKillTree(const ProcKey& key, const std::wstring& name) {
+    std::shared_ptr<AppContext> app = Ui().liveCtx;
+    if (!app) return;
+    const bool elevated = app->elevated;
+    app->jobs.Submit([app, elevated, key, name] {
         ops::TreeResult r;
         std::wstring err;
         if (!ops::TerminateTree(key, &r, &err)) {
-            PostNote(*notes, Notification::Kind::JobFailed,
+            PostNote(app->notes, Notification::Kind::JobFailed,
                      Fmt(L"终止进程树 {} ({}) 失败：{}{}", name, key.pid,
                          err.empty() ? std::wstring(L"未知错误") : err, FailSuffix(elevated)));
             return;
@@ -134,43 +145,45 @@ void SubmitKillTree(AppContext& ctx, const ProcKey& key, const std::wstring& nam
         std::wstring text = Fmt(L"已终止进程树 {} ({})：终止 {} 个", name, key.pid, r.terminated);
         if (r.skippedProtected > 0) text += Fmt(L"，跳过保护进程 {} 个", r.skippedProtected);
         if (r.failed > 0) text += Fmt(L"，失败 {} 个", r.failed);
-        PostNote(*notes, r.failed > 0 ? Notification::Kind::Warn : Notification::Kind::JobDone,
+        PostNote(app->notes, r.failed > 0 ? Notification::Kind::Warn : Notification::Kind::JobDone,
                  text);
     });
 }
 
-void SubmitTrimWorkingSet(AppContext& ctx, const ProcKey& key, const std::wstring& name) {
-    NotificationQueue* notes = &ctx.notes;
-    const bool elevated = ctx.elevated;
-    ctx.jobs.Submit([notes, elevated, key, name] {
+void SubmitTrimWorkingSet(const ProcKey& key, const std::wstring& name) {
+    std::shared_ptr<AppContext> app = Ui().liveCtx;
+    if (!app) return;
+    const bool elevated = app->elevated;
+    app->jobs.Submit([app, elevated, key, name] {
         std::wstring err;
         if (ops::TrimWorkingSet(key, &err)) {
-            PostNote(*notes, Notification::Kind::JobDone,
+            PostNote(app->notes, Notification::Kind::JobDone,
                      Fmt(L"已请求释放 {} ({}) 的工作集内存", name, key.pid));
         } else {
-            PostNote(*notes, Notification::Kind::JobFailed,
+            PostNote(app->notes, Notification::Kind::JobFailed,
                      Fmt(L"释放 {} ({}) 工作集失败：{}{}", name, key.pid,
                          err.empty() ? std::wstring(L"未知错误") : err, FailSuffix(elevated)));
         }
     });
 }
 
-void SubmitPurgeStandby(AppContext& ctx) {
-    NotificationQueue* notes = &ctx.notes;
-    const bool elevated = ctx.elevated;
-    ctx.jobs.Submit([notes, elevated] {
+void SubmitPurgeStandby() {
+    std::shared_ptr<AppContext> app = Ui().liveCtx;
+    if (!app) return;
+    const bool elevated = app->elevated;
+    app->jobs.Submit([app, elevated] {
         std::wstring err;
         if (ops::PurgeStandbyList(&err)) {
-            PostNote(*notes, Notification::Kind::JobDone, L"已清理系统待机列表");
+            PostNote(app->notes, Notification::Kind::JobDone, L"已清理系统待机列表");
         } else {
-            PostNote(*notes, Notification::Kind::JobFailed,
+            PostNote(app->notes, Notification::Kind::JobFailed,
                      Fmt(L"清理待机列表失败：{}{}", err.empty() ? std::wstring(L"未知错误") : err,
                          FailSuffix(elevated)));
         }
     });
 }
 
-void RequestTreePlan(AppContext& ctx, const ProcInfo& p) {
+void RequestTreePlan(const ProcInfo& p) {
     auto& req = Ui().confirm;
     req = ConfirmRequest{};
     req.kind = ConfirmKind::KillTree;
@@ -180,16 +193,17 @@ void RequestTreePlan(AppContext& ctx, const ProcInfo& p) {
     req.path = p.path;
     req.serviceHost = (p.flags & PF_ServiceHost) != 0;
     req.planCount = std::make_shared<std::atomic<int>>(-1);
+    std::shared_ptr<AppContext> app = Ui().liveCtx;
+    if (!app) return;
     std::shared_ptr<std::atomic<int>> plan = req.planCount;
-    NotificationQueue* notes = &ctx.notes;
-    ctx.jobs.Submit([notes, key = p.key, plan] {
+    app->jobs.Submit([app, key = p.key, plan] {
         std::vector<ProcKey> members;
         std::wstring err;
         if (ops::PlanTerminateTree(key, &members, &err)) {
             plan->store(static_cast<int>(members.size()));
         } else {
             plan->store(-2);
-            PostNote(*notes, Notification::Kind::JobFailed,
+            PostNote(app->notes, Notification::Kind::JobFailed,
                      Fmt(L"无法规划进程树：{}", err.empty() ? std::wstring(L"未知错误") : err));
         }
     });
@@ -283,7 +297,7 @@ void DrawToasts() {
 // Confirm dialogs (modal, centered; two-stage destructive-op gate).
 // ===========================================================================
 
-void DrawConfirmDialogs(AppContext& ctx) {
+void DrawConfirmDialogs() {
     ConfirmRequest& req = Ui().confirm;
     if (req.kind == ConfirmKind::None) return;
 
@@ -333,7 +347,10 @@ void DrawConfirmDialogs(AppContext& ctx) {
             ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
             int planned = -1;
             if (req.planCount) planned = req.planCount->load();
-            ImGui::TextUnformatted(U8(Fmt(L"预计终止 {} 个进程（执行时可能变化）", planned)));
+            // PlanTerminateTree returns descendants only; TreeResult.planned includes
+            // the root, so display planned + 1 (target included) to match that count.
+            ImGui::TextUnformatted(
+                U8(Fmt(L"预计终止 {} 个（含目标进程，执行时可能变化）", planned + 1)));
             if (req.serviceHost) {
                 ImGui::TextColored(ColFail(), "%s",
                                    U8(L"警告：该进程是服务宿主，终止将影响其承载的全部服务。"));
@@ -357,19 +374,27 @@ void DrawConfirmDialogs(AppContext& ctx) {
     }
 
     ImGui::Separator();
-    if (ImGui::Button(U8(action), ImVec2(120.0f, 0.0f))) {
-        switch (req.kind) {
-            case ConfirmKind::Kill: SubmitKill(ctx, req.key, req.name); break;
-            case ConfirmKind::KillTree: SubmitKillTree(ctx, req.key, req.name); break;
-            case ConfirmKind::TrimWorkingSet: SubmitTrimWorkingSet(ctx, req.key, req.name); break;
-            case ConfirmKind::PurgeStandby: SubmitPurgeStandby(ctx); break;
-            default: break;
-        }
+    // V8-P1-2: keyboard focus lands on CANCEL (not the destructive action), and the
+    // action button is removed from keyboard nav entirely, so Space/Enter in the
+    // freshly opened modal can never fire a terminate.
+    ImGui::SetKeyboardFocusHere(0);
+    if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
         req = ConfirmRequest{};
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    const bool actionPressed =
+        ImGui::Button(U8(action), ImVec2(120.0f, 0.0f));
+    ImGui::PopItemFlag();
+    if (actionPressed) {
+        switch (req.kind) {
+            case ConfirmKind::Kill: SubmitKill(req.key, req.name); break;
+            case ConfirmKind::KillTree: SubmitKillTree(req.key, req.name); break;
+            case ConfirmKind::TrimWorkingSet: SubmitTrimWorkingSet(req.key, req.name); break;
+            case ConfirmKind::PurgeStandby: SubmitPurgeStandby(); break;
+            default: break;
+        }
         req = ConfirmRequest{};
         ImGui::CloseCurrentPopup();
     }
@@ -579,7 +604,12 @@ private:
 
     // ---- filtering / sorting -----------------------------------------------
     void UpdateFilter() {
-        filterWide_ = Utf8ToWide(filterUtf8_);
+        // Lowercase the needle once here; ContainsLower lowercases the haystack per
+        // row. Matching is case-insensitive for ASCII ("Chrome" matches chrome.exe).
+        std::wstring needle = Utf8ToWide(filterUtf8_);
+        std::transform(needle.begin(), needle.end(), needle.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+        filterWide_ = std::move(needle);
         if (filterWide_ != lastFilterWide_) {
             lastFilterWide_ = filterWide_;
             rebuildNeeded_ = true;
@@ -801,9 +831,10 @@ private:
         }
         ImGui::BeginDisabled(protectedProc);
         if (ImGui::MenuItem(U8(L"终止进程"))) RequestConfirmKill(p);
-        if (ImGui::MenuItem(U8(L"终止进程树"))) RequestTreePlan(ctx, p);
-        ImGui::EndDisabled();
+        if (ImGui::MenuItem(U8(L"终止进程树"))) RequestTreePlan(p);
+        // V8-P1-1: trim is a destructive op too — same gate as the terminate items.
         if (ImGui::MenuItem(U8(L"释放工作集"))) RequestConfirmTrim(p);
+        ImGui::EndDisabled();
         ImGui::Separator();
         if (ImGui::MenuItem(U8(L"复制名称"))) ImGui::SetClipboardText(U8(p.name));
         ImGui::BeginDisabled(p.path.empty());
@@ -1233,6 +1264,12 @@ void RegisterPages(AppContext& ctx) {
     ctx.pages.push_back(std::make_unique<PerfPage>());
 }
 
+void BindAppContext(std::shared_ptr<AppContext> ctx) {
+    // main registers its owning handle here before the frame loop; ops job lambdas
+    // capture it so in-flight jobs survive teardown (V7-P1-3).
+    Ui().liveCtx = std::move(ctx);
+}
+
 void ApplySession(AppContext& ctx, const ops::SessionState& s) {
     if (!ctx.pages.empty()) {
         int page = s.page;
@@ -1300,7 +1337,7 @@ void DrawShell(AppContext& ctx) {
     ImGui::PopStyleVar();
 
     DrawToasts();
-    DrawConfirmDialogs(ctx);
+    DrawConfirmDialogs();
 }
 
 }  // namespace stm

@@ -21,6 +21,7 @@
 #include <tlhelp32.h>
 #include <algorithm>
 #include <cstddef>
+#include <cwchar>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -305,6 +306,19 @@ std::wstring QueryImagePath(uint32_t pid) {
     return std::wstring(buf, len);
 }
 
+// True when `path` lives inside the Windows directory (case-insensitive prefix match).
+// Conservative on failure: an undeterminable system root counts as "inside".
+bool IsUnderSystemRoot(const std::wstring& path) {
+    wchar_t winDir[MAX_PATH]{};
+    UINT n = GetSystemWindowsDirectoryW(winDir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) n = GetWindowsDirectoryW(winDir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return true;
+    if (path.size() < n) return false;
+    if (_wcsnicmp(path.c_str(), winDir, n) != 0) return false;
+    const wchar_t next = n < path.size() ? path[n] : L'\0';
+    return next == L'\0' || next == L'\\' || next == L'/';
+}
+
 std::wstring FindImageNameBySnapshot(uint32_t pid) {
     HANDLE raw = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (raw == INVALID_HANDLE_VALUE) return {};
@@ -407,6 +421,15 @@ bool TerminateTree(const ProcKey& root, TreeResult* out, std::wstring* err) {
 }
 
 bool TrimWorkingSet(const ProcKey& key, std::wstring* err) {
+    // Hard gate: the protected list applies to EmptyWorkingSet too (V8-P1-1) — trimming a
+    // critical process is a denial-of-service, so refuse before touching the process,
+    // same as TerminateProcessById.
+    const std::wstring reason = ProtectedReason(key, L"", L"");
+    if (!reason.empty()) {
+        if (err) *err = L"已拒绝释放工作集：" + reason + L"（保护名单强制拦截）";
+        STM_LOG_INFO("ops", L"工作集释放被保护名单拦截 pid={}", key.pid);
+        return false;
+    }
     UniqueHandle h;
     bool seDebugHeld = false;
     const OpenVerdict v = OpenVerified(key,
@@ -457,15 +480,24 @@ bool PurgeStandbyList(std::wstring* err) {
 }
 
 std::wstring ProtectedReason(const ProcKey& key, const std::wstring& name, const std::wstring& path) {
-    if (key.pid <= 4) return stm::ProtectedReason(key.pid, name, path);  // idle/System need no name
-    if (!name.empty()) return stm::ProtectedReason(key.pid, name, path);
-    // No name provided by the caller: resolve it on demand (handle path first, then a
-    // Toolhelp scan), then run the list check with the resolved identity.
-    const std::wstring resolvedPath = QueryImagePath(key.pid);
-    const std::wstring resolvedName =
-        resolvedPath.empty() ? FindImageNameBySnapshot(key.pid) : ImageNameFromPath(resolvedPath);
-    return stm::ProtectedReason(key.pid, resolvedName,
-                                resolvedPath.empty() ? path : resolvedPath);
+    // pid 0/4 are decided by the core list and stay protected regardless of name/path.
+    if (key.pid <= 4) return stm::ProtectedReason(key.pid, name, path);
+    // Resolve identity on demand when the caller only has a ProcKey (handle path first,
+    // then a Toolhelp scan).
+    std::wstring useName = name;
+    std::wstring usePath = path;
+    if (useName.empty()) {
+        usePath = QueryImagePath(key.pid);
+        useName = usePath.empty() ? FindImageNameBySnapshot(key.pid) : ImageNameFromPath(usePath);
+    }
+    const std::wstring reason = stm::ProtectedReason(key.pid, useName, usePath);
+    if (reason.empty()) return {};
+    // V8-P2 hardening: a bare image-name match is not enough. When the image path is known
+    // and clearly outside the Windows directory, the process merely shares a name with a
+    // system process (same-name spoof) and is NOT protected. An unknown path stays
+    // protected (conservative; e.g. tree members only carry snapshot names).
+    if (!usePath.empty() && !IsUnderSystemRoot(usePath)) return {};
+    return reason;
 }
 
 }  // namespace stm::ops

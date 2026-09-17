@@ -31,6 +31,9 @@ bool IsTotalInstance(const std::wstring& inst) { return inst == L"_Total"; }
 
 }  // namespace
 
+// Closing the query also releases the counters bound to it (review V7-P1-1).
+SystemCollector::~SystemCollector() { PdhCloseQuerySafe(&pdhQuery_); }
+
 // PDH disk rates + hard faults. All counters are wildcard/plain English paths
 // added once; the disk instance set is tracked by PDH itself and read back via
 // the formatted array (no rebuild). Rate counters need two collects inside the
@@ -110,8 +113,21 @@ void SystemCollector::CollectNet(SystemInfo* out, double elapsedSec) {
     }
     ::FreeMibTable(tbl);
     if (haveNetPrev_ && elapsedSec > 0.0) {
-        out->netRecvBps = static_cast<double>(recv - prevRecv_) / elapsedSec;
-        out->netSendBps = static_cast<double>(send - prevSend_) / elapsedSec;
+        // Interface-set changes (VPN torn down, NIC hot-unplugged, counter
+        // reset) make the summed octets REGRESS; the unsigned delta would wrap
+        // to ~1.8e19 and show a bogus spike (review V6-P1-2). Report kUnavail
+        // for this tick; prev updates either way so the next tick is valid
+        // again against the new baseline. Recv/send regress independently.
+        if (recv >= prevRecv_) {
+            out->netRecvBps = static_cast<double>(recv - prevRecv_) / elapsedSec;
+        } else {
+            out->netRecvBps = kUnavail;
+        }
+        if (send >= prevSend_) {
+            out->netSendBps = static_cast<double>(send - prevSend_) / elapsedSec;
+        } else {
+            out->netSendBps = kUnavail;
+        }
     }
     prevRecv_ = recv;
     prevSend_ = send;

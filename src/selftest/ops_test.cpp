@@ -128,6 +128,58 @@ STM_TEST(ops_trim_self) {
     return true;
 }
 
+// Protection gate applies to TrimWorkingSet too (V8-P1-1): dwm.exe is on the list and
+// non-PPL, so without the gate it would actually be trimmed.
+STM_TEST(ops_trim_protected_refusal) {
+    const uint32_t pid = FindPidByName(L"dwm.exe");
+    if (pid == 0) return true;  // exotic environment: skip silently
+    const stm::ProcKey key{pid, CreateTimeOf(pid)};
+    std::wstring e;
+    if (stm::ops::TrimWorkingSet(key, &e)) {
+        *err = L"dwm.exe 的工作集释放未被保护名单拦截";
+        return false;
+    }
+    if (e.find(L"保护") == std::wstring::npos) {
+        *err = L"拒绝信息未提及保护原因：" + e;
+        return false;
+    }
+    return true;
+}
+
+// V8-P2 anti-spoof: a process that merely shares a protected image name but lives
+// outside %SystemRoot% is NOT protected — its working set may be trimmed.
+STM_TEST(ops_trim_same_name_allowed) {
+    wchar_t temp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, temp) == 0) return true;  // env skip
+    const std::wstring fakePath = std::wstring(temp) + L"dwm.exe";
+    if (_wcsnicmp(fakePath.c_str(), L"C:\\Windows\\", 11) == 0) return true;  // env guard
+    if (!CopyFileW(L"C:\\Windows\\System32\\cmd.exe", fakePath.c_str(), FALSE)) return true;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    wchar_t cmdLine[] = L"dwm.exe /c ping -n 10 127.0.0.1";
+    if (!CreateProcessW(fakePath.c_str(), cmdLine, nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &si, &pi)) {
+        DeleteFileW(fakePath.c_str());
+        return true;  // AV/policy may refuse to run a dwm.exe-named binary: env skip
+    }
+    stm::UniqueHandle procGuard(pi.hProcess);
+    stm::UniqueHandle threadGuard(pi.hThread);
+    const stm::ProcKey key{pi.dwProcessId, CreateTimeOf(pi.dwProcessId)};
+
+    std::wstring e;
+    const bool ok = stm::ops::TrimWorkingSet(key, &e);
+    TerminateProcess(procGuard.get(), 1);
+    WaitForSingleObject(procGuard.get(), 5000);
+    DeleteFileW(fakePath.c_str());
+    if (!ok) {
+        *err = L"同名进程（路径在 %SystemRoot% 外）不应被保护名单拦截：" + e;
+        return false;
+    }
+    return true;
+}
+
 // Spawn cmd.exe -> ping.exe (two levels), plan the tree, then terminate it leaf-first.
 STM_TEST(ops_tree_plan) {
     STARTUPINFOW si{};

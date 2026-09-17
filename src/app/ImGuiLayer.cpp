@@ -50,8 +50,19 @@ bool ImGuiLayer::Init(HWND hwnd, D3DRenderer* renderer, float fontSizePx) {
         io.Fonts->AddFontDefault();
     }
 
-    if (!ImGui_ImplWin32_Init(hwnd)) return false;
-    if (!ImGui_ImplDX11_Init(renderer->Device(), renderer->Context())) return false;
+    if (!ImGui_ImplWin32_Init(hwnd)) {
+        // V7-P1-4: roll back what Init already created (ImPlot + ImGui contexts,
+        // font atlas) instead of leaking them on backend failure.
+        ImPlot::DestroyContext();
+        ImGui::DestroyContext();
+        return false;
+    }
+    if (!ImGui_ImplDX11_Init(renderer->Device(), renderer->Context())) {
+        ImGui_ImplWin32_Shutdown();
+        ImPlot::DestroyContext();
+        ImGui::DestroyContext();
+        return false;
+    }
     return true;
 }
 

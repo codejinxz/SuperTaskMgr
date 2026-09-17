@@ -13,10 +13,9 @@
 #include "ops/SessionState.h"
 #include "ops/SingleInstance.h"
 #include "core/Privilege.h"
+#include <memory>
 #include <shellapi.h>
-#include <cstdlib>
 #include <string>
-#include <vector>
 
 namespace stm {
 namespace {
@@ -60,22 +59,30 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     ops::SessionState session;
     const bool hasSession = ops::LoadSession(&session);
 
-    AppContext ctx;
-    ctx.elevated = ops::IsElevated();
-    ctx.details = std::make_unique<ops::DetailsProvider>(ctx.jobs, ctx.notes);
-    if (!ctx.cfg.Load(ConfigPath())) {
+    // V7-P1-3: AppContext lives in a shared_ptr. Ops job lambdas capture this handle
+    // by value (registered via BindAppContext), so a job still running after
+    // JobQueue::Shutdown's wait timeout (worker detached) keeps notes/jobs/details
+    // alive until it finishes — the queues' lifetime is extended with the context
+    // instead of being freed under a detached worker. If the last reference drops
+    // on the detached worker thread itself, ~JobQueue is still safe: after detach
+    // the thread object is non-joinable and Shutdown(0) returns without joining.
+    const std::shared_ptr<AppContext> ctx = std::make_shared<AppContext>();
+    ctx->elevated = ops::IsElevated();
+    ctx->details = std::make_unique<ops::DetailsProvider>(ctx->jobs, ctx->notes);
+    if (!ctx->cfg.Load(ConfigPath())) {
         STM_LOG_INFO("app", L"配置缺失或损坏，使用默认设置");
     }
 
-    RegisterPages(ctx);
-    if (hasSession) ApplySession(ctx, session);
-    if (!ctx.collect.Start(hasSession ? ClampInterval(session.intervalMs)
-                                      : ClampInterval(ctx.cfg.GetInt(L"intervalMs", 1000)))) {
+    RegisterPages(*ctx);
+    if (hasSession) ApplySession(*ctx, session);
+    BindAppContext(ctx);
+    if (!ctx->collect.Start(hasSession ? ClampInterval(session.intervalMs)
+                                       : ClampInterval(ctx->cfg.GetInt(L"intervalMs", 1000)))) {
         MessageBoxW(nullptr, L"采集服务启动失败。", L"错误", MB_OK | MB_ICONERROR);
         return 1;
     }
-    if (!ctx.jobs.Start()) {
-        ctx.collect.Stop();
+    if (!ctx->jobs.Start()) {
+        ctx->collect.Stop();
         MessageBoxW(nullptr, L"操作线程启动失败。", L"错误", MB_OK | MB_ICONERROR);
         return 1;
     }
@@ -84,7 +91,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     D3DRenderer renderer;
     MainWindow win;
     WindowCallbacks cbs;
-    cbs.quit = &ctx.wantExit;
+    cbs.quit = &ctx->wantExit;
     cbs.onResize = [](void* ud, int w, int h) { static_cast<D3DRenderer*>(ud)->Resize(w, h); };
     ui::Tray tray;
     // Tray messages ride the window-proc hook (Win32Window exposes no other way in).
@@ -106,7 +113,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     Theme::Apply();
 
     // Tray icon: skipped under --smoke (CI renders headless-ish, no shell icon churn).
-    if (smokeFrames == 0 && tray.Create(win.Hwnd(), ctx.elevated)) {
+    if (smokeFrames == 0 && tray.Create(win.Hwnd(), ctx->elevated)) {
         const HWND hwnd = win.Hwnd();
         tray.onToggleWindow = [hwnd]() {
             if (IsWindowVisible(hwnd)) {
@@ -120,11 +127,13 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
         };
-        tray.onRestartElevated = [&ctx, &win]() {
-            SaveSessionFromCtx(ctx, win.Hwnd());
-            if (ops::RelaunchAsAdmin(L"--relaunched")) ctx.wantExit = true;
+        // Capture the shared_ptr by value so these callbacks stay lifetime-safe
+        // regardless of teardown ordering.
+        tray.onRestartElevated = [ctx, &win]() {
+            SaveSessionFromCtx(*ctx, win.Hwnd());
+            if (ops::RelaunchAsAdmin(L"--relaunched")) ctx->wantExit = true;
         };
-        tray.onExit = [&ctx]() { ctx.wantExit = true; };
+        tray.onExit = [ctx]() { ctx->wantExit = true; };
     }
 
     if (hasSession && session.winW > 100 && session.winH > 100) {
@@ -135,33 +144,35 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     int frames = 0;
-    while (!ctx.wantExit) {
+    while (!ctx->wantExit) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if (ctx.wantExit) break;
+        if (ctx->wantExit) break;
 
         QueryPerformanceCounter(&t0);
         renderer.BeginFrame();
         ui.NewFrame();
-        DrawShell(ctx);  // drains notifications into toasts; one snapshot read per frame
+        DrawShell(*ctx);  // drains notifications into toasts; one snapshot read per frame
         ui.Render();
         renderer.Present();
         QueryPerformanceCounter(&t1);
-        ctx.frameMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        ctx->frameMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
 
         if (smokeFrames > 0 && ++frames >= smokeFrames) break;
     }
 
     if (smokeFrames == 0) {
-        SaveSessionFromCtx(ctx, win.Hwnd());  // window rect / page / selection handoff
-        ctx.cfg.Save(ConfigPath());
+        SaveSessionFromCtx(*ctx, win.Hwnd());  // window rect / page / selection handoff
+        ctx->cfg.Save(ConfigPath());
     }
     tray.Remove();
-    ctx.collect.Stop();
-    ctx.jobs.Shutdown(2000);
+    // Stops collection and gives in-flight ops jobs up to 2 s; anything still
+    // running afterwards survives on ctx's shared_ptr (see comment above).
+    ctx->collect.Stop();
+    ctx->jobs.Shutdown(2000);
     ui.Shutdown();
     renderer.Shutdown();
     win.Destroy();

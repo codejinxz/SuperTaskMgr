@@ -156,6 +156,11 @@ bool IsFixedDrivePath(const std::wstring& path) {
 // The frozen DetailsProvider::Entry has no per-kind "attempted" flag and the header must
 // not grow; single-shot bookkeeping for CmdLine is kept in this provider-keyed side map.
 constexpr uint32_t kAttemptedCmdLine = 1u << 0;
+// V7-P1-2: both the per-process cache and the side map must stay bounded. When the cache
+// exceeds kDetailsCacheCap entries, every non-pending entry is dropped and the attempted
+// records of the same key set are trimmed along with it (pending entries survive: their
+// in-flight job writes back through cache_.find, which already tolerates a missing entry).
+constexpr size_t kDetailsCacheCap = 1024;
 std::mutex g_attemptMu;
 std::map<std::pair<const void*, ProcKey>, uint32_t> g_attemptedKinds;
 
@@ -183,6 +188,26 @@ void DetailsProvider::Request(const ProcKey& key, const std::wstring& path, uint
     uint32_t todo = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
+        // V7-P1-2 bound: Invalidate() exists but nothing calls it yet. Integration point
+        // for the UI: after each snapshot, Invalidate() every ProcKey that vanished from
+        // procs (delta set) so selection churn stays under the cap organically. Until
+        // that lands, over capacity drop all non-pending entries here and trim the
+        // attempted records of exactly the dropped key set (side map mirrors the cache).
+        if (cache_.size() > kDetailsCacheCap) {
+            std::vector<ProcKey> dropped;
+            for (auto it = cache_.begin(); it != cache_.end();) {
+                if (it->second.pending) {
+                    ++it;
+                    continue;
+                }
+                dropped.push_back(it->first);
+                it = cache_.erase(it);
+            }
+            if (!dropped.empty()) {
+                std::lock_guard<std::mutex> sideLock(g_attemptMu);
+                for (const ProcKey& k : dropped) g_attemptedKinds.erase({this, k});
+            }
+        }
         Entry* e = BeginEntry(key);  // creates the entry when absent
         if (e->pending) return;      // a fetch for this process is already in flight
         if ((kinds & static_cast<uint32_t>(DetailKind::Signature)) != 0 && !e->data.sigResolved)
@@ -290,6 +315,9 @@ const ProcessDetails* DetailsProvider::Peek(const ProcKey& key) const {
 }
 
 void DetailsProvider::Invalidate(const ProcKey& key) {
+    // UI integration point (arch section 8): call this on the UI thread for every ProcKey
+    // that disappeared between snapshots so the cache tracks the live process set; the
+    // capacity trim in Request() is only the safety net.
     {
         std::lock_guard<std::mutex> lock(mu_);
         cache_.erase(key);

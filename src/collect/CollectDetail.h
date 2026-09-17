@@ -135,6 +135,10 @@ private:
 
 class SystemCollector {
 public:
+    SystemCollector() = default;
+    ~SystemCollector();  // closes the PDH query (review V7-P1-1)
+    SystemCollector(const SystemCollector&) = delete;
+    SystemCollector& operator=(const SystemCollector&) = delete;
     // pt supplies the NtQSI aggregate totals + elapsed seconds for rates.
     void Collect(const ProcessCollector::TickOut& pt, SystemInfo* out);
 
@@ -156,6 +160,10 @@ private:
 
 class GpuCollector {
 public:
+    GpuCollector() = default;
+    ~GpuCollector();  // closes the PDH query (review V7-P1-1)
+    GpuCollector(const GpuCollector&) = delete;
+    GpuCollector& operator=(const GpuCollector&) = delete;
     // Gathers DXGI adapters + PDH GPU Engine / GPU Process Memory counters.
     // createTimeByPid: this tick's process identities for pid matching (R5 #11:
     // GPU counter instances carry pid only; pids absent from the snapshot drop).
