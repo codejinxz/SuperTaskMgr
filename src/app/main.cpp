@@ -1,0 +1,141 @@
+// Application entry: single-instance, session handoff, service wiring, message loop.
+#include "app/AppContext.h"
+#include "app/D3DRenderer.h"
+#include "app/ImGuiLayer.h"
+#include "app/Theme.h"
+#include "app/Win32Window.h"
+#include "app/ui/Pages.h"
+#include "core/FsUtil.h"
+#include "core/Log.h"
+#include "core/Str.h"
+#include "ops/Elevate.h"
+#include "ops/SessionState.h"
+#include "ops/SingleInstance.h"
+#include "core/Privilege.h"
+#include <shellapi.h>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+namespace stm {
+namespace {
+
+int ParseSmokeFrames() {
+    int nArgs = 0;
+    int smoke = 0;
+    LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+    if (args) {
+        for (int i = 1; i + 1 < nArgs; ++i) {
+            if (wcscmp(args[i], L"--smoke") == 0) smoke = _wtoi(args[i + 1]);
+        }
+        LocalFree(args);
+    }
+    return smoke;
+}
+
+uint32_t ClampInterval(int64_t v) {
+    if (v < 500) return 500;
+    if (v > 5000) return 5000;
+    return static_cast<uint32_t>(v);
+}
+
+}  // namespace
+}  // namespace stm
+
+int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
+    using namespace stm;
+    const int smokeFrames = ParseSmokeFrames();
+
+    LogInit(LogDir());
+    STM_LOG_INFO("app", L"启动（phase2 skeleton, elevated=%s, smoke=%d）",
+                 IsProcessElevated() ? L"1" : L"0", smokeFrames);
+
+    ops::SingleInstance si;
+    if (!si.TryAcquire(1000)) {
+        MessageBoxW(nullptr, L"超级任务管理器已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
+    ops::SessionState session;
+    const bool hasSession = ops::LoadSession(&session);
+
+    AppContext ctx;
+    ctx.elevated = ops::IsElevated();
+    ctx.details = std::make_unique<ops::DetailsProvider>(ctx.jobs, ctx.notes);
+    if (!ctx.cfg.Load(ConfigPath())) {
+        STM_LOG_INFO("app", L"配置缺失或损坏，使用默认设置");
+    }
+
+    RegisterPages(ctx);
+    if (!ctx.collect.Start(hasSession ? ClampInterval(session.intervalMs)
+                                      : ClampInterval(ctx.cfg.GetInt(L"intervalMs", 1000)))) {
+        MessageBoxW(nullptr, L"采集服务启动失败。", L"错误", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (!ctx.jobs.Start()) {
+        ctx.collect.Stop();
+        MessageBoxW(nullptr, L"操作线程启动失败。", L"错误", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    MainWindow::EnableDpiAwareness();
+    D3DRenderer renderer;
+    MainWindow win;
+    WindowCallbacks cbs;
+    cbs.quit = &ctx.wantExit;
+    cbs.onResize = [](void* ud, int w, int h) { static_cast<D3DRenderer*>(ud)->Resize(w, h); };
+    cbs.ud = &renderer;
+    if (!win.Create(inst, L"超级任务管理器", 1280, 800, cmdShow, cbs)) {
+        STM_LOG_ERROR("app", L"窗口创建失败");
+        return 1;
+    }
+    if (!renderer.Init(win.Hwnd(), win.Width(), win.Height())) {
+        MessageBoxW(nullptr, L"D3D11 初始化失败（含 WARP 兜底）。", L"错误", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    ImGuiLayer ui;
+    if (!ui.Init(win.Hwnd(), &renderer)) return 1;
+    Theme::Apply();
+
+    if (hasSession && session.winW > 100 && session.winH > 100) {
+        MoveWindow(win.Hwnd(), session.winX, session.winY, session.winW, session.winH, FALSE);
+    }
+
+    // Frame loop: vsync-paced; collection happens on its own thread.
+    LARGE_INTEGER freq{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    int frames = 0;
+    while (!ctx.wantExit) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (ctx.wantExit) break;
+
+        QueryPerformanceCounter(&t0);
+        renderer.BeginFrame();
+        ui.NewFrame();
+        DrawShell(ctx);
+        // notifications -> status toasts are a phase-2 UI task; drain to keep queue clean
+        std::vector<Notification> drained;
+        ctx.notes.Drain(&drained);
+        ui.Render();
+        renderer.Present();
+        QueryPerformanceCounter(&t1);
+        ctx.frameMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+
+        if (smokeFrames > 0 && ++frames >= smokeFrames) break;
+    }
+
+    if (smokeFrames == 0) {
+        ctx.cfg.Save(ConfigPath());
+    }
+    ctx.collect.Stop();
+    ctx.jobs.Shutdown(2000);
+    ui.Shutdown();
+    renderer.Shutdown();
+    win.Destroy();
+    LogShutdown();
+    return 0;
+}
