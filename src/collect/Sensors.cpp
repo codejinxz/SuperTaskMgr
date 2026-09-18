@@ -1,3 +1,4 @@
+
 // Sensors.cpp — phase 3 + F3 extension (contract Sensors.h). Every reading
 // follows the honest trichotomy of R6: Ok = real value from a documented
 // user-mode source; NeedAdmin = source exists but is elevation-gated;
@@ -7,10 +8,16 @@
 //
 //   CPU frequency  CallNtPowerInformation(ProcessorInformation=11)  documented, no admin
 //   CPU per-core % PDH \Processor Information(*)\% Processor Time (documented, R6 §6)
-//   CPU package T  WMI root\WMI\MSAcpi_ThermalZoneTemperature     admin on this box
-//   GPU temp/util  nvml.dll from System32 (driver-supplied) when present; otherwise the
-//                  gpu vector stays EMPTY with an honesty note (IGCL skipped: complex
-//                  interface, see R6 §4). No fake readings for Intel iGPU boxes.
+//   ACPI thermal   WMI root\WMI\MSAcpi_ThermalZoneTemperature — ONE READING PER
+//                  INSTANCE (G-B multi-value: every zone of the instance set,
+//                  label "ACPI 热区 N" + InstanceName); admin on this box
+//   GPU temp/util  nvml.dll from System32 (driver-supplied) when present; per card
+//                  the NVML path expands to per-sensor readings (G-B): temp,
+//                  slowdown temp threshold, power W, GPU util, VRAM util (the two
+//                  nvmlDeviceGetUtilizationRates components), fan; multi-GPU
+//                  enumerated card by card. Absent nvml.dll -> the gpus group
+//                  keeps its PDH content with an honesty note (IGCL skipped:
+//                  complex interface, see R6 §4). No fake readings anywhere.
 //   GPU engine %   PDH \GPU Engine(*)\Utilization Percentage per engtype_* (R6 §4);
 //                  VRAM dedicated/shared via \GPU Adapter Memory(*)
 //   Network        GetIfTable2 per-adapter octet deltas over a shared 350 ms window
@@ -19,7 +26,11 @@
 //   Memory         GlobalMemoryStatusEx + GetPerformanceInfo (K32 bound dynamically)
 //   Disks          MSFT_PhysicalDisk (coarse health) + NVMe health log page 0x02 /
 //                  ATA SMART via SMART_RCV_DRIVE_DATA for temperature + power-on hours
-//                  + spare/wear/critical-warning detail (F3).
+//                  + spare/wear/critical-warning detail (F3). One DiskHealth PER
+//                  physical drive, never aggregated (G-B: confirmed per-disk).
+//   Extra (G-B)    best-effort WMI temperature classes outside the ACPI zone
+//                  (Win32_Temperature, MSStorageDriver_FailurePredictData per-
+//                  drive SMART temps); empty group = nothing found = not shown.
 //   Fans           NeedDriver, always.
 //
 // Blocking call: run on the ops job queue. Never throws; partial results allowed.
@@ -45,18 +56,18 @@
 #include <map>
 #include <memory>
 #include <utility>
-
 namespace stm {
-
 namespace {
-
 // ===========================================================================
 // dynamic helpers (libs not in the link line: oleaut32, powrprof, ws2_32-free)
 // ===========================================================================
 using SysAllocStringFn = BSTR(STDAPICALLTYPE*)(const OLECHAR*);
 using SysFreeStringFn = void(STDAPICALLTYPE*)(BSTR);
+using VariantClearFn = HRESULT(STDAPICALLTYPE*)(VARIANT*);
 using CallNtPowerInformationFn = LONG(WINAPI*)(ULONG, PVOID, ULONG, PVOID, ULONG);
-
+using SafeArrayAccessDataFn = HRESULT(STDAPICALLTYPE*)(SAFEARRAY*, void**);
+using SafeArrayUnaccessDataFn = HRESULT(STDAPICALLTYPE*)(SAFEARRAY*);
+using SafeArrayGetBoundFn = HRESULT(STDAPICALLTYPE*)(SAFEARRAY*, UINT, LONG*);
 SysAllocStringFn SysAlloc() {
     static SysAllocStringFn fn = []() -> SysAllocStringFn {
         const HMODULE h = ::LoadLibraryW(L"oleaut32.dll");
@@ -65,7 +76,6 @@ SysAllocStringFn SysAlloc() {
     }();
     return fn;
 }
-
 SysFreeStringFn SysFree() {
     static SysFreeStringFn fn = []() -> SysFreeStringFn {
         const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
@@ -74,7 +84,55 @@ SysFreeStringFn SysFree() {
     }();
     return fn;
 }
-
+// V15/P1: uniform VARIANT teardown. VariantClear releases whichever resource
+// the property read produced (BSTR, SAFEARRAY incl. its data block, ...) exactly
+// once. The VT_ARRAY|VT_UI1 VendorSpecific path previously paired only
+// Access/UnaccessData and leaked one SAFEARRAY per row on every refresh.
+VariantClearFn VariantClr() {
+    static VariantClearFn fn = []() -> VariantClearFn {
+        const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
+        return h ? reinterpret_cast<VariantClearFn>(::GetProcAddress(h, "VariantClear"))
+                 : nullptr;
+    }();
+    return fn;
+}
+// SAFEARRAY byte access (oleaut32; only the G-B "extra" WMI SMART path needs it).
+SafeArrayAccessDataFn SafeArrAccess() {
+    static SafeArrayAccessDataFn fn = []() -> SafeArrayAccessDataFn {
+        const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
+        return h ? reinterpret_cast<SafeArrayAccessDataFn>(
+                       ::GetProcAddress(h, "SafeArrayAccessData"))
+                 : nullptr;
+    }();
+    return fn;
+}
+SafeArrayUnaccessDataFn SafeArrUnaccess() {
+    static SafeArrayUnaccessDataFn fn = []() -> SafeArrayUnaccessDataFn {
+        const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
+        return h ? reinterpret_cast<SafeArrayUnaccessDataFn>(
+                       ::GetProcAddress(h, "SafeArrayUnaccessData"))
+                 : nullptr;
+    }();
+    return fn;
+}
+SafeArrayGetBoundFn SafeArrLBound() {
+    static SafeArrayGetBoundFn fn = []() -> SafeArrayGetBoundFn {
+        const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
+        return h ? reinterpret_cast<SafeArrayGetBoundFn>(
+                       ::GetProcAddress(h, "SafeArrayGetLBound"))
+                 : nullptr;
+    }();
+    return fn;
+}
+SafeArrayGetBoundFn SafeArrUBound() {
+    static SafeArrayGetBoundFn fn = []() -> SafeArrayGetBoundFn {
+        const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
+        return h ? reinterpret_cast<SafeArrayGetBoundFn>(
+                       ::GetProcAddress(h, "SafeArrayGetUBound"))
+                 : nullptr;
+    }();
+    return fn;
+}
 CallNtPowerInformationFn CallNtPower() {
     static CallNtPowerInformationFn fn = []() -> CallNtPowerInformationFn {
         const HMODULE h = ::LoadLibraryW(L"powrprof.dll");
@@ -84,7 +142,6 @@ CallNtPowerInformationFn CallNtPower() {
     }();
     return fn;
 }
-
 // Scoped BSTR (needs oleaut32, bound above).
 struct Bs {
     BSTR b = nullptr;
@@ -100,7 +157,6 @@ struct Bs {
     Bs& operator=(const Bs&) = delete;
     BSTR get() const { return b; }
 };
-
 template <typename T>
 struct ComPtr {
     T* p = nullptr;
@@ -119,13 +175,11 @@ struct ComPtr {
     T* get() const { return p; }
     explicit operator bool() const { return p != nullptr; }
 };
-
 // Local GUIDs (wbemuuid.lib is not linked).
 constexpr GUID kCLSID_WbemLocator = {
     0x4590f811, 0x1d3a, 0x11d0, {0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
 constexpr GUID kIID_IWbemLocator = {
     0xdc12a687, 0x737f, 0x11cf, {0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
-
 // Local WBEM constants (values per wbemcli.h; named k* to avoid #define drift).
 constexpr HRESULT kWbemAccessDenied = 0x80041003;     // WBEM_E_ACCESS_DENIED
 constexpr HRESULT kWbemNotFound = 0x80041002;         // WBEM_E_NOT_FOUND
@@ -134,7 +188,6 @@ constexpr HRESULT kWbemInvalidNamespace = 0x8004100E; // WBEM_E_INVALID_NAMESPAC
 constexpr HRESULT kEAccessDenied = 0x80070005;        // E_ACCESSDENIED (DCM level)
 constexpr long kFlagForwardOnly = 0x10;               // WBEM_FLAG_FORWARD_ONLY
 constexpr long kFlagReturnImmediately = 0x20;         // WBEM_FLAG_RETURN_IMMEDIATELY
-
 void EnsureComSecurity() {
     // Must run at most once per process; RPC_E_TOO_LATE (already set by
     // somebody else) is fine. We only assert the WMI-friendly defaults.
@@ -145,7 +198,6 @@ void EnsureComSecurity() {
     }();
     (void)done;
 }
-
 // ===========================================================================
 // minimal WMI query helper
 // ===========================================================================
@@ -154,16 +206,15 @@ struct WmiVal {
     bool isNum = false;
     std::wstring str;
     uint32_t num = 0;
+    std::vector<uint8_t> bytes;  // VT_ARRAY|VT_UI1 (G-B: SMART VendorSpecific)
 };
 using WmiRow = std::map<std::wstring, WmiVal>;
-
 struct WmiResult {
     bool ok = false;            // executed; rows (possibly empty) are valid
     bool denied = false;        // elevation-gated -> NeedAdmin
     bool notSupported = false;  // namespace/class absent -> NoHardware
     std::vector<WmiRow> rows;
 };
-
 void ClassifyWmiHr(HRESULT hr, WmiResult* r) {
     if (hr == kWbemAccessDenied || hr == kEAccessDenied) {
         r->denied = true;
@@ -173,7 +224,6 @@ void ClassifyWmiHr(HRESULT hr, WmiResult* r) {
         STM_LOG_WARN("sensors", Fmt(L"WMI 查询失败 hr=0x{:08X}", static_cast<unsigned>(hr)));
     }
 }
-
 WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
     WmiVal v;
     VARIANT var{};  // zero-init == VariantInit (oleaut32 is not linked)
@@ -182,6 +232,22 @@ WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
     if (var.vt == VT_BSTR && var.bstrVal) {
         v.present = true;
         v.str = var.bstrVal;
+    } else if (var.vt == (VT_ARRAY | VT_UI1) && var.parray) {
+        // Byte vector (G-B: MSStorageDriver_FailurePredictData.VendorSpecific).
+        const SafeArrayAccessDataFn acc = SafeArrAccess();
+        const SafeArrayUnaccessDataFn unacc = SafeArrUnaccess();
+        const SafeArrayGetBoundFn lb = SafeArrLBound();
+        const SafeArrayGetBoundFn ub = SafeArrUBound();
+        LONG lo = 0, hi = -1;
+        void* data = nullptr;
+        if (acc && unacc && lb && ub && lb(var.parray, 1, &lo) == S_OK &&
+            ub(var.parray, 1, &hi) == S_OK && hi >= lo && acc(var.parray, &data) == S_OK) {
+            const LONG n = hi - lo + 1;
+            const auto* bytes = static_cast<const uint8_t*>(data);
+            v.bytes.assign(bytes, bytes + (n > 4096 ? 4096 : n));  // bound the copy
+            v.present = true;
+            unacc(var.parray);
+        }
     } else if (var.vt == VT_I4) {
         v.present = v.isNum = true;
         v.num = static_cast<uint32_t>(var.lVal);
@@ -198,13 +264,20 @@ WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
         v.present = v.isNum = true;
         v.num = var.bVal;
     }
-    if (var.vt == VT_BSTR && var.bstrVal) {
+    // V15/P1: the VARIANT returned by IWbemClassObject::Get owns its payload.
+    // Copy first (above), then hand ownership to VariantClear exactly once —
+    // this replaces the old manual SysFreeString (double-free hazard) and adds
+    // the missing SAFEARRAY destroy. Degenerate fallback only if oleaut32 went
+    // missing between binding points; the leak regresses to BSTR-free-only.
+    const VariantClearFn clear = VariantClr();
+    if (clear) {
+        clear(&var);
+    } else if (var.vt == VT_BSTR && var.bstrVal) {
         const SysFreeStringFn f = SysFree();
         if (f) f(var.bstrVal);
     }
     return v;
 }
-
 // One query, `props` fetched per row. Row cap keeps a wedged provider bounded.
 WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
                    const std::vector<const wchar_t*>& props) {
@@ -223,9 +296,7 @@ WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
             if (own) ::CoUninitialize();
         }
     } guard{ownInit};
-
     EnsureComSecurity();
-
     ComPtr<IWbemLocator> loc;
     HRESULT hr = ::CoCreateInstance(kCLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
                                     kIID_IWbemLocator, reinterpret_cast<void**>(loc.pp()));
@@ -259,7 +330,17 @@ WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
     for (int i = 0; i < 64; ++i) {
         ComPtr<IWbemClassObject> obj;
         ULONG got = 0;
-        if (en->Next(5000, 1, obj.pp(), &got) != S_OK || got == 0) break;
+        const HRESULT step = en->Next(5000, 1, obj.pp(), &got);
+        if (step != S_OK || got == 0) {
+            // G-B honesty fix: the access denial of an elevation-gated class can
+            // surface at ENUMERATION time, not at ExecQuery (measured on
+            // MSAcpi_ThermalZoneTemperature non-admin: ExecQuery S_OK, first
+            // Next() -> 0x80041003 WBEM_E_ACCESS_DENIED). Without this the
+            // snapshot claimed NoHardware ("本机无此传感器") where the truth is
+            // NeedAdmin. (The old code hit exactly that on this box.)
+            if (step == kWbemAccessDenied || step == kEAccessDenied) r.denied = true;
+            break;
+        }
         WmiRow row;
         for (const wchar_t* name : props) row[name] = ReadProp(obj.get(), name);
         r.rows.push_back(std::move(row));
@@ -267,7 +348,6 @@ WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
     r.ok = true;
     return r;
 }
-
 // ===========================================================================
 // CPU: frequency (documented, no admin) + package temperature (ACPI thermal zone)
 // ===========================================================================
@@ -282,7 +362,6 @@ struct ProcessorPowerInfo {  // PROCESSOR_POWER_INFORMATION (winnt.h, documented
 };
 #pragma pack(pop)
 static_assert(sizeof(ProcessorPowerInfo) == 24, "PROCESSOR_POWER_INFORMATION layout");
-
 void ReadCpuFreq(std::vector<SensorReading>* cpu, std::wstring* notes) {
     const CallNtPowerInformationFn fn = CallNtPower();
     SYSTEM_INFO si{};
@@ -316,40 +395,70 @@ void ReadCpuFreq(std::vector<SensorReading>* cpu, std::wstring* notes) {
         cpu->push_back(std::move(r));
     }
 }
-
 void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
-    // MSAcpi_ThermalZoneTemperature: implemented by the ACPI driver; unit is
-    // 0.1 K. Non-admin is usually rejected (R6 §3: this box reports 拒绝访问).
-    const WmiResult w = WmiQuery(L"ROOT\\WMI", L"SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature",
-                                 {L"CurrentTemperature"});
-    if (w.denied) {
+    // MSAcpi_ThermalZoneTemperature: an INSTANCE SET (one per ACPI thermal zone,
+    // not a single package value) — implemented by the ACPI driver, unit 0.1 K.
+    // G-B: enumerate every instance (WMI collection traversal), one reading per
+    // zone, labeled "ACPI 热区 N" (+ InstanceName when the row carries one).
+    // Non-admin is usually rejected (R6 §3: this box reports 拒绝访问).
+    const WmiResult w = WmiQuery(L"ROOT\\WMI",
+                                 L"SELECT InstanceName, CurrentTemperature FROM "
+                                 L"MSAcpi_ThermalZoneTemperature",
+                                 {L"InstanceName", L"CurrentTemperature"});
+    if (w.denied && w.rows.empty()) {
+        // The normal non-admin case: enumeration denied before any instance.
         SensorReading r;
-        r.label = L"CPU 整包温度（ACPI 热区）";
+        r.label = L"ACPI 热区温度";
         r.unit = L"°C";
         r.state = SensorReading::State::NeedAdmin;
         cpu->push_back(r);
         *notes += L"；ACPI 热区温度需管理员权限";
         return;
     }
+    // V15/P2 honesty: an unclassified failure at locator/connect/proxy/query
+    // stage is WMI INFRASTRUCTURE being unavailable — the thermal-zone source
+    // itself is unproven. That must not render as NoHardware ("本机无此传感器").
+    // Within the frozen four-state contract this surfaces as NeedAdmin + an
+    // explicit note that elevation will NOT fix it (label carries the truth too).
+    if (!w.ok && !w.notSupported) {
+        STM_LOG_WARN("sensors", L"WMI 基础设施不可用（连接/查询失败），热区状态未知");
+        SensorReading r;
+        r.label = L"ACPI 热区温度（WMI 不可用）";
+        r.unit = L"°C";
+        r.state = SensorReading::State::NeedAdmin;
+        cpu->push_back(r);
+        *notes += L"；WMI 服务不可用（连接/查询失败），热区温度状态未知（非权限问题，提权无济于事）";
+        return;
+    }
     if (w.notSupported || w.rows.empty()) {
         SensorReading r;
-        r.label = L"CPU 整包温度（ACPI 热区）";
+        r.label = L"ACPI 热区温度";
         r.unit = L"°C";
         r.state = SensorReading::State::NoHardware;
         cpu->push_back(r);
         *notes += L"；本机无 ACPI 热区传感器";
         return;
     }
-    int added = 0;
+    int added = 0, invalid = 0, rowIdx = -1;
     for (const WmiRow& row : w.rows) {
+        ++rowIdx;
         const auto it = row.find(L"CurrentTemperature");
-        if (it == row.end() || !it->second.present || !it->second.isNum) continue;
+        if (it == row.end() || !it->second.present || !it->second.isNum) {
+            ++invalid;
+            continue;  // honest: no reading instead of a fake 0
+        }
         const double c = static_cast<double>(it->second.num) / 10.0 - 273.15;
-        if (c < -60.0 || c > 250.0) continue;  // implausible -> no fake reading
+        if (c < -60.0 || c > 250.0) {
+            ++invalid;
+            continue;  // implausible -> no fake reading
+        }
         SensorReading r;
-        r.label = w.rows.size() > 1
-                      ? Fmt(L"CPU 整包温度（ACPI 热区 {}）", static_cast<int>(added))
-                      : L"CPU 整包温度（ACPI 热区）";
+        std::wstring zone = Fmt(L"ACPI 热区 {}", rowIdx);
+        const auto in = row.find(L"InstanceName");  // present but maybe empty
+        if (in != row.end() && in->second.present && !in->second.str.empty()) {
+            zone += Fmt(L"（{}）", in->second.str);
+        }
+        r.label = std::move(zone);
         r.value = c;
         r.unit = L"°C";
         r.state = SensorReading::State::Ok;
@@ -358,29 +467,36 @@ void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
     }
     if (added == 0) {
         SensorReading r;
-        r.label = L"CPU 整包温度（ACPI 热区）";
+        r.label = L"ACPI 热区温度";
         r.unit = L"°C";
         r.state = SensorReading::State::NoHardware;
         cpu->push_back(r);
         *notes += L"；ACPI 热区返回无效温度值（不显示假数据）";
+    } else if (invalid > 0) {
+        *notes += Fmt(L"；{} 个 ACPI 热区返回无效值（已省略，不显示假数据）", invalid);
+    } else if (w.denied) {
+        // Rare: partial enumeration cut short by a denial after some instances.
+        *notes += L"；ACPI 热区枚举被拒绝（结果可能不完整，需管理员权限）";
     }
 }
-
 // ===========================================================================
 // GPU: NVML only (driver-supplied nvml.dll in System32). Absent -> empty gpu
 // vector + honesty note; we never fake values for unsupported vendors.
+// G-B: per card the NVML path expands into one reading PER SENSOR (temperature,
+// slowdown temperature threshold, power, GPU util, VRAM util, fan) instead of a
+// single aggregate — the user asked for "同类传感器多个值都展示出来". The
+// legacy `gpu` vector keeps its exact F3 content (temp/gpu-util/power) for
+// contract stability; the full expansion lands in the `gpus` group.
 // ===========================================================================
 namespace nvml {
-
 using Device = void*;
 constexpr int kRetSuccess = 0;  // nvmlReturn_t NVML_SUCCESS
 constexpr int kTempGpu = 0;     // nvmlTemperatureSensors_t NVML_TEMPERATURE_GPU
-
+constexpr int kThreshSlowdown = 1;  // nvmlTemperatureThresholds_t ..._SLOWDOWN
 struct Utilization {  // nvmlUtilization_t
     unsigned gpu;
     unsigned memory;
 };
-
 using InitFn = int (*)();
 using ShutdownFn = int (*)();
 using GetCountFn = int (*)(unsigned*);
@@ -388,7 +504,8 @@ using GetHandleFn = int (*)(unsigned, Device*);
 using GetTempFn = int (*)(Device, int, unsigned*);
 using GetUtilFn = int (*)(Device, Utilization*);
 using GetPowerFn = int (*)(Device, unsigned*);  // milliwatts
-
+using GetThreshFn = int (*)(Device, int, unsigned*);  // temperature threshold, °C
+using GetFanFn = int (*)(Device, unsigned*);  // percent of max
 struct Fns {
     InitFn init = nullptr;
     ShutdownFn shutdown = nullptr;
@@ -397,8 +514,9 @@ struct Fns {
     GetTempFn temp = nullptr;
     GetUtilFn util = nullptr;
     GetPowerFn power = nullptr;
+    GetThreshFn thresh = nullptr;  // optional export
+    GetFanFn fan = nullptr;        // optional export
 };
-
 // Loads C:\Windows\System32\nvml.dll (driver-owned; absolute path — never a
 // search-order load). Returns false with notes filled when unavailable.
 bool Load(Fns* f, HMODULE* modOut, std::wstring* notes) {
@@ -417,6 +535,11 @@ bool Load(Fns* f, HMODULE* modOut, std::wstring* notes) {
     f->temp = reinterpret_cast<GetTempFn>(proc("nvmlDeviceGetTemperature"));
     f->util = reinterpret_cast<GetUtilFn>(proc("nvmlDeviceGetUtilizationRates"));
     f->power = reinterpret_cast<GetPowerFn>(proc("nvmlDeviceGetPowerUsage"));
+    f->thresh = reinterpret_cast<GetThreshFn>(proc("nvmlDeviceGetTemperatureThreshold_v2"));
+    if (!f->thresh) {
+        f->thresh = reinterpret_cast<GetThreshFn>(proc("nvmlDeviceGetTemperatureThreshold"));
+    }
+    f->fan = reinterpret_cast<GetFanFn>(proc("nvmlDeviceGetFanSpeed"));
     if (!f->init || !f->shutdown || !f->count || !f->handle || !f->temp) {
         *notes += L"；nvml.dll 缺少所需导出，GPU 传感器不可用";
         ::FreeLibrary(*modOut);
@@ -431,9 +554,17 @@ bool Load(Fns* f, HMODULE* modOut, std::wstring* notes) {
     }
     return true;
 }
-
-void Read(std::vector<SensorReading>* gpu, std::wstring* notes,
-          std::vector<SensorReading>* tempsOut = nullptr) {
+SensorReading Make(const wchar_t* label, double value, const wchar_t* unit) {
+    SensorReading r;
+    r.label = label;
+    r.value = value;
+    r.unit = unit;
+    r.state = SensorReading::State::Ok;
+    r.source = L"NVML";
+    return r;
+}
+void Read(std::vector<SensorReading>* legacy, std::vector<SensorReading>* expanded,
+          std::wstring* notes) {
     Fns f;
     HMODULE mod = nullptr;
     if (!Load(&f, &mod, notes)) return;
@@ -445,7 +576,6 @@ void Read(std::vector<SensorReading>* gpu, std::wstring* notes,
             if (mod) FreeLibrary(mod);
         }
     } nvmlGuard{f.shutdown, mod};
-
     unsigned count = 0;
     if (f.count(&count) != kRetSuccess) {
         *notes += L"；NVML 设备枚举失败";
@@ -455,50 +585,62 @@ void Read(std::vector<SensorReading>* gpu, std::wstring* notes,
     for (unsigned i = 0; i < count; ++i) {
         Device dev = nullptr;
         if (f.handle(i, &dev) != kRetSuccess) continue;
+        // --- temperature (legacy vector keeps its F3 entry too) ---
         unsigned tempC = 0;
         if (f.temp(dev, kTempGpu, &tempC) == kRetSuccess && tempC > 0) {
-            SensorReading r;
-            r.label = Fmt(L"GPU {} 温度", i);
-            r.value = static_cast<double>(tempC);
-            r.unit = L"°C";
-            r.state = SensorReading::State::Ok;
-            gpu->push_back(r);                       // existing contract vector
-            if (tempsOut) tempsOut->push_back(r);    // F3: reuse in the gpus group
+            const SensorReading r = Make(Fmt(L"GPU {} 温度", i).c_str(),
+                                         static_cast<double>(tempC), L"°C");
+            legacy->push_back(r);      // existing contract vector
+            expanded->push_back(r);    // G-B per-sensor group
         }
-        if (f.util) {
-            Utilization u{};
-            if (f.util(dev, &u) == kRetSuccess) {
-                SensorReading r;
-                r.label = Fmt(L"GPU {} 利用率", i);
-                r.value = static_cast<double>(std::min(u.gpu, 100u));
-                r.unit = L"%";
-                r.state = SensorReading::State::Ok;
-                gpu->push_back(std::move(r));
+        // --- slowdown temperature threshold (per card, when the driver knows it) ---
+        if (f.thresh) {
+            unsigned slowC = 0;
+            if (f.thresh(dev, kThreshSlowdown, &slowC) == kRetSuccess && slowC > 0) {
+                expanded->push_back(
+                    Make(Fmt(L"GPU {} 慢速温度阈值", i).c_str(), static_cast<double>(slowC), L"°C"));
             }
         }
+        // --- power draw (W) ---
         if (f.power) {
             unsigned mw = 0;
             if (f.power(dev, &mw) == kRetSuccess && mw > 0) {
-                SensorReading r;
-                r.label = Fmt(L"GPU {} 功耗", i);
-                r.value = static_cast<double>(mw) / 1000.0;
-                r.unit = L"W";
-                r.state = SensorReading::State::Ok;
-                gpu->push_back(std::move(r));
+                const SensorReading r = Make(Fmt(L"GPU {} 功耗", i).c_str(),
+                                             static_cast<double>(mw) / 1000.0, L"W");
+                legacy->push_back(r);
+                expanded->push_back(r);
+            }
+        }
+        // --- utilization: gpu AND memory components as separate readings ---
+        if (f.util) {
+            Utilization u{};
+            if (f.util(dev, &u) == kRetSuccess) {
+                const SensorReading ru = Make(Fmt(L"GPU {} 利用率", i).c_str(),
+                                              static_cast<double>(std::min(u.gpu, 100u)), L"%");
+                legacy->push_back(ru);
+                expanded->push_back(ru);
+                expanded->push_back(Make(Fmt(L"GPU {} 显存利用率", i).c_str(),
+                                         static_cast<double>(std::min(u.memory, 100u)), L"%"));
+            }
+        }
+        // --- fan (NVML reports % of max; 0% is a REAL reading — zero-RPM idle
+        // mode — so unlike temps it stays Ok at 0) ---
+        if (f.fan) {
+            unsigned pct = 0;
+            if (f.fan(dev, &pct) == kRetSuccess) {
+                expanded->push_back(Make(Fmt(L"GPU {} 风扇", i).c_str(),
+                                         static_cast<double>(std::min(pct, 100u)), L"%"));
             }
         }
     }
-    if (gpu->empty()) *notes += L"；NVML 在线但未报告 GPU 传感器";
+    if (expanded->empty()) *notes += L"；NVML 在线但未报告 GPU 传感器";
     else *notes += L"；GPU 读数来自 NVML；GPU 占用率另见性能页（GpuCollector）";
 }
-
 }  // namespace nvml
-
 // ===========================================================================
 // Disks: per-PhysicalDrive health, honest at every permission level
 // ===========================================================================
 enum class BusProto { Nvme, Ata, Usb, Other };
-
 BusProto ClassifyBus(uint32_t busType) {
     // STORAGE_BUS_TYPE: 3=ATA 2=ATAPI 11=SATA 17=NVMe 7=USB ...
     switch (busType) {
@@ -510,7 +652,6 @@ BusProto ClassifyBus(uint32_t busType) {
         default: return BusProto::Other;
     }
 }
-
 const wchar_t* BusName(uint32_t busType) {
     switch (busType) {
         case 1: return L"SCSI";
@@ -531,7 +672,6 @@ const wchar_t* BusName(uint32_t busType) {
         default: return L"未知";
     }
 }
-
 std::wstring CStrFromDesc(const BYTE* base, ULONG off) {
     if (off == 0 || off >= 2048) return {};
     const char* s = reinterpret_cast<const char*>(base + off);
@@ -542,7 +682,6 @@ std::wstring CStrFromDesc(const BYTE* base, ULONG off) {
     if (out.empty()) return {};
     return Utf8ToWide(out);
 }
-
 // IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceProtocolSpecificProperty) ->
 // NVMe Get Log Page 0x02 SMART/Health (documented "Working with NVMe drives").
 // F3: also reports available spare % / spare threshold % alongside pctUsed.
@@ -594,7 +733,6 @@ bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8
     *poh = (hours <= kMaxHours) ? hours : UINT64_MAX;
     return true;
 }
-
 // Classic SMART READ DATA via SMART_RCV_DRIVE_DATA (winioctl.h, ATA drives).
 bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
     GETVERSIONINPARAMS ver{};
@@ -603,7 +741,6 @@ bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
         return false;
     }
     if ((ver.fCapabilities & CAP_SMART_CMD) == 0) return false;
-
     SENDCMDINPARAMS inp{};
     inp.cBufferSize = 512;
     inp.irDriveRegs.bFeaturesReg = 0xD0;  // SMART READ ATTRIBUTE VALUES
@@ -660,7 +797,6 @@ bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
     *poh = haveHours ? hours : UINT64_MAX;
     return true;
 }
-
 void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
     // Coarse OS-level health first (works for standard users on stock Windows;
     // StorageReliabilityCounter would need admin — R6 §5).
@@ -692,7 +828,6 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         if (sn != row.end() && sn->second.present) wd.serial = sn->second.str;
         wmi[id->second.str] = std::move(wd);
     }
-
     int needAdmin = 0;
     for (uint32_t n = 0; n < 32; ++n) {
         const std::wstring path = Fmt(L"\\\\.\\PhysicalDrive{}", n);
@@ -704,7 +839,6 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         // invalid value and never hand it to UniqueHandle/CloseHandle.
         if (h0 == INVALID_HANDLE_VALUE) continue;  // absent drive; gaps are legal
         const stm::UniqueHandle h(h0);
-
         DiskHealth d;
         uint32_t busNum = UINT32_MAX;
         const auto wit = wmi.find(std::to_wstring(n));
@@ -724,7 +858,6 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         d.tempC = 0.0;
         d.powerOnHours = UINT64_MAX;
         d.tempState = SensorReading::State::NoHardware;
-
         // Descriptor: model/serial/bus even where WMI was denied (0-access
         // handle is enough for the plain property query).
         BYTE qbuf[2048]{};
@@ -752,7 +885,6 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         // Never a blank line: WMI and descriptor both unavailable -> the drive
         // number is the honest fallback name.
         if (d.model.empty()) d.model = Fmt(L"PhysicalDrive{}", n);
-
         // Detailed health: only for buses that plausibly report SMART.
         const BusProto proto = busNum != UINT32_MAX ? ClassifyBus(busNum) : BusProto::Other;
         if (proto == BusProto::Nvme || proto == BusProto::Ata) {
@@ -816,7 +948,6 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         *notes += Fmt(L"；{} 块磁盘的 SMART/温度需管理员权限", needAdmin);
     }
 }
-
 // ===========================================================================
 // F3: shared 350 ms delta window. One PDH query carries the rate counters
 // (per-core CPU % via Processor Information; per-engtype GPU Engine; GPU
@@ -826,7 +957,6 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
 // entry — never fabricated zeros.
 // ===========================================================================
 constexpr DWORD kDeltaWindowMs = 350;
-
 // PDH engine type token -> short display name; nullptr = keep the raw token.
 const wchar_t* EngineTypeLabel(const std::wstring& raw) {
     if (raw == L"3D") return L"3D";
@@ -836,11 +966,9 @@ const wchar_t* EngineTypeLabel(const std::wstring& raw) {
     if (raw == L"VideoProcessing") return L"视频处理";
     return nullptr;
 }
-
 double ClampPct(double v) {
     return v < 0.0 ? 0.0 : (v > 100.0 ? 100.0 : v);
 }
-
 void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorReading>* gpuOut,
                      std::vector<SensorReading>* netOut, std::wstring* notes) {
     PDH_HQUERY q = nullptr;
@@ -858,7 +986,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
             if (q) ::PdhCloseQuery(q);
         }
     } cleanup;
-
     if (::PdhOpenQueryW(nullptr, 0, &q) == ERROR_SUCCESS && q != nullptr) {
         cleanup.q = q;
         std::wstring tpl;
@@ -876,7 +1003,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         }
         if (haveProc || haveEng) stm::cd::PdhCollect(q);  // rate counters need a warm-up sample
     }
-
     const bool haveNet0 = ::GetIfTable2(&ifT0) == NO_ERROR && ifT0 != nullptr;
     cleanup.t0 = ifT0;
     const ULONGLONG t0ms = ::GetTickCount64();
@@ -886,7 +1012,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
     const bool haveNet1 = haveNet0 && ::GetIfTable2(&ifT1) == NO_ERROR && ifT1 != nullptr;
     cleanup.t1 = ifT1;
     const double dtSec = static_cast<double>(t1ms - t0ms) / 1000.0;
-
     // --- per-core CPU utilization (Processor Information, documented; R6 §6) ---
     if (haveProc) {
         std::vector<stm::cd::PdhArrayItem> items;
@@ -925,7 +1050,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         coreUtil->push_back(r);
         *notes += L"；Processor Information 计数器不可用，每核占用率不可用";
     }
-
     // --- GPU engine utilization, aggregated per engtype_* (R6 §4) ---
     bool anyEngine = false;
     if (haveEng) {
@@ -969,7 +1093,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         gpuOut->push_back(r);
         *notes += L"；GPU Engine 计数器不可用（需 Win10 1709+ 图形栈）";
     }
-
     // --- GPU adapter memory, summed over adapters (raw usage counters) ---
     auto adapterMemoryBytes = [](PDH_HCOUNTER h) {
         if (!h) return -1.0;
@@ -1011,7 +1134,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         gpuOut->push_back(r);
         if (!haveEng) *notes += L"；GPU Adapter Memory 计数器不可用";
     }
-
     // --- per-adapter network rates (GetIfTable2 octet deltas) ---
     if (haveNet1) {
         std::map<uint32_t, const MIB_IF_ROW2*> t0rows;
@@ -1085,7 +1207,6 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         netOut->push_back(r);
     }
 }
-
 // ===========================================================================
 // F3: battery (CallNtPowerInformation SystemBatteryState=5, winnt.h layout).
 // No battery -> one NoHardware entry (honest; desktops are the normal case).
@@ -1106,7 +1227,6 @@ struct BatteryStateRow {  // SYSTEM_BATTERY_STATE
 };
 #pragma pack(pop)
 static_assert(sizeof(BatteryStateRow) == 32, "SYSTEM_BATTERY_STATE layout");
-
 void ReadBattery(std::vector<SensorReading>* out, std::wstring* notes) {
     const CallNtPowerInformationFn fn = CallNtPower();
     BatteryStateRow bs{};
@@ -1160,14 +1280,12 @@ void ReadBattery(std::vector<SensorReading>* out, std::wstring* notes) {
         out->push_back(std::move(r));
     }
 }
-
 // ===========================================================================
 // F3: memory (GlobalMemoryStatusEx + GetPerformanceInfo). GetPerformanceInfo
 // is bound dynamically (K32GetPerformanceInfo in kernel32, psapi.dll
 // fallback) so the stm_collect link line stays unchanged.
 // ===========================================================================
 using GetPerfInfoFn = BOOL(WINAPI*)(PPERFORMANCE_INFORMATION, DWORD);
-
 GetPerfInfoFn GetPerfInfo() {
     static GetPerfInfoFn fn = []() -> GetPerfInfoFn {
         const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
@@ -1182,7 +1300,6 @@ GetPerfInfoFn GetPerfInfo() {
     }();
     return fn;
 }
-
 void ReadMemory(std::vector<SensorReading>* out, std::wstring* notes) {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof(ms);
@@ -1249,36 +1366,102 @@ void ReadMemory(std::vector<SensorReading>* out, std::wstring* notes) {
         out->push_back(std::move(nonPaged));
     }
 }
-
+// ===========================================================================
+// G-B: "extra" — best-effort readings from documented WMI temperature classes
+// OUTSIDE MSAcpi_ThermalZoneTemperature. The snapshot group is displayed only
+// when non-empty, so every failure path stays silent: absence promises nothing.
+// ===========================================================================
+void ReadExtraSensors(std::vector<SensorReading>* out) {
+    // 1) Win32_Temperature (ROOT\CIMV2, DMTF temperature sensor): CurrentReading
+    //    in tenths of degrees. Almost never implemented by a real provider — an
+    //    absent class is the normal case and simply yields nothing.
+    {
+        const WmiResult w = WmiQuery(L"ROOT\\CIMV2",
+                                     L"SELECT CurrentReading FROM Win32_Temperature",
+                                     {L"CurrentReading"});
+        int added = 0;
+        for (const WmiRow& row : w.rows) {
+            const auto it = row.find(L"CurrentReading");
+            if (it == row.end() || !it->second.present || !it->second.isNum) continue;
+            const double c = static_cast<double>(it->second.num) / 10.0 - 273.15;
+            if (c < -60.0 || c > 250.0) continue;  // implausible -> skip, no fake
+            SensorReading r;
+            r.label = Fmt(L"WMI 温度传感器 {}", added);
+            r.value = c;
+            r.unit = L"°C";
+            r.state = SensorReading::State::Ok;
+            out->push_back(std::move(r));
+            ++added;
+        }
+    }
+    // 2) MSStorageDriver_FailurePredictData (ROOT\WMI): per-drive SMART attribute
+    //    block (same 12-byte layout as AtaSmart); attribute 194/190 raw[0] is the
+    //    temperature. Usually admin-gated (this box: 拒绝访问) — a denial leaves
+    //    the group untouched; the per-disk IOCTL path above remains the source.
+    {
+        const WmiResult w = WmiQuery(L"ROOT\\WMI",
+                                     L"SELECT InstanceName, VendorSpecific FROM "
+                                     L"MSStorageDriver_FailurePredictData",
+                                     {L"InstanceName", L"VendorSpecific"});
+        int added = 0;
+        for (const WmiRow& row : w.rows) {
+            const auto vs = row.find(L"VendorSpecific");
+            if (vs == row.end() || !vs->second.present) continue;
+            const std::vector<uint8_t>& s = vs->second.bytes;
+            double t = 0;
+            bool have = false;
+            // version(2) then 12-byte attributes: id(1) flags(2) value(1)
+            // worst(1) raw(6, LE) reserved(1) — raw[0] at p[5], see AtaSmart.
+            for (size_t off = 2; off + 6 <= s.size(); off += 12) {
+                const uint8_t id = s[off];
+                if (id == 0) break;
+                if ((id == 194 || id == 190) && !have) {
+                    const double cand = static_cast<double>(s[off + 5]);
+                    if (cand >= 10.0 && cand <= 120.0) {  // plausible Celsius only
+                        t = cand;
+                        have = true;
+                    }
+                }
+            }
+            if (!have) continue;  // honest: unreadable/absent -> no entry at all
+            SensorReading r;
+            r.label = Fmt(L"磁盘 {} 温度（WMI SMART）", added);
+            const auto in = row.find(L"InstanceName");
+            if (in != row.end() && in->second.present && !in->second.str.empty()) {
+                r.label += Fmt(L"（{}）", in->second.str);
+            }
+            r.value = t;
+            r.unit = L"°C";
+            r.state = SensorReading::State::Ok;
+            out->push_back(std::move(r));
+            ++added;
+        }
+    }
+}
 }  // namespace
-
 SensorSnapshot ReadSensors(std::wstring* err) {
     SensorSnapshot snap;
     std::wstring notes;
     try {
         ReadCpuTemp(&snap.cpu, &notes);
-
         std::vector<SensorReading> coreFreq;
         ReadCpuFreq(&coreFreq, &notes);
         for (const SensorReading& r : coreFreq) snap.cpu.push_back(r);  // existing contract
-
         // F3: shared ~350 ms delta window (per-core %, GPU engine/VRAM, per-NIC rates).
         std::vector<SensorReading> coreUtil, gpuEngine, net;
         ReadDeltaWindow(&coreUtil, &gpuEngine, &net, &notes);
         snap.cpuCores = std::move(coreFreq);
         snap.cpuCores.insert(snap.cpuCores.end(), coreUtil.begin(), coreUtil.end());
-
-        std::vector<SensorReading> gpuTemps;
-        nvml::Read(&snap.gpu, &notes, &gpuTemps);
+        // G-B: gpus = PDH engine/VRAM group + the NVML per-card, per-sensor
+        // expansion (legacy `gpu` vector keeps its exact F3 content).
         snap.gpus = std::move(gpuEngine);
-        snap.gpus.insert(snap.gpus.end(), gpuTemps.begin(), gpuTemps.end());
+        nvml::Read(&snap.gpu, &snap.gpus, &notes);
         snap.network = std::move(net);
-
         ReadDisks(&snap.disks, &notes);
         ReadBattery(&snap.battery, &notes);
         ReadMemory(&snap.memory, &notes);
+        ReadExtraSensors(&snap.extra);  // G-B: best effort; empty -> not shown
         snap.uptimeSec = static_cast<double>(::GetTickCount64()) / 1000.0;
-
         SensorReading fan;
         fan.label = L"风扇转速";
         fan.value = 0.0;
@@ -1299,5 +1482,4 @@ SensorSnapshot ReadSensors(std::wstring* err) {
     snap.notes = notes;
     return snap;
 }
-
 }  // namespace stm

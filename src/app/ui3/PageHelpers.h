@@ -95,7 +95,7 @@ inline bool DriverErrNeedsAdmin(const std::wstring& err) {
 // Sensor page (W2 redesign): per-group visibility, persisted in the config.
 // Pure helpers so stm_selftest can cover keys/defaults without a GUI.
 // ---------------------------------------------------------------------------
-enum class SensorGroup { Cpu, Gpu, Mem, Disk, Net, Battery, Fan, Count };
+enum class SensorGroup { Cpu, Gpu, Mem, Disk, Net, Battery, Fan, Extra, Count };
 
 inline const wchar_t* SensorGroupCfgKey(SensorGroup g) {
     switch (g) {
@@ -106,12 +106,15 @@ inline const wchar_t* SensorGroupCfgKey(SensorGroup g) {
         case SensorGroup::Net: return L"sensShowNet";
         case SensorGroup::Battery: return L"sensShowBattery";
         case SensorGroup::Fan: return L"sensShowFan";
+        case SensorGroup::Extra: return L"sensShowExtra";
         default: return L"";
     }
 }
 
 // Product default: every group visible except 风扇 (honest NeedDriver-only data).
-inline bool SensorGroupDefaultVisible(SensorGroup g) { return g != SensorGroup::Fan; }
+inline bool SensorGroupDefaultVisible(SensorGroup g) {
+    return g != SensorGroup::Fan;
+}
 
 inline bool SensorGroupVisible(const Config& cfg, SensorGroup g) {
     return cfg.GetBool(SensorGroupCfgKey(g), SensorGroupDefaultVisible(g));
@@ -126,6 +129,7 @@ inline const wchar_t* SensorGroupTitle(SensorGroup g) {
         case SensorGroup::Net: return L"网络";
         case SensorGroup::Battery: return L"电池";
         case SensorGroup::Fan: return L"风扇";
+        case SensorGroup::Extra: return L"其他";
         default: return L"";
     }
 }

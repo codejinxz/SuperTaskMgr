@@ -38,7 +38,7 @@ target_link_libraries(stm_collect PUBLIC stm_core pdh iphlpapi dxgi)
 # ---------------- stm_ops: destructive ops, elevation, signature ----------------
 file(GLOB STM_OPS_SRC CONFIGURE_DEPENDS src/ops/*.cpp)
 add_library(stm_ops STATIC ${STM_OPS_SRC})
-target_link_libraries(stm_ops PUBLIC stm_core wintrust taskschd)
+target_link_libraries(stm_ops PUBLIC stm_core wintrust taskschd wevtapi)
 
 # ---------------- vendored third_party (W0 isolation) ----------------
 file(GLOB IMGUI_SRC third_party/imgui/*.cpp)

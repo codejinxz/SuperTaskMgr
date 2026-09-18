@@ -8,6 +8,7 @@
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/Pages.h"
 #include "app/ui/Tray.h"
+#include "app/ui3/GcPages.h"  // F4: 热键绑定 + 新页注册依赖的共享入口
 #include "app/ui3/Pages3.h"
 #include "core/FsUtil.h"
 #include "core/HandleGuard.h"
@@ -60,6 +61,20 @@ uint32_t ClampInterval(int64_t v) {
     if (v < 500) return 500;
     if (v > 5000) return 5000;
     return static_cast<uint32_t>(v);
+}
+
+// F4#10: 托盘左键与全局热键共用的主窗显隐三分支（最小化=>还原并置前；
+// 可见=>隐藏；否则显示并置前，P1-2）。
+void ToggleMainWindowVisible(HWND hwnd) {
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    } else if (IsWindowVisible(hwnd)) {
+        ShowWindow(hwnd, SW_HIDE);
+    } else {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
 }
 
 // ---------------- autotest helpers (mirrors src/selftest/ui_fix_test.cpp) ----
@@ -313,8 +328,14 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     cbs.onResize = [](void* ud, int w, int h) { static_cast<D3DRenderer*>(ud)->Resize(w, h); };
     ui::Tray tray;
     // Tray messages ride the window-proc hook (Win32Window exposes no other way in).
-    cbs.onMessage = [&tray](HWND h, UINT msg, WPARAM wParam, LPARAM lParam,
-                            bool* handled) -> LRESULT {
+    // F4#10: WM_HOTKEY（全局热键 Ctrl+Alt+M）也在此处理，复用托盘三分支显隐逻辑。
+    cbs.onMessage = [&tray, &win](HWND h, UINT msg, WPARAM wParam, LPARAM lParam,
+                                  bool* handled) -> LRESULT {
+        if (msg == WM_HOTKEY && wParam == static_cast<WPARAM>(ui3::kGcHotkeyId)) {
+            ToggleMainWindowVisible(win.Hwnd());
+            *handled = true;
+            return 0;
+        }
         return tray.HandleMessage(h, msg, wParam, lParam, handled);
     };
     cbs.ud = &renderer;
@@ -338,15 +359,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
             // P1-2 (F2 review): a minimized window still reports IsWindowVisible()==TRUE,
             // so the old two-branch check hid the taskbar button on left click. Three
             // branches: minimized => restore+foreground; visible => hide; else show.
-            if (IsIconic(hwnd)) {
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
-            } else if (IsWindowVisible(hwnd)) {
-                ShowWindow(hwnd, SW_HIDE);
-            } else {
-                ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
-            }
+            ToggleMainWindowVisible(hwnd);
         };
         tray.onShowWindow = [hwnd]() {
             ShowWindow(hwnd, SW_SHOW);
@@ -367,6 +380,17 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     // Under --smoke every page's Draw is exercised in an offscreen window so
     // the new tabs' empty/error states are covered by the CI smoke run.
     ui3::SetSmokeDrawAll(smokeFrames > 0);
+
+    // F4#10: 全局热键挂到主窗（UI 线程 == 窗口线程，RegisterHotKey 合法）；
+    // headless（--smoke/--autotest）不注册，避免 CI 侧副作用。失败只记日志。
+    ui3::GcHotkeyBindWindow(win.Hwnd());
+    if (!headless && ctx->cfg.GetBool(L"hotkeyEnabled", false)) {
+        std::wstring hkErr;
+        if (!ui3::GcHotkeySetEnabled(true, &hkErr)) {
+            ctx->cfg.SetBool(L"hotkeyEnabled", false);
+            STM_LOG_WARN("app", L"全局热键注册失败：{}", hkErr);
+        }
+    }
 
     if (hasSession && session.winW > 100 && session.winH > 100) {
         MoveWindow(win.Hwnd(), session.winX, session.winY, session.winW, session.winH, FALSE);
@@ -445,6 +469,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         ctx->cfg.Save(ConfigPath());
     }
     tray.Remove();
+    ui3::GcHotkeyUnbindWindow();   // F4#10: 退出反注册热键
     ui3::SetBalloonSink(nullptr);  // P2-7: sink captured &tray; drop before teardown
     // Stops collection and gives in-flight ops jobs up to 2 s; anything still
     // running afterwards survives on ctx's shared_ptr (see comment above).

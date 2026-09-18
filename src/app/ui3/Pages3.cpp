@@ -14,6 +14,8 @@
 // Only additive integration points live in app/ui/Pages.cpp and app/main.cpp.
 #include "app/ui3/Pages3.h"
 #include "app/ui3/AsyncFetch.h"
+#include "app/ui3/GcPages.h"    // F4#3: 宿主服务模态
+#include "app/ui3/JumpState.h"  // F4#3: 跨页跳转槽
 #include "app/ui3/PageHelpers.h"
 #include "app/ui/Pages.h"
 #include "app/ui/ConfirmAction.h"
@@ -375,8 +377,33 @@ private:
         while (clipper.Step()) {
             for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
                 const ConnEntry& c = res.data[static_cast<size_t>(rows_[static_cast<size_t>(r)])];
+                ImGui::PushID(static_cast<int>(r));
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
+                // F4#3: 行级右键菜单 —— 跳转到进程 / 查看宿主服务。
+                if (ImGui::Selectable("##connrow", false,
+                                      ImGuiSelectableFlags_SpanAllColumns)) {
+                }
+                if (ImGui::BeginPopupContextItem("##rowctx")) {
+                    std::wstring name;
+                    std::shared_ptr<const Snapshot> snapNow =
+                        LiveP3Ctx() ? LiveP3Ctx()->collect.Store().Get() : nullptr;
+                    if (snapNow != nullptr) {
+                        if (const ProcInfo* p = FindPid(*snapNow, c.pid)) name = p->name;
+                    }
+                    if (ImGui::MenuItem(U8(L"跳转到进程"), nullptr, false, c.pid != 0)) {
+                        RequestJumpToProcess(c.pid);
+                    }
+                    if (ImGui::MenuItem(U8(L"查看宿主服务…"), nullptr, false, c.pid != 0)) {
+                        RequestHostServicesModal(c.pid, name);
+                    }
+                    if (ImGui::MenuItem(U8(L"复制本地端点"))) {
+                        ImGui::SetClipboardText(
+                            U8(ConnEndpoint(c.localAddr, c.localPort)));
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::SameLine();
                 ImGui::TextUnformatted(U8(ProtoLabel(c.proto)));
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(U8(ConnEndpoint(c.localAddr, c.localPort)));
@@ -398,6 +425,7 @@ private:
                     name = p->name;
                 }
                 ImGui::TextUnformatted(U8(name));
+                ImGui::PopID();
             }
         }
         ImGui::EndTable();
@@ -916,6 +944,10 @@ private:
         }
         ImGui::EndDisabled();
         if (ImGui::MenuItem(U8(L"复制服务名"))) ImGui::SetClipboardText(U8(s.name));
+        // F4#3: 服务页反向跳转进程（s.pid==0 表示未运行或驱动服务）。
+        if (ImGui::MenuItem(U8(L"跳转到进程"), nullptr, false, s.pid != 0)) {
+            RequestJumpToProcess(s.pid);
+        }
     }
 
     // ---- confirm + submit ---------------------------------------------------
@@ -1307,52 +1339,69 @@ public:
 
         const SensorSnapshot& snap = res->data;
         const std::vector<SensorReading> lhm = CurrentLhmRows();
+        // 组渲染分发：详细模式逐条渲染全部读数（含完整标签），精简模式为现有概要。
+        const auto readings = [&](const std::vector<SensorReading>& items) {
+            if (detailMode_) {
+                DrawReadingsDetailed(ctx, items);
+            } else {
+                DrawReadings(ctx, items);
+            }
+        };
 
         // Vertical full-width groups; each 可选显示 via cfg (P2 requirement).
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Cpu)) {
-            BeginGroup("##grp_cpu", L"CPU");
-            DrawReadings(ctx, snap.cpu);
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Cpu));
+            BeginGroup("##grp_cpu", L"CPU", snap.cpu.size() + snap.cpuCores.size());
+            readings(snap.cpu);
+            readings(FilterLhm(lhm, LhmGroup::Cpu));
             DrawCoreTable(ctx, snap.cpuCores);
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Gpu)) {
-            BeginGroup("##grp_gpu", L"GPU");
-            DrawReadings(ctx, snap.gpu);
-            DrawReadings(ctx, snap.gpus);
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Gpu));
+            BeginGroup("##grp_gpu", L"GPU", snap.gpu.size() + snap.gpus.size());
+            readings(snap.gpu);
+            readings(snap.gpus);
+            readings(FilterLhm(lhm, LhmGroup::Gpu));
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Mem)) {
-            BeginGroup("##grp_mem", L"内存");
-            DrawReadings(ctx, snap.memory);
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Mem));
+            BeginGroup("##grp_mem", L"内存", snap.memory.size());
+            readings(snap.memory);
+            readings(FilterLhm(lhm, LhmGroup::Mem));
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Disk)) {
-            BeginGroup("##grp_disk", L"磁盘");
+            BeginGroup("##grp_disk", L"磁盘", snap.disks.size());
             DrawDisks(ctx, snap.disks);
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Disk));
+            readings(FilterLhm(lhm, LhmGroup::Disk));
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Net)) {
-            BeginGroup("##grp_net", L"网络");
-            DrawReadings(ctx, snap.network);
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Net));
+            BeginGroup("##grp_net", L"网络", snap.network.size());
+            readings(snap.network);
+            readings(FilterLhm(lhm, LhmGroup::Net));
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Battery)) {
-            BeginGroup("##grp_battery", L"电池");
-            DrawReadings(ctx, snap.battery);   // NoHardware entry = honest empty state
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Battery));
+            BeginGroup("##grp_battery", L"电池", snap.battery.size());
+            readings(snap.battery);   // NoHardware entry = honest empty state
+            readings(FilterLhm(lhm, LhmGroup::Battery));
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Fan)) {
-            BeginGroup("##grp_fan", L"风扇");
-            DrawReadings(ctx, snap.fans);      // honest NeedDriver entries
-            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Fan));
+            BeginGroup("##grp_fan", L"风扇", snap.fans.size());
+            readings(snap.fans);      // honest NeedDriver entries
+            readings(FilterLhm(lhm, LhmGroup::Fan));
             EndGroup();
         }
+        // G-B 的 extra 读数（不归入上述任一组的杂项；契约：空 = 未发现，整组不显示）。
+        if (!snap.extra.empty() && SensorGroupVisible(ctx.cfg, SensorGroup::Extra)) {
+            BeginGroup("##grp_extra", L"其他", snap.extra.size());
+            readings(snap.extra);
+            EndGroup();
+        }
+        // TODO(integrator): G-B 后续如再向 collect/Sensors.h 增补字段，在本函数
+        // 对应分组内追加一行 `readings(snap.<newField>);` 即可 —— 精简/详细开关、
+        // 四态诚实渲染与组显隐（PageHelpers.h SensorGroup）自动生效。
     }
 
 private:
@@ -1375,6 +1424,7 @@ private:
     void LoadPrefsOnce(AppContext& ctx) {
         if (prefsLoaded_) return;
         prefsLoaded_ = true;
+        detailMode_ = ctx.cfg.GetBool(L"sensDetailMode", false);  // 用户需求②：默认关
         lhmPort_ = static_cast<uint16_t>(std::max(
             1024, std::min(65535, static_cast<int>(ctx.cfg.GetInt(L"lhmPort", 8085)))));
         lhmOn_ = ctx.cfg.GetBool(L"lhmEnabled", false);
@@ -1540,21 +1590,75 @@ private:
         ImGui::SameLine();
         checkbox(SensorGroup::Fan);
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", U8(L"（风扇默认关闭：无内核驱动时仅能如实报告“需要驱动支持”）"));
+        checkbox(SensorGroup::Extra);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", U8(L"（风扇默认关闭：无内核驱动时仅能如实报告“需要驱动支持”；"
+                                     L"「其他」仅在发现杂项读数时出现）"));
         ImGui::Separator();
     }
 
     // ---- group scaffolding (vertical, full width: P1-3) -----------------------
-    static void BeginGroup(const char* id, const wchar_t* title) {
+    static void BeginGroup(const char* id, const wchar_t* title, size_t readingCount) {
         ImGui::BeginChild(id, ImVec2(0.0f, 0.0f),
                           ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
         ImGui::TextUnformatted(U8(title));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", U8(Fmt(L"（{} 项）", readingCount)));
         ImGui::Separator();
     }
     static void EndGroup() { ImGui::EndChild(); }
 
     static void DrawReadings(AppContext& ctx, const std::vector<SensorReading>& items) {
         for (const SensorReading& s : items) DrawReading(ctx, s);
+    }
+
+    // F4#9 详细模式：逐条渲染全部读数（完整标签不截断 + 独立数值/状态列）。
+    static void DrawReadingsDetailed(AppContext& ctx, const std::vector<SensorReading>& items) {
+        if (items.empty()) return;
+        const int flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                          ImGuiTableFlags_SizingFixedFit;
+        if (!ImGui::BeginTable("##detailreadings", 3, flags)) return;
+        ImGui::TableSetupColumn(U8(L"读数"), ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn(U8(L"数值"), ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn(U8(L"状态"), ImGuiTableColumnFlags_WidthFixed, 190.0f);
+        ImGui::TableHeadersRow();
+        for (const SensorReading& s : items) {
+            ImGui::PushID(static_cast<int>(&s - items.data()));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(U8(s.label.empty() ? std::wstring(L"—") : s.label));
+            ImGui::TableNextColumn();
+            if (s.state == SensorReading::State::Ok) {
+                ImGui::TextUnformatted(U8(Fmt(L"{:.2f} {}", s.value, s.unit)));
+            } else {
+                ImGui::TextDisabled("%s", U8(L"—"));
+            }
+            ImGui::TableNextColumn();
+            switch (s.state) {
+                case SensorReading::State::Ok:
+                    ImGui::TextColored(ColDone(), "%s", U8(L"正常"));
+                    break;
+                case SensorReading::State::NeedAdmin: {
+                    ImGui::TextColored(ColWarn(), "%s", U8(L"需要管理员权限"));
+                    if (!ctx.elevated && ops::CanElevate()) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(U8(L"提权重启"))) {
+                            RequestElevateRestart(ctx);  // P1-4: jobs worker, not UI thread
+                        }
+                    }
+                    break;
+                }
+                case SensorReading::State::NeedDriver:
+                    ImGui::TextColored(ColMuted(), "%s", U8(L"需要驱动支持"));
+                    break;
+                case SensorReading::State::NoHardware:
+                default:
+                    ImGui::TextColored(ColMuted(), "%s", U8(L"本机无此传感器"));
+                    break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
 
     // Per-core frequency + utilization table (cpuCores: MHz and % rows paired by
@@ -1742,6 +1846,17 @@ private:
                 U8(L"手动刷新：立即重新读取传感器（可越过 10 秒最小间隔；SMART/温度查询"
                    L"较重，自动刷新受该间隔限制）"));
         }
+        // F4#9（用户需求②）：详细模式开关（cfg sensDetailMode，默认关）。
+        ImGui::SameLine();
+        if (ImGui::Checkbox(U8(L"详细模式"), &detailMode_)) {
+            ctx.cfg.SetBool(L"sensDetailMode", detailMode_);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "%s",
+                U8(L"精简：各组概要读数；详细：逐条渲染全部读数（完整标签、数值与"
+                   L"状态分列，含多实例）"));
+        }
     }
 
     void MaybeFetchNow() { fetch_.MaybeFetch(Produce, true); }
@@ -1750,6 +1865,7 @@ private:
     AsyncFetch<std::vector<SensorReading>> lhmFetch_{10.0};
     std::shared_ptr<LhmProbe> lhmProbe_;
     bool prefsLoaded_ = false;
+    bool detailMode_ = false;  // F4#9: 传感器详细模式（cfg sensDetailMode）
     bool lhmOn_ = false;       // validated state (probe-passed), persisted in cfg
     uint16_t lhmPort_ = 8085;
     uint64_t lastFrame_ = kNeverDrawn;

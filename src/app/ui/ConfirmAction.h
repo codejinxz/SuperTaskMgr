@@ -19,8 +19,10 @@
 #include <memory>
 #include <string>
 #include "app/AppContext.h"
+#include "app/ui3/ProcControlUi.h"  // ui3::PriorityLabel（优先级文案单一来源）
 #include "core/ProcData.h"
 #include "core/Str.h"
+#include "ops/ProcessControl.h"
 #include "ops/ProcessOps.h"
 #include "ops/StartupOps.h"
 
@@ -37,6 +39,11 @@ struct ConfirmKind {
         TrimWorkingSet,  // 释放工作集
         PurgeStandby,    // 清理待机列表
         StartupToggle,   // 启用/禁用启动项 (startupEnable + startupItem)
+        // --- F4#2 进程控制（挂起/恢复/优先级/亲和性）---
+        Suspend,         // 挂起进程（比终止更危险：保护名单进程菜单项直接禁用）
+        Resume,          // 恢复进程（低风险，可直接提交、不开确认框）
+        SetPriority,     // 设置优先级（设置前经 ConfirmDialog 确认；priority 字段）
+        SetAffinity,     // 设置亲和性（亲和性模态本身即确认；affinityMask 字段）
     };
 };
 
@@ -55,6 +62,9 @@ struct ConfirmRequest {
     // StartupToggle only.
     bool startupEnable = false;
     ops::StartupItem startupItem;
+    // F4#2: SetPriority -> priority; SetAffinity -> affinityMask (nonzero).
+    ops::ProcPriority priority = ops::ProcPriority::Normal;
+    uint64_t affinityMask = 0;
 };
 
 // Non-empty suffix appended to failure notes when not elevated (H5 requirement:
@@ -165,6 +175,85 @@ inline std::function<void()> MakeStartupToggleJob(std::shared_ptr<AppContext> ap
     };
 }
 
+// ---------------------------------------------------------------------------
+// F4#2: process control jobs (suspend/resume/priority/affinity). Same protocol:
+// ops re-verifies (pid, createTime) identity and refuses protected processes.
+// ---------------------------------------------------------------------------
+
+inline std::wstring ControlTargetLabel(const ConfirmRequest& req) {
+    return Fmt(L"{} ({})", req.name, req.key.pid);
+}
+
+inline std::function<void()> MakeSuspendJob(std::shared_ptr<AppContext> app,
+                                            const ConfirmRequest& req) {
+    const bool elevated = app->elevated;
+    return [app, elevated, req] {
+        std::wstring err;
+        if (ops::SuspendProcess(req.key, &err)) {
+            PostConfirmNote(*app, Notification::Kind::JobDone,
+                            Fmt(L"已挂起进程 {}", ControlTargetLabel(req)));
+        } else {
+            PostConfirmNote(*app, Notification::Kind::JobFailed,
+                            Fmt(L"挂起 {} 失败：{}{}", ControlTargetLabel(req),
+                                err.empty() ? std::wstring(L"未知错误") : err,
+                                AdminHintSuffix(elevated)));
+        }
+    };
+}
+
+inline std::function<void()> MakeResumeJob(std::shared_ptr<AppContext> app,
+                                           const ConfirmRequest& req) {
+    const bool elevated = app->elevated;
+    return [app, elevated, req] {
+        std::wstring err;
+        if (ops::ResumeProcess(req.key, &err)) {
+            PostConfirmNote(*app, Notification::Kind::JobDone,
+                            Fmt(L"已恢复进程 {}", ControlTargetLabel(req)));
+        } else {
+            PostConfirmNote(*app, Notification::Kind::JobFailed,
+                            Fmt(L"恢复 {} 失败：{}{}", ControlTargetLabel(req),
+                                err.empty() ? std::wstring(L"未知错误") : err,
+                                AdminHintSuffix(elevated)));
+        }
+    };
+}
+
+inline std::function<void()> MakeSetPriorityJob(std::shared_ptr<AppContext> app,
+                                                const ConfirmRequest& req) {
+    const bool elevated = app->elevated;
+    return [app, elevated, req] {
+        std::wstring err;
+        if (ops::SetProcPriority(req.key, req.priority, &err)) {
+            PostConfirmNote(*app, Notification::Kind::JobDone,
+                            Fmt(L"已将 {} 优先级设为「{}」", ControlTargetLabel(req),
+                                ui3::PriorityLabel(req.priority)));
+        } else {
+            PostConfirmNote(*app, Notification::Kind::JobFailed,
+                            Fmt(L"设置 {} 优先级失败：{}{}", ControlTargetLabel(req),
+                                err.empty() ? std::wstring(L"未知错误") : err,
+                                AdminHintSuffix(elevated)));
+        }
+    };
+}
+
+inline std::function<void()> MakeSetAffinityJob(std::shared_ptr<AppContext> app,
+                                                const ConfirmRequest& req) {
+    const bool elevated = app->elevated;
+    return [app, elevated, req] {
+        std::wstring err;
+        if (ops::SetProcAffinity(req.key, req.affinityMask, &err)) {
+            PostConfirmNote(*app, Notification::Kind::JobDone,
+                            Fmt(L"已将 {} 的处理器亲和性设为 0x{:X}", ControlTargetLabel(req),
+                                req.affinityMask));
+        } else {
+            PostConfirmNote(*app, Notification::Kind::JobFailed,
+                            Fmt(L"设置 {} 亲和性失败：{}{}", ControlTargetLabel(req),
+                                err.empty() ? std::wstring(L"未知错误") : err,
+                                AdminHintSuffix(elevated)));
+        }
+    };
+}
+
 // Execute the confirmed action: the ONLY entry point a confirm-dialog confirm
 // button should call. Returns true when the op job was queued; a false return is
 // always accompanied by an immediately-posted JobFailed notification (never silent).
@@ -177,6 +266,10 @@ inline bool ExecuteConfirmedAction(std::shared_ptr<AppContext> ctx, const Confir
         case ConfirmKind::TrimWorkingSet: job = MakeTrimWorkingSetJob(ctx, req); break;
         case ConfirmKind::PurgeStandby: job = MakePurgeStandbyJob(ctx); break;
         case ConfirmKind::StartupToggle: job = MakeStartupToggleJob(ctx, req); break;
+        case ConfirmKind::Suspend: job = MakeSuspendJob(ctx, req); break;
+        case ConfirmKind::Resume: job = MakeResumeJob(ctx, req); break;
+        case ConfirmKind::SetPriority: job = MakeSetPriorityJob(ctx, req); break;
+        case ConfirmKind::SetAffinity: job = MakeSetAffinityJob(ctx, req); break;
         case ConfirmKind::None:
         default: return false;
     }

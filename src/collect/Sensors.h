@@ -13,6 +13,13 @@
 // (Ok = documented user-mode source: PDH / GetIfTable2 / CallNtPowerInformation /
 // GlobalMemoryStatusEx / GetPerformanceInfo / NVML; an optional external
 // LibreHardwareMonitor source lives in collect/LhmSource.h, OFF by default).
+//
+// G-B extension (2026-09-18, "同类传感器多值展示"): additive only, again. New
+// members are SensorReading::source and SensorSnapshot::extra. Semantics of all
+// pre-existing members are unchanged; the four-state model governs the new
+// readings too. Multi-value rule: a sensor kind with several instances/sources
+// (ACPI thermal zones, NVML GPUs, per-engtype GPU engines, disks, NICs) yields
+// one reading PER instance — never an aggregate in place of the set.
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -24,6 +31,10 @@ struct SensorReading {
     double value = 0.0;      // in `unit` units
     std::wstring unit;       // L"°C", L"MHz", L"rpm", L"%"
     enum class State { Ok, NeedAdmin, NeedDriver, NoHardware } state = State::Ok;
+    // --- G-B addition (2026-09-18): data provenance, e.g. L"NVML". Empty =
+    // this module's built-in source. Pure metadata: no existing producer sets
+    // it, so default-constructed readings behave exactly as before.
+    std::wstring source;
 };
 
 struct DiskHealth {
@@ -53,14 +64,21 @@ struct SensorSnapshot {
     // --- F3 additions (2026-09-18), all governed by the four-state model ---
     std::vector<SensorReading> cpuCores;  // per-core freq (MHz, CallNtPowerInformation)
                                           // + utilization (%, PDH Processor Information)
-    std::vector<SensorReading> gpus;      // engine-level util 3D/Copy/VideoDecode/Encode
-                                          // (PDH GPU Engine), VRAM dedicated/shared
-                                          // (PDH GPU Adapter Memory), NVML temp when present
+    std::vector<SensorReading> gpus;      // per-sensor GPU expansion (G-B): NVML per card —
+                                          // temp / slowdown threshold / power / gpu+mem util /
+                                          // fan — plus engine-level util 3D/Copy/VideoDecode/
+                                          // Encode (PDH GPU Engine) and VRAM dedicated/shared
+                                          // (PDH GPU Adapter Memory). No NVML -> PDH-only.
     std::vector<SensorReading> network;   // per-adapter recv/send B/s + link speed (GetIfTable2)
     std::vector<SensorReading> battery;   // AC/DC, charge %, remaining time (CallNtPowerInformation
                                           // SystemBatteryState); NoHardware entry when absent
     std::vector<SensorReading> memory;    // physical/committed/paged pool/nonpaged pool
                                           // (GlobalMemoryStatusEx + GetPerformanceInfo)
+    // --- G-B addition (2026-09-18): readings detected but not fitting any group
+    // above (best effort: WMI temperature classes outside MSAcpi_ThermalZone, e.g.
+    // Win32_Temperature / MSStorageDriver_FailurePredictData disk temps). Four-
+    // state rules apply; EMPTY means "nothing found" — simply not displayed.
+    std::vector<SensorReading> extra;
     double uptimeSec = 0.0;               // system uptime in seconds (GetTickCount64)
 };
 

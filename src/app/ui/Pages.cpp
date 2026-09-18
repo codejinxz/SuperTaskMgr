@@ -9,12 +9,19 @@
 #include "app/ui/SortKey.h"
 #include "app/ui/UiText.h"
 #include "app/ui/VersionInfo.h"
-#include "app/ui3/Pages3.h"  // phase-3 extension tabs + shell hooks (additive)
+#include "app/ui3/GcPages.h"      // F4: 崩溃记录/窗口页注册 + 宿主服务模态 + 热键
+#include "app/ui3/JumpState.h"    // F4#3: 跨页跳转槽
+#include "app/ui3/Pages3.h"       // phase-3 extension tabs + shell hooks (additive)
+#include "app/ui3/PerfCsv.h"      // F4#7: 性能 CSV 记录
+#include "app/ui3/ProcControlUi.h"  // F4#2: 优先级/亲和性文案与掩码换算
+#include "app/ui3/ProcKind.h"     // F4#1: 系统进程分类
+#include "app/ui3/ProcTree.h"     // F4#4: 进程树行序
 #include "core/ProcData.h"
 #include "core/ProtectedList.h"
 #include "core/Str.h"
 #include "ops/DetailsProvider.h"
 #include "ops/Elevate.h"
+#include "ops/ProcessControl.h"
 #include "ops/ProcessOps.h"
 #include "imgui.h"
 #include "imgui_internal.h"  // TableSetColumnSortDirection + per-column width readback
@@ -25,6 +32,7 @@
 #include <cwctype>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <shellapi.h>
 #include <string>
 #include <unordered_map>
@@ -69,6 +77,9 @@ struct UiState {
     bool selectedValid = false;
     ui::SortColumn sortColumn = ui::SortColumn::Name;
     bool sortDesc = false;
+    // F4#3: 跨页跳转（网络/服务页 -> 进程页）。DrawShell 消费槽位后暂存于此，
+    // 进程页下一帧解析；找不到时 toast "进程已退出"。
+    uint32_t jumpPendingPid = 0;
 };
 
 UiState& Ui() {
@@ -298,6 +309,8 @@ void DrawConfirmDialogs() {
         case ui::ConfirmKind::KillTree: title = L"确认终止进程树"; action = L"终止进程树"; break;
         case ui::ConfirmKind::TrimWorkingSet: title = L"确认释放工作集"; action = L"释放工作集"; break;
         case ui::ConfirmKind::PurgeStandby: title = L"确认清理待机列表"; action = L"清理待机列表"; break;
+        case ui::ConfirmKind::Suspend: title = L"确认挂起进程"; action = L"挂起进程"; break;
+        case ui::ConfirmKind::SetPriority: title = L"调整进程优先级"; action = L"应用"; break;
         default: break;
     }
     ImGui::PushStyleColor(ImGuiCol_Text, ColFail());
@@ -347,6 +360,34 @@ void DrawConfirmDialogs() {
             ImGui::TextWrapped(
                 "%s", U8(L"仅释放系统文件缓存（待机列表），不会回收进程正在使用的内存；系统随后"
                           "按需重新缓存。需要管理员权限。"));
+            break;
+        case ui::ConfirmKind::Suspend:
+            ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
+            ImGui::TextWrapped(
+                "%s",
+                U8(L"挂起将冻结该进程的全部线程：它不再响应输入、释放不了锁，也可能连带"
+                   L"挂起依赖它的服务或界面。诊断互锁/泄漏时请先尝试，确认后再执行。"));
+            if (req.serviceHost) {
+                ImGui::TextColored(ColFail(), "%s",
+                                   U8(L"警告：该进程是服务宿主，挂起可能导致其承载的全部服务"
+                                      L"卡死，且挂起比终止更难排查。"));
+            }
+            ImGui::TextDisabled("%s", U8(L"挂起后可随时用右键菜单「恢复进程」恢复。"));
+            break;
+        case ui::ConfirmKind::SetPriority:
+            ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
+            ImGui::TextUnformatted(
+                U8(Fmt(L"新优先级：{}", ui3::PriorityLabel(req.priority))));
+            if (req.priority == ops::ProcPriority::Realtime) {
+                ImGui::TextColored(
+                    ColFail(), "%s",
+                    U8(L"警告：实时优先级可能抢占包括输入处理在内的所有系统任务，导致系统"
+                       L"失去响应；仅应在独占硬件场景使用。"));
+            } else if (req.priority == ops::ProcPriority::High) {
+                ImGui::TextColored(ColWarn(), "%s",
+                                   U8(L"提示：高优先级进程会优先于普通程序获得 CPU 时间。"));
+            }
+            ImGui::TextDisabled("%s", U8(L"设置立即生效，不持久化（重启后恢复默认）。"));
             break;
         default:
             break;
@@ -427,6 +468,14 @@ void AppendHistory(const Snapshot& s) {
     PerfHistory& h = Hist();
     if (s.tickId == 0 || s.tickId == h.lastTick) return;  // initial empty / same tick
     h.lastTick = s.tickId;
+    // F4#7: 性能 CSV 记录与环形历史共用摄取点（每 tick 一行，1 Hz 小写入）。
+    // V15-P1: 写入失败（磁盘满等）→ 记录器已自动停止，这里如实 toast（含路径），
+    // 后续 tick 因未激活成为空操作 —— 绝不静默丢行而 UI 仍显示"记录中"。
+    if (!ui3::SharedPerfCsv().Append(s)) {
+        const std::wstring failedPath = ui3::SharedPerfCsv().Path();
+        PushToast(Notification::Kind::JobFailed,
+                  Fmt(L"性能 CSV 记录已自动停止——磁盘写入失败：{}", failedPath));
+    }
     h.cpuTotal.Push(static_cast<float>(s.sys.cpuTotalPercent));      // NaN ok: rendered skipped
     h.physAvail.Push(static_cast<float>(s.sys.physAvail));
     h.commit.Push(static_cast<float>(s.sys.commitTotal));
@@ -480,6 +529,17 @@ public:
         const std::shared_ptr<const Snapshot>& snap = Ui().snap;  // shell-read, never null
         metaBudget_ = 3;  // per-frame cap for new GetFileVersionInfoW queries
         LoadPersistedOnce(ctx);
+        // F4#3: 消费跨页跳转（DrawShell 已把 activePage 切到本页）。找不到时诚实提示。
+        if (Ui().jumpPendingPid != 0) {
+            const uint32_t pid = Ui().jumpPendingPid;
+            Ui().jumpPendingPid = 0;
+            const ProcInfo* jp = FindByPid(*snap, pid);
+            if (jp != nullptr) {
+                Select(*jp);
+            } else {
+                PushToast(Notification::Kind::Warn, Fmt(L"进程 {} 已退出，无法跳转", pid));
+            }
+        }
         if (snap->tickId != lastTickId_) {
             lastTickId_ = snap->tickId;
             RefreshSelection(*snap);
@@ -492,6 +552,7 @@ public:
         }
 
         DrawToolbar(*snap);
+        if (sysDistMode_ == 1) DrawKindLegend();
 
         const float detailW = 380.0f;
         const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -505,6 +566,7 @@ public:
         ImGui::BeginChild("##detailarea", ImVec2(detailW, avail.y), ImGuiChildFlags_Borders);
         DrawDetailPanel(ctx, *snap);
         ImGui::EndChild();
+        DrawAffinityModal(ctx);
     }
 
 private:
@@ -544,6 +606,11 @@ private:
         constexpr float kMaxPlausibleWeight = 10.0f;
         if (widths_[0] > kMaxPlausibleWeight || widths_[0] <= 0.0f) widths_[0] = kDefaultWidths[0];
         if (widths_[12] > kMaxPlausibleWeight || widths_[12] <= 0.0f) widths_[12] = kDefaultWidths[12];
+
+        // F4#1/#4: 系统进程区分模式与树形视图开关（cfg 持久化）。
+        sysDistMode_ = static_cast<int>(ctx.cfg.GetInt(L"sysDistMode", 0));
+        if (sysDistMode_ < 0 || sysDistMode_ > 2) sysDistMode_ = 0;
+        treeMode_ = ctx.cfg.GetBool(L"procTreeMode", false);
     }
 
     void PersistSort(AppContext& ctx) {
@@ -631,16 +698,79 @@ private:
         return ContainsLower(p.name, filterWide_) || ContainsLower(pid, filterWide_);
     }
 
+    // F4#1: "只看用户进程"（sysDistMode 2）——隐藏 Critical/Windows/ServiceHost，
+    // Uwp 属用户应用保留。分类按分类器优先级（Critical > ServiceHost > Uwp >
+    // Windows > User）；Unknown（无名称无路径无徽标）按可见处理（诚实降级）。
+    bool PassesDistFilter(const ProcInfo& p) const {
+        if (sysDistMode_ != 2) return true;
+        const ui3::ProcKind k = ui3::ClassifyProc(p.key.pid, p.name, p.path, p.flags);
+        return ui3::ProcKindVisibleInUserFilter(k);
+    }
+
+    // F4#1/#4: 行序重建 = 文本过滤 + 系统进程过滤 + 当前排序键排序，
+    // 树形模式再按 (parentPid, createTime 防复用) DFS 展平（先过滤后建树）。
     void RebuildRows(const Snapshot& snap) {
-        rows_.clear();
-        rows_.reserve(snap.procs.size());
+        std::vector<int> filtered;
+        filtered.reserve(snap.procs.size());
         for (int i = 0; i < static_cast<int>(snap.procs.size()); ++i) {
-            if (MatchesFilter(snap.procs[static_cast<size_t>(i)])) rows_.push_back(i);
+            const ProcInfo& p = snap.procs[static_cast<size_t>(i)];
+            if (MatchesFilter(p) && PassesDistFilter(p)) filtered.push_back(i);
         }
-        std::stable_sort(rows_.begin(), rows_.end(), [this, &snap](int x, int y) {
+        std::stable_sort(filtered.begin(), filtered.end(), [this, &snap](int x, int y) {
             return ui::SortLess(snap.procs[static_cast<size_t>(x)],
                                 snap.procs[static_cast<size_t>(y)], sortColumn_, sortDesc_);
         });
+
+        rows_.clear();
+        rows_.reserve(filtered.size());
+        kinds_.clear();
+        if (!treeMode_) {
+            for (int i : filtered) {
+                const ProcInfo& p = snap.procs[static_cast<size_t>(i)];
+                rows_.push_back(ui3::TreeRow{i, 0});
+                kinds_.push_back(ui3::ClassifyProc(p.key.pid, p.name, p.path, p.flags));
+            }
+            return;
+        }
+        // 树形：把过滤后的子集拷出（已按当前排序键排序，兄弟序 = 子集原序），
+        // BuildTreeOrder 输出相对下标，再映射回快照绝对下标。
+        std::vector<ProcInfo> subset;
+        std::vector<int> idxMap;
+        subset.reserve(filtered.size());
+        idxMap.reserve(filtered.size());
+        for (int i : filtered) {
+            subset.push_back(snap.procs[static_cast<size_t>(i)]);
+            idxMap.push_back(i);
+        }
+        std::vector<ui3::TreeRow> tree;
+        ui3::BuildTreeOrder(subset, [](int a, int b) { return a < b; }, &tree);
+        rows_.reserve(tree.size());
+        kinds_.reserve(tree.size());
+        for (const ui3::TreeRow& r : tree) {
+            const int abs = idxMap[static_cast<size_t>(r.index)];
+            const ProcInfo& p = snap.procs[static_cast<size_t>(abs)];
+            rows_.push_back(ui3::TreeRow{abs, r.depth});
+            kinds_.push_back(ui3::ClassifyProc(p.key.pid, p.name, p.path, p.flags));
+        }
+    }
+
+    // ---- F4#1: 高亮模式表格上方图例 ------------------------------------------
+    void DrawKindLegend() const {
+        struct Entry { ui3::ProcKind kind; ImVec4 color; };
+        static const Entry kItems[] = {
+            {ui3::ProcKind::Critical,    ImVec4(0.92f, 0.36f, 0.36f, 1.0f)},
+            {ui3::ProcKind::Windows,     ImVec4(0.62f, 0.70f, 0.80f, 1.0f)},
+            {ui3::ProcKind::ServiceHost, ImVec4(0.35f, 0.80f, 0.80f, 1.0f)},
+            {ui3::ProcKind::Uwp,         ImVec4(0.72f, 0.55f, 0.92f, 1.0f)},
+            {ui3::ProcKind::User,        ImVec4(0.85f, 0.85f, 0.85f, 1.0f)},
+        };
+        for (const Entry& e : kItems) {
+            ImGui::TextColored(e.color, "%s", U8(L"●"));
+            ImGui::SameLine();
+            ImGui::TextUnformatted(U8(ui3::ProcKindLegendLabel(e.kind)));
+            ImGui::SameLine();
+        }
+        ImGui::TextDisabled("%s", U8(Fmt(L"模式：{}", ui3::SysDistModeLabel(sysDistMode_))));
     }
 
     // ---- toolbar ------------------------------------------------------------
@@ -655,6 +785,44 @@ private:
         if (ImGui::Button(U8(L"清空"))) {
             filterUtf8_.clear();
         }
+        // F4#1: 区分系统进程（下拉三态，cfg sysDistMode）。
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::BeginCombo("##sysdist", U8(Fmt(L"区分系统进程：{}",
+                                                  ui3::SysDistModeLabel(sysDistMode_))))) {
+            for (int m = 0; m <= 2; ++m) {
+                if (ImGui::Selectable(U8(ui3::SysDistModeLabel(m)), m == sysDistMode_)) {
+                    sysDistMode_ = m;
+                    if (std::shared_ptr<AppContext> app = Ui().liveCtx) {
+                        app->cfg.SetInt(L"sysDistMode", m);
+                    }
+                    rebuildNeeded_ = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(L"高亮：按类别着色进程名；只看用户进程：隐藏系统关键/"
+                                 L"Windows 系统进程/服务宿主（UWP 应用保留）"));
+        }
+        // F4#4: 平铺/树形切换（cfg procTreeMode）。
+        ImGui::SameLine();
+        if (ImGui::Button(treeMode_ ? U8(L"平铺视图") : U8(L"树形视图"))) {
+            treeMode_ = !treeMode_;
+            if (std::shared_ptr<AppContext> app = Ui().liveCtx) {
+                app->cfg.SetBool(L"procTreeMode", treeMode_);
+            }
+            sortReflected_ = false;  // 返回平铺时重新同步表头排序指示
+            rebuildNeeded_ = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(treeMode_ ? L"当前为树形视图（按父进程层级缩进，"
+                                             L"排序仅作用于同级）：点击回到平铺"
+                                           : L"按父进程层级展示（孤儿/父已退出提升为根）："
+                                             L"点击进入树形视图"));
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("%s", U8(Fmt(L"{} / {} 个进程", rows_.size(), snap.procs.size())));
     }
@@ -666,39 +834,49 @@ private:
             return;
         }
 
+        // F4#4: 树形模式下禁用表头点击排序（全局排序降级为同级排序，UI 明示）。
         const int tableFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
-                               ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingFixedFit;
+                               ImGuiTableFlags_SizingFixedFit |
+                               (treeMode_ ? 0 : ImGuiTableFlags_Sortable);
         if (!ImGui::BeginTable("procs", static_cast<int>(ui::SortColumn::Count) + 2, tableFlags)) {
             return;
         }
         ImGui::TableSetupScrollFreeze(0, 1);
         SetupColumns();
-        ReflectPersistedSortOnce();
+        if (!treeMode_) ReflectPersistedSortOnce();
 
-        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
-            if (specs->SpecsDirty) {
-                if (specs->SpecsCount > 0 && specs->Specs[0].ColumnIndex < static_cast<int>(ui::SortColumn::Count)) {
-                    // The sort key changes ONLY on a header click by the user.
-                    sortColumn_ = static_cast<ui::SortColumn>(specs->Specs[0].ColumnIndex);
-                    sortDesc_ = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
-                    Ui().sortColumn = sortColumn_;
-                    Ui().sortDesc = sortDesc_;
-                    PersistSort(ctx);
+        if (!treeMode_) {
+            if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+                if (specs->SpecsDirty) {
+                    if (specs->SpecsCount > 0 && specs->Specs[0].ColumnIndex < static_cast<int>(ui::SortColumn::Count)) {
+                        // The sort key changes ONLY on a header click by the user.
+                        sortColumn_ = static_cast<ui::SortColumn>(specs->Specs[0].ColumnIndex);
+                        sortDesc_ = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                        Ui().sortColumn = sortColumn_;
+                        Ui().sortDesc = sortDesc_;
+                        PersistSort(ctx);
+                    }
+                    specs->SpecsDirty = false;
+                    rebuildNeeded_ = true;
                 }
-                specs->SpecsDirty = false;
-                rebuildNeeded_ = true;
             }
         }
 
         ImGui::TableHeadersRow();
         DrawHeaderTooltips();
+        if (treeMode_ && ImGui::TableGetColumnFlags(0) & ImGuiTableColumnFlags_IsHovered) {
+            ImGui::SetTooltip("%s",
+                              U8(L"树形视图：点击表头排序已禁用，排序键仅在同级进程内生效"));
+        }
 
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(rows_.size()));
         while (clipper.Step()) {
             for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
-                DrawRow(ctx, snap.procs[static_cast<size_t>(rows_[static_cast<size_t>(r)])]);
+                const ui3::TreeRow& row = rows_[static_cast<size_t>(r)];
+                DrawRow(ctx, snap.procs[static_cast<size_t>(row.index)], row.depth,
+                        kinds_[static_cast<size_t>(r)]);
             }
         }
 
@@ -745,7 +923,7 @@ private:
         if (hover(7)) ImGui::SetTooltip("%s", U8(L"每秒硬缺页：需从磁盘读入的缺页次数"));
     }
 
-    void DrawRow(AppContext& ctx, const ProcInfo& p) {
+    void DrawRow(AppContext& ctx, const ProcInfo& p, int depth, ui3::ProcKind kind) {
         // P2-11 (F2 review): identify rows by the stable ProcKey (pid + createTime),
         // not a display index — a refresh that reorders rows mid-interaction must
         // never retarget an open context menu / tooltip to a different process.
@@ -755,11 +933,31 @@ private:
 
         // Name + row interaction (selection, double click, context menu).
         ImGui::TableNextColumn();
+        // F4#4: 树形模式名称列缩进 depth*12px + 「└」连接符（根行无缩进）。
+        if (depth > 0) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                                 static_cast<float>(depth) * ui3::kTreeIndentPx);
+        }
+        // F4#1: 高亮模式按类别着色进程名（图例见表格上方）。
+        ImVec4 nameColor(-1.0f, -1.0f, -1.0f, -1.0f);
+        if (sysDistMode_ == 1) {
+            switch (kind) {
+                case ui3::ProcKind::Critical:    nameColor = ImVec4(0.92f, 0.36f, 0.36f, 1.0f); break;
+                case ui3::ProcKind::Windows:     nameColor = ImVec4(0.62f, 0.70f, 0.80f, 1.0f); break;
+                case ui3::ProcKind::ServiceHost: nameColor = ImVec4(0.35f, 0.80f, 0.80f, 1.0f); break;
+                case ui3::ProcKind::Uwp:         nameColor = ImVec4(0.72f, 0.55f, 0.92f, 1.0f); break;
+                default: break;  // User/Unknown 默认色
+            }
+        }
+        const std::wstring displayName =
+            depth > 0 ? std::wstring(ui3::TreeBranchGlyph()) + p.name : p.name;
         const bool selected = selectedValid_ && p.key == selected_;
-        if (ImGui::Selectable(U8(p.name), selected,
+        if (nameColor.w >= 0.0f) ImGui::PushStyleColor(ImGuiCol_Text, nameColor);
+        if (ImGui::Selectable(U8(displayName), selected,
                               ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
             Select(p);
         }
+        if (nameColor.w >= 0.0f) ImGui::PopStyleColor();
         if (selected) {
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                    ImGui::GetColorU32(ImGuiCol_Header, 0.45f));
@@ -782,7 +980,7 @@ private:
         ImGui::PopID();
     }
 
-    void DrawBadges(const ProcInfo& p) const {
+    void DrawBadges(const ProcInfo& p) {
         auto badge = [&p](uint32_t flag, const char* label, const ImVec4& color) {
             if ((p.flags & flag) == 0) return;
             ImGui::TextColored(color, "%s", label);
@@ -791,11 +989,18 @@ private:
         badge(PF_Elevated, "A", ImVec4(0.95f, 0.65f, 0.30f, 1.0f));  // 管理员提权
         badge(PF_Uwp, "U", ImVec4(0.45f, 0.72f, 0.95f, 1.0f));       // UWP
         badge(PF_Wow64, "W", ImVec4(0.50f, 0.85f, 0.55f, 1.0f));     // WOW64
-        badge(PF_ServiceHost, "S", ImVec4(0.75f, 0.55f, 0.95f, 1.0f));  // 服务宿主
+        if ((p.flags & PF_ServiceHost) != 0) {
+            // F4#3: 服务宿主徽标 tooltip 列出宿主服务名（jobs 缓存，见 GcPages）。
+            ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "S");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", U8(ui3::HostServiceNamesText(p.key.pid)));
+            }
+            ImGui::SameLine();
+        }
         badge(PF_Protected, "P", ImVec4(0.92f, 0.36f, 0.36f, 1.0f));    // 受保护
         badge(PF_Suspended, "Z", ImVec4(0.60f, 0.60f, 0.60f, 1.0f));    // 挂起
         static const std::wstring kLegend =
-            L"A 管理员提权  U UWP  W WOW64  S 服务宿主  P 受保护  Z 挂起";
+            L"A 管理员提权  U UWP  W WOW64  S 服务宿主（悬停查看承载的服务）  P 受保护  Z 挂起";
         if ((ImGui::TableGetColumnFlags() & ImGuiTableColumnFlags_IsHovered) != 0) {
             ImGui::SetTooltip("%s", U8(kLegend));
         }
@@ -827,6 +1032,8 @@ private:
         std::wstring reason;
         const bool protectedProc = (p.flags & PF_Protected) != 0;
         if (protectedProc) reason = ProtectedReason(p.key.pid, p.name, p.path);
+        const bool serviceHost = (p.flags & PF_ServiceHost) != 0;
+        const bool suspended = (p.flags & PF_Suspended) != 0;
 
         if (ImGui::MenuItem(U8(L"查看详情"), nullptr, false, true)) Select(p);
         ImGui::Separator();
@@ -834,11 +1041,61 @@ private:
             ImGui::MenuItem(U8(Fmt(L"受保护：{}", reason.empty() ? std::wstring(L"系统关键进程") : reason)),
                             nullptr, false, false);
         }
+        // F4#3: 服务宿主 -> 查看承载的服务（模态，走 jobs 缓存）。
+        if (serviceHost && ImGui::MenuItem(U8(L"查看宿主服务…"))) {
+            ui3::RequestHostServicesModal(p.key.pid, p.name);
+        }
         ImGui::BeginDisabled(protectedProc);
         if (ImGui::MenuItem(U8(L"终止进程"))) RequestConfirmKill(p);
         if (ImGui::MenuItem(U8(L"终止进程树"))) RequestTreePlan(p);
         // V8-P1-1: trim is a destructive op too — same gate as the terminate items.
         if (ImGui::MenuItem(U8(L"释放工作集"))) RequestConfirmTrim(p);
+        ImGui::Separator();
+        // F4#2: 挂起/恢复 + 优先级 + 亲和性。保护名单进程全部禁用
+        //（挂起 csrss 比终止更恶劣）。挂起态徽标 (PF_Suspended) 决定菜单文案；
+        // ops 执行时仍按 (pid, createTime) 重验身份 + 保护名单硬拒。
+        if (suspended) {
+            if (ImGui::MenuItem(U8(L"恢复进程"))) {
+                ui::ConfirmRequest req;
+                req.kind = ui::ConfirmKind::Resume;
+                req.key = p.key;
+                req.pid = p.key.pid;
+                req.name = p.name;
+                req.path = p.path;
+                ui::ExecuteConfirmedAction(Ui().liveCtx, req);
+                ctrlInfoDirty_ = true;
+            }
+        } else if (ImGui::MenuItem(U8(L"挂起进程…"))) {
+            RequestConfirmSuspend(p);
+        }
+        if (ImGui::BeginMenu(U8(L"设置优先级"), !protectedProc)) {
+            ops::ProcPriority current = ops::ProcPriority::Normal;
+            ops::ProcessControlInfo ci;
+            std::wstring ciErr;
+            const CtrlQuery st = GetCtrlInfo(p.key, &ci, &ciErr);
+            const bool hasCurrent = st == CtrlQuery::Ready &&
+                                    ui3::PriorityFromWin32(ci.priorityClass, &current);
+            for (int i = 0; i <= static_cast<int>(ops::ProcPriority::Realtime); ++i) {
+                const ops::ProcPriority pr = static_cast<ops::ProcPriority>(i);
+                const bool isRealtime = pr == ops::ProcPriority::Realtime;
+                if (isRealtime) ImGui::PushStyleColor(ImGuiCol_Text, ColFail());
+                if (ImGui::MenuItem(U8(ui3::PriorityLabel(pr)), nullptr,
+                                    hasCurrent && current == pr)) {
+                    RequestConfirmPriority(p, pr);
+                }
+                if (isRealtime) ImGui::PopStyleColor();
+            }
+            if (st == CtrlQuery::Failed) {
+                ImGui::TextColored(ColWarn(), "%s",
+                                   U8(Fmt(L"（优先级查询失败：{}）", ciErr)));
+            } else if (!hasCurrent) {
+                ImGui::TextDisabled("%s", U8(L"（当前优先级查询中…）"));
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem(U8(L"设置亲和性…"), nullptr, false, !protectedProc)) {
+            RequestAffinityModal(p);
+        }
         ImGui::EndDisabled();
         ImGui::Separator();
         if (ImGui::MenuItem(U8(L"复制名称"))) ImGui::SetClipboardText(U8(p.name));
@@ -851,6 +1108,32 @@ private:
         }
         ImGui::EndDisabled();
         ImGui::EndPopup();
+    }
+
+    // ---- F4#1/#2 确认请求构建 --------------------------------------------------
+    void RequestConfirmSuspend(const ProcInfo& p) {
+        CloseConfirm();
+        auto& req = Ui().confirm;
+        req.kind = ui::ConfirmKind::Suspend;
+        req.key = p.key;
+        req.pid = p.key.pid;
+        req.name = p.name;
+        req.path = p.path;
+        req.serviceHost = (p.flags & PF_ServiceHost) != 0;
+        Ui().confirmOpenRequested = true;
+    }
+
+    void RequestConfirmPriority(const ProcInfo& p, ops::ProcPriority pr) {
+        CloseConfirm();
+        auto& req = Ui().confirm;
+        req.kind = ui::ConfirmKind::SetPriority;
+        req.key = p.key;
+        req.pid = p.key.pid;
+        req.name = p.name;
+        req.path = p.path;
+        req.serviceHost = (p.flags & PF_ServiceHost) != 0;
+        req.priority = pr;
+        Ui().confirmOpenRequested = true;
     }
 
     static void OpenContainingFolder(const std::wstring& path) {
@@ -922,8 +1205,258 @@ private:
 
         field(L"窗口标题", p.windowTitle);
         field(L"会话 ID", Fmt(L"{}", p.sessionId));
+        DrawControlSection(ctx, p, alive);
         DrawModulesSection(ctx, p, alive);
         ImGui::EndChild();
+    }
+
+    // ---- F4#2: 进程控制信息缓存（GetProcessControlInfo 走 jobs，2 秒新鲜度） ----
+    struct CtrlSlot {
+        std::mutex mu;
+        bool ready = false;
+        bool ok = false;
+        double requestedAt = 0.0;  // ImGui::GetTime() of last request (staleness)
+        ops::ProcessControlInfo info;
+        std::wstring err;
+    };
+
+    // Returns a COPY under the slot lock (the worker may refresh the slot while
+    // this frame renders — never hand out a pointer into the shared cell).
+    // V15-P2-2: tri-state query result — Pending (job in flight), Ready (values
+    // valid), Failed (ops reported honestly via err, e.g. 无读取权限). The UI must
+    // never render a fake "未知（类 0x0）" for a failed query.
+    enum class CtrlQuery { Pending, Ready, Failed };
+    CtrlQuery GetCtrlInfo(const ProcKey& key, ops::ProcessControlInfo* out,
+                          std::wstring* err) {
+        EnsureCtrlInfo(key);
+        const auto it = ctrl_.find(key);
+        if (it == ctrl_.end()) return CtrlQuery::Pending;
+        std::lock_guard<std::mutex> lock(it->second->mu);
+        if (!it->second->ready) return CtrlQuery::Pending;
+        if (!it->second->err.empty()) {  // 契约：err 非空 = 查询失败（诚实）
+            if (err != nullptr) *err = it->second->err;
+            return CtrlQuery::Failed;
+        }
+        if (out != nullptr) *out = it->second->info;
+        return CtrlQuery::Ready;
+    }
+
+    void EnsureCtrlInfo(const ProcKey& key) {
+        const double now = ImGui::GetTime();
+        const auto it = ctrl_.find(key);
+        if (it != ctrl_.end()) {
+            std::lock_guard<std::mutex> lock(it->second->mu);
+            if (it->second->ready && !ctrlInfoDirty_ &&
+                now - it->second->requestedAt < 2.0) {
+                return;
+            }
+        }
+        if (ctrlBusy_) return;  // 单飞：等待上一个查询落地
+        ctrlInfoDirty_ = false;
+        std::shared_ptr<CtrlSlot> slot;
+        if (it != ctrl_.end()) {
+            slot = it->second;
+        } else {
+            slot = std::make_shared<CtrlSlot>();
+            ctrl_.emplace(key, slot);
+        }
+        {
+            std::lock_guard<std::mutex> lock(slot->mu);
+            slot->requestedAt = now;
+            slot->ready = false;
+        }
+        ctrlBusy_ = true;
+        std::shared_ptr<AppContext> app = Ui().liveCtx;
+        std::shared_ptr<CtrlSlot> capture = slot;
+        if (!app || app->jobs.Submit([app, capture, key] {
+                std::wstring err;
+                ops::ProcessControlInfo info = ops::GetProcessControlInfo(key, &err);
+                std::lock_guard<std::mutex> lock(capture->mu);
+                capture->info = info;
+                capture->err = std::move(err);
+                capture->ok = true;  // 失败也有 err，ok 表示查询已完成
+                capture->ready = true;
+            }) == 0) {
+            ctrlBusy_ = false;  // 队列已停（退出中）：下次重试
+            return;
+        }
+        ctrlPending_ = slot;
+    }
+
+    // Polls the in-flight control-info query (single slot) — keeps the map clean
+    // and resets the single-flight flag once the job lands.
+    void PollCtrlInfo() {
+        if (!ctrlPending_) return;
+        std::lock_guard<std::mutex> lock(ctrlPending_->mu);
+        if (ctrlPending_->ready) {
+            ctrlPending_.reset();
+            ctrlBusy_ = false;
+        }
+    }
+
+    void DrawControlSection(AppContext& ctx, const ProcInfo& p, bool alive) {
+        (void)ctx;
+        ImGui::Separator();
+        ImGui::TextUnformatted(U8(L"控制"));
+        if (!alive) {
+            ImGui::TextDisabled("%s", U8(L"进程已退出，无法查询"));
+            return;
+        }
+        PollCtrlInfo();
+        EnsureCtrlInfo(p.key);
+        ops::ProcessControlInfo ci;
+        std::wstring ciErr;
+        auto field2 = [](const std::wstring& label, const std::wstring& value) {
+            ImGui::TextDisabled("%s", U8(label));
+            ImGui::SameLine(110.0f);
+            ImGui::TextWrapped("%s", U8(value));
+        };
+        // V15-P2-2: Pending 与 Failed 分开呈现 —— 失败显示 err，绝不渲染
+        // "未知（类 0x0）"这类把零值当数据的输出。失败 2 秒新鲜度到期自动重试。
+        const CtrlQuery st = GetCtrlInfo(p.key, &ci, &ciErr);
+        if (st == CtrlQuery::Pending) {
+            field2(L"优先级", L"查询中…");
+            field2(L"亲和性", L"查询中…");
+            return;
+        }
+        if (st == CtrlQuery::Failed) {
+            ImGui::TextColored(ColWarn(), "%s", U8(Fmt(L"查询失败：{}", ciErr)));
+            return;
+        }
+        ops::ProcPriority pr = ops::ProcPriority::Normal;
+        field2(L"优先级", ui3::PriorityFromWin32(ci.priorityClass, &pr)
+                              ? ui3::PriorityLabel(pr)
+                              : Fmt(L"未知（类 0x{:X}）", ci.priorityClass));
+        field2(L"亲和性", ui3::AffinitySummary(ci.affinityMask));
+        std::wstring suspText = L"未知";
+        if (ci.suspendedAvail) suspText = ci.suspended ? L"已挂起" : L"运行中";
+        field2(L"挂起状态", suspText);
+        if (!ci.suspendedAvail) {
+            ImGui::TextDisabled("%s", U8(L"（挂起检测不可用：无读取权限）"));
+        }
+    }
+
+    // ---- F4#2: 亲和性模态（每逻辑核复选框 + 全选/全不选 + 确定，走 jobs） -------
+    struct AffinityModal {
+        bool openRequested = false;
+        ProcKey key;
+        uint32_t pid = 0;
+        std::wstring name;
+        std::vector<char> sel;
+        uint64_t systemMask = 0;
+        bool inited = false;
+    };
+
+    void RequestAffinityModal(const ProcInfo& p) {
+        aff_ = AffinityModal{};
+        aff_.openRequested = true;
+        aff_.key = p.key;
+        aff_.pid = p.key.pid;
+        aff_.name = p.name;
+    }
+
+    void DrawAffinityModal(AppContext& ctx) {
+        (void)ctx;  // submission goes through Ui().liveCtx (ExecuteConfirmedAction)
+        if (!aff_.openRequested && !ImGui::IsPopupOpen("##affinity")) return;
+        constexpr char kPopup[] = "##affinity";
+        if (aff_.openRequested) {
+            ImGui::OpenPopup(kPopup);
+            aff_.openRequested = false;
+            aff_.inited = false;
+        }
+        if (!ImGui::IsPopupOpen(kPopup)) return;
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                                ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(420.0f, 0.0f), ImVec2(420.0f, 480.0f));
+        if (!ImGui::BeginPopupModal(kPopup, nullptr, ImGuiWindowFlags_None)) return;
+
+        ImGui::TextUnformatted(U8(Fmt(L"设置 {} (PID {}) 的处理器亲和性", aff_.name, aff_.pid)));
+        ImGui::Separator();
+
+        PollCtrlInfo();
+        ops::ProcessControlInfo cinfo;
+        std::wstring affErr;
+        if (!aff_.inited) {
+            const CtrlQuery st = GetCtrlInfo(aff_.key, &cinfo, &affErr);
+            if (st == CtrlQuery::Ready && cinfo.systemAffinityMask != 0) {
+                aff_.systemMask = cinfo.systemAffinityMask;
+                const std::vector<int> cpus =
+                    ui3::AffinityCpuList(cinfo.affinityMask & cinfo.systemAffinityMask);
+                aff_.sel.assign(64, 0);
+                for (int cpu : cpus) aff_.sel[static_cast<size_t>(cpu)] = 1;
+                aff_.inited = true;
+            }
+        }
+        if (!aff_.inited) {
+            // V15-P2-3: Pending 与失败态分开 —— 失败显示 err 并允许"重试"，
+            // 不再永远停在"正在查询当前亲和性…"。掩码有效但读不到（0）同属失败。
+            const CtrlQuery st = GetCtrlInfo(aff_.key, &cinfo, &affErr);
+            if (st == CtrlQuery::Pending) {
+                ImGui::TextDisabled("%s", U8(L"正在查询当前亲和性…（无读取权限时无法设置）"));
+            } else {
+                const std::wstring reason =
+                    st == CtrlQuery::Failed
+                        ? affErr
+                        : std::wstring(L"无法读取系统亲和性掩码（权限不足或进程已退出）");
+                ImGui::TextColored(ColWarn(), "%s", U8(Fmt(L"查询失败：{}", reason)));
+                if (ImGui::Button(U8(L"重试"))) {
+                    ctrlInfoDirty_ = true;  // 强制下次 EnsureCtrlInfo 重新查询
+                }
+                ImGui::SameLine();
+            }
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
+            if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        if (ImGui::Button(U8(L"全选"))) {
+            for (int cpu : ui3::AffinityCpuList(aff_.systemMask)) {
+                aff_.sel[static_cast<size_t>(cpu)] = 1;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(U8(L"全不选"))) {
+            std::fill(aff_.sel.begin(), aff_.sel.end(), static_cast<char>(0));
+        }
+        int chosen = 0;
+        const std::vector<int> sysCpus = ui3::AffinityCpuList(aff_.systemMask);
+        const size_t cols = 8;  // 每行 8 个复选框（64 核网格化）
+        for (size_t n = 0; n < sysCpus.size(); ++n) {
+            const int cpu = sysCpus[n];
+            if (n % cols != 0) ImGui::SameLine();
+            ImGui::PushID(cpu);
+            bool on = aff_.sel[static_cast<size_t>(cpu)] != 0;
+            if (ImGui::Checkbox(U8(Fmt(L"CPU {}", cpu)), &on)) {
+                aff_.sel[static_cast<size_t>(cpu)] = on ? 1 : 0;
+            }
+            ImGui::PopID();
+        }
+        for (char c : aff_.sel) chosen += c != 0 ? 1 : 0;
+        ImGui::TextDisabled("%s", U8(Fmt(L"已选 {} / {} 个逻辑核（掩码须落在系统允许组内）",
+                                         chosen, sysCpus.size())));
+        ImGui::Separator();
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
+        if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(chosen == 0);
+        if (ImGui::Button(U8(L"确定"), ImVec2(120.0f, 0.0f)) && chosen > 0) {
+            uint64_t mask = 0;
+            for (int cpu : sysCpus) {
+                if (aff_.sel[static_cast<size_t>(cpu)] != 0) mask |= (1ull << cpu);
+            }
+            ui::ConfirmRequest req;
+            req.kind = ui::ConfirmKind::SetAffinity;
+            req.key = aff_.key;
+            req.pid = aff_.pid;
+            req.name = aff_.name;
+            req.affinityMask = mask;
+            ui::ExecuteConfirmedAction(Ui().liveCtx, req);
+            ctrlInfoDirty_ = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
     }
 
     void MaybeRequestDetails(AppContext& ctx, const ProcInfo& p) {
@@ -1095,7 +1628,6 @@ private:
     double lastWidthSave_ = 0.0;
 
     uint64_t lastTickId_ = 0;
-    std::vector<int> rows_;  // filtered + sorted indices into snapshot procs
     std::string filterUtf8_;
     std::wstring filterWide_;
     std::wstring lastFilterWide_;
@@ -1109,6 +1641,20 @@ private:
     int metaBudget_ = 3;
     // F4: per-module-path signature verification cache (ops worker results).
     std::unordered_map<std::wstring, std::shared_ptr<std::atomic<int>>> moduleSigs_;
+
+    // F4#1/#4: 系统进程区分模式（0 关 / 1 高亮 / 2 只看用户）与树形视图开关。
+    int sysDistMode_ = 0;
+    bool treeMode_ = false;
+    // 行序（平铺 depth=0；树形 DFS 行序带深度）+ 与 rows_ 对齐的类别（着色用）。
+    std::vector<ui3::TreeRow> rows_;
+    std::vector<ui3::ProcKind> kinds_;
+
+    // F4#2: 进程控制信息缓存（jobs 单飞查询；ctrlInfoDirty_ 在操作提交后失效）。
+    std::unordered_map<ProcKey, std::shared_ptr<CtrlSlot>> ctrl_;
+    std::shared_ptr<CtrlSlot> ctrlPending_;
+    bool ctrlBusy_ = false;
+    bool ctrlInfoDirty_ = false;
+    AffinityModal aff_;
 };
 
 // ===========================================================================
@@ -1165,6 +1711,7 @@ public:
         // render adapter utilization/memory + per-process top 5 consumers.
         DrawGpuBlock(*Ui().snap);
         ui3::DrawAlertControls(ctx);  // phase-3: threshold alert controls (additive row)
+        DrawCsvControls(ctx, sys);    // F4#7: 性能 CSV 记录开关
     }
 
 private:
@@ -1223,6 +1770,51 @@ private:
         PlotRing(U8(L"接收"), hist.netRecv, false);
         PlotRing(U8(L"发送"), hist.netSend, false);
         ImPlot::EndPlot();
+    }
+
+    // F4#7: 性能 CSV 记录（开始 -> captures 目录；停止 -> toast 路径 + 打开文件夹）。
+    static void DrawCsvControls(AppContext& ctx, const SystemInfo& sys) {
+        ui3::PerfCsvRecorder& rec = ui3::SharedPerfCsv();
+        ImGui::Separator();
+        if (!rec.Active()) {
+            if (ImGui::Button(U8(L"记录 CSV"))) {
+                std::wstring err;
+                const size_t cores = sys.perCorePercent.size();
+                if (rec.Start(ui3::PerfCsvDefaultDir(), cores, &err)) {
+                    ctx.cfg.SetBool(L"perfCsvWanted", true);
+                    PushToast(Notification::Kind::JobDone,
+                              Fmt(L"已开始记录性能 CSV：{}", rec.Path()));
+                } else {
+                    PushToast(Notification::Kind::JobFailed,
+                              err.empty() ? std::wstring(L"启动 CSV 记录失败") : err);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s",
+                                  U8(L"按当前刷新间隔把系统级指标追加写入 %LOCALAPPDATA%"
+                                     L"\\SuperTaskMgr\\captures\\perf_*.csv（含每核 CPU、内存、"
+                                     L"磁盘、网络、GPU 利用率；不记录任何进程级数据）"));
+            }
+            return;
+        }
+        ImGui::TextColored(ColDone(), "%s", U8(L"● 记录中"));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", U8(TruncateModulePath(rec.Path())));
+        if (ImGui::IsItemHovered() && rec.Path().size() > 60) {
+            ImGui::SetTooltip("%s", U8(rec.Path()));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(U8(L"停止记录"))) {
+            const std::wstring path = rec.Path();
+            rec.Stop();
+            ctx.cfg.SetBool(L"perfCsvWanted", false);
+            PushToast(Notification::Kind::JobDone, Fmt(L"已停止记录，文件保存于 {}", path));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(U8(L"打开文件夹"))) {
+            const std::wstring arg = L"/select,\"" + rec.Path() + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+        }
     }
 
     static void DrawMemoryBars(const SystemInfo& sys) {
@@ -1437,6 +2029,30 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     ImGui::SameLine();
     if (ImGui::Button(U8(L"清理待机缓存"))) RequestConfirmPurgeStandby();
 
+    // F4#10: 全局热键 Ctrl+Alt+M 呼出/隐藏主窗（cfg hotkeyEnabled，默认关；
+    // 注册/反注册在主线程完成，失败如实提示，不持久化到注册表）。
+    ImGui::SameLine();
+    {
+        bool hotkey = ctx.cfg.GetBool(L"hotkeyEnabled", false);
+        if (ImGui::Checkbox(U8(L"全局热键 Ctrl+Alt+M"), &hotkey)) {
+            std::wstring err;
+            if (ui3::GcHotkeySetEnabled(hotkey, &err)) {
+                ctx.cfg.SetBool(L"hotkeyEnabled", hotkey);
+                PushToast(Notification::Kind::Info,
+                          hotkey ? L"已注册全局热键 Ctrl+Alt+M（呼出/隐藏主窗）"
+                                 : L"已注销全局热键");
+            } else {
+                // 不落 cfg：下一帧复选框按持久状态回显（诚实状态机）。
+                PushToast(Notification::Kind::JobFailed, err);
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(L"注册 Ctrl+Alt+M 全局热键：任意前台应用下呼出/隐藏本工具"
+                                 L"（仅运行期有效，不写注册表）"));
+        }
+    }
+
     ImGui::SameLine(ImGui::GetWindowWidth() - 90.0f);
     if (ctx.elevated) {
         ImGui::TextColored(ColInfo(), "%s", U8(L"管理员"));
@@ -1485,6 +2101,16 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     } else {
         ImGui::TextDisabled("%s", U8(L"完整模式"));
     }
+    // F4#7: CSV 记录状态在状态栏常显（悬停显示文件路径）。
+    if (ui3::SharedPerfCsv().Active()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::TextColored(ColDone(), "%s", U8(L"● 记录 CSV"));
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(ui3::SharedPerfCsv().Path()));
+        }
+    }
     if (!Ui().lastNote.empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("|");
@@ -1504,6 +2130,7 @@ void RegisterPages(AppContext& ctx) {
     ctx.pages.push_back(std::make_unique<ProcessesPage>());
     ctx.pages.push_back(std::make_unique<PerfPage>());
     ui3::RegisterPhase3Pages(ctx);  // phase-3: 网络/启动项/服务/驱动/传感器
+    ui3::RegisterGcPages(ctx);      // F4: 崩溃记录/窗口
 }
 
 void BindAppContext(std::shared_ptr<AppContext> ctx) {
@@ -1554,6 +2181,17 @@ void DrawShell(AppContext& ctx) {
     DrainNotifications(ctx);
     ui3::AlertTick(ctx);  // phase-3: threshold alert watcher (default off)
 
+    // F4#3: 跨页跳转 —— 任意页发起的"跳转到进程"切换到进程页，由其下一帧解析
+    // （找不到目标进程时 toast "进程已退出"）。
+    {
+        uint32_t jumpPid = 0;
+        if (ui3::ConsumeProcessJump(&jumpPid)) {
+            Ui().jumpPendingPid = jumpPid;
+            if (!ctx.pages.empty()) ctx.activePage = 0;
+            Ui().tabSelectArmed = true;  // 让 TabBar 选中进程页
+        }
+    }
+
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
@@ -1590,6 +2228,7 @@ void DrawShell(AppContext& ctx) {
     ImGui::PopStyleVar();
 
     ui3::DrawSmokeAllPages(ctx);  // phase-3: --smoke exercises every page offscreen
+    ui3::DrawGcModals(ctx);       // F4#3: 宿主服务共享模态
     DrawToasts();
     DrawConfirmDialogs();
 }
