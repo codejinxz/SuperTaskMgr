@@ -4,6 +4,8 @@
 // narrow-char (UTF-8) API. The UI thread reads the snapshot exactly once per frame.
 #include "app/ui/Pages.h"
 #include "app/AppContext.h"
+#include "app/ui/ConfirmAction.h"
+#include "app/ui/ModulesUi.h"
 #include "app/ui/SortKey.h"
 #include "app/ui/UiText.h"
 #include "app/ui/VersionInfo.h"
@@ -25,6 +27,7 @@
 #include <memory>
 #include <shellapi.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace stm {
@@ -43,23 +46,9 @@ struct Toast {
     double expireTime = 0.0;  // ImGui::GetTime() based
 };
 
-struct ConfirmKind {
-    enum E { None = 0, Kill, KillTree, TrimWorkingSet, PurgeStandby };
-};
-
-// Pending confirmation. ProcKey/name/path are locked at request time ("确认框打开
-// 瞬间锁定副本"); ops re-verifies identity at execution time regardless.
-struct ConfirmRequest {
-    int kind = ConfirmKind::None;
-    ProcKey key;
-    uint32_t pid = 0;
-    std::wstring name;
-    std::wstring path;
-    bool serviceHost = false;
-    // Tree planning: filled by an ops job, polled by the UI until ready.
-    // -1 pending, -2 planning failed, >= 0 planned count.
-    std::shared_ptr<std::atomic<int>> planCount;
-};
+// ConfirmKind/ConfirmRequest moved to app/ui/ConfirmAction.h (bug F1 fix): the
+// confirm-action execution is shared with the phase-3 startup dialog and is
+// unit-tested by stm_selftest without a GUI.
 
 struct UiState {
     std::shared_ptr<const Snapshot> snap;  // one Store().Get() per frame (shell owns it)
@@ -70,8 +59,10 @@ struct UiState {
     std::shared_ptr<AppContext> liveCtx;
     std::deque<Toast> toasts;
     std::wstring lastNote;                  // survives toast expiry for the status bar
-    ConfirmRequest confirm;
-    bool confirmOpenRequested = false;
+    ui::ConfirmRequest confirm;
+    bool confirmOpenRequested = false;      // set once by the menu handler: open the modal
+    bool confirmOpened = false;             // modal actually reached the open state
+    bool tabSelectArmed = true;             // P1-1: one-shot SetSelected on session restore
     bool paused = false;
     // Selection bookkeeping the session handoff reads (updated by ProcessesPage).
     ProcKey selectedKey;
@@ -93,8 +84,9 @@ void PushToast(Notification::Kind kind, const std::wstring& text) {
 }
 
 // ===========================================================================
-// ops job submission helpers (all destructive ops go through ctx.jobs; results
-// come back as notifications -> toasts).
+// Confirm-action submission: all destructive ops go through ui::ExecuteConfirmed-
+// Action (app/ui/ConfirmAction.h) on the ops worker queue; results come back as
+// notifications -> toasts. See ConfirmAction.h for the lifetime/feedback contract.
 // ===========================================================================
 
 void PostNote(NotificationQueue& notes, Notification::Kind kind, const std::wstring& text) {
@@ -104,117 +96,58 @@ void PostNote(NotificationQueue& notes, Notification::Kind kind, const std::wstr
     notes.Push(n);
 }
 
-std::wstring FailSuffix(bool elevated) {
-    return elevated ? std::wstring()
-                    : std::wstring(L"（可能需要管理员权限，可尝试提权重启）");
-}
-
-// Every job captures the shared AppContext by value: the capture holds notes/jobs/
-// details alive even if main tears down while this job is still in flight
-// (JobQueue::Shutdown detaches after its wait timeout). Never touch the raw
-// AppContext& from inside a job.
-void SubmitKill(const ProcKey& key, const std::wstring& name) {
-    std::shared_ptr<AppContext> app = Ui().liveCtx;
-    if (!app) return;
-    const bool elevated = app->elevated;
-    app->jobs.Submit([app, elevated, key, name] {
-        std::wstring err;
-        if (ops::TerminateProcessById(key, &err)) {
-            PostNote(app->notes, Notification::Kind::JobDone,
-                     Fmt(L"已终止进程 {} ({})", name, key.pid));
-        } else {
-            PostNote(app->notes, Notification::Kind::JobFailed,
-                     Fmt(L"终止 {} ({}) 失败：{}{}", name, key.pid,
-                         err.empty() ? std::wstring(L"未知错误") : err, FailSuffix(elevated)));
-        }
-    });
-}
-
-void SubmitKillTree(const ProcKey& key, const std::wstring& name) {
-    std::shared_ptr<AppContext> app = Ui().liveCtx;
-    if (!app) return;
-    const bool elevated = app->elevated;
-    app->jobs.Submit([app, elevated, key, name] {
-        ops::TreeResult r;
-        std::wstring err;
-        if (!ops::TerminateTree(key, &r, &err)) {
-            PostNote(app->notes, Notification::Kind::JobFailed,
-                     Fmt(L"终止进程树 {} ({}) 失败：{}{}", name, key.pid,
-                         err.empty() ? std::wstring(L"未知错误") : err, FailSuffix(elevated)));
-            return;
-        }
-        std::wstring text = Fmt(L"已终止进程树 {} ({})：终止 {} 个", name, key.pid, r.terminated);
-        if (r.skippedProtected > 0) text += Fmt(L"，跳过保护进程 {} 个", r.skippedProtected);
-        if (r.failed > 0) text += Fmt(L"，失败 {} 个", r.failed);
-        PostNote(app->notes, r.failed > 0 ? Notification::Kind::Warn : Notification::Kind::JobDone,
-                 text);
-    });
-}
-
-void SubmitTrimWorkingSet(const ProcKey& key, const std::wstring& name) {
-    std::shared_ptr<AppContext> app = Ui().liveCtx;
-    if (!app) return;
-    const bool elevated = app->elevated;
-    app->jobs.Submit([app, elevated, key, name] {
-        std::wstring err;
-        if (ops::TrimWorkingSet(key, &err)) {
-            PostNote(app->notes, Notification::Kind::JobDone,
-                     Fmt(L"已请求释放 {} ({}) 的工作集内存", name, key.pid));
-        } else {
-            PostNote(app->notes, Notification::Kind::JobFailed,
-                     Fmt(L"释放 {} ({}) 工作集失败：{}{}", name, key.pid,
-                         err.empty() ? std::wstring(L"未知错误") : err, FailSuffix(elevated)));
-        }
-    });
-}
-
-void SubmitPurgeStandby() {
-    std::shared_ptr<AppContext> app = Ui().liveCtx;
-    if (!app) return;
-    const bool elevated = app->elevated;
-    app->jobs.Submit([app, elevated] {
-        std::wstring err;
-        if (ops::PurgeStandbyList(&err)) {
-            PostNote(app->notes, Notification::Kind::JobDone, L"已清理系统待机列表");
-        } else {
-            PostNote(app->notes, Notification::Kind::JobFailed,
-                     Fmt(L"清理待机列表失败：{}{}", err.empty() ? std::wstring(L"未知错误") : err,
-                         FailSuffix(elevated)));
-        }
-    });
+// Clears any pending confirm request (used by every dialog exit path).
+void CloseConfirm() {
+    Ui().confirm = ui::ConfirmRequest{};
+    Ui().confirmOpenRequested = false;
+    Ui().confirmOpened = false;
 }
 
 void RequestTreePlan(const ProcInfo& p) {
+    CloseConfirm();
     auto& req = Ui().confirm;
-    req = ConfirmRequest{};
-    req.kind = ConfirmKind::KillTree;
+    req.kind = ui::ConfirmKind::KillTree;
     req.key = p.key;
     req.pid = p.key.pid;
     req.name = p.name;
     req.path = p.path;
     req.serviceHost = (p.flags & PF_ServiceHost) != 0;
     req.planCount = std::make_shared<std::atomic<int>>(-1);
+    // P2 (V14): the tree dialog opens immediately with a "正在规划进程树…" line.
+    Ui().confirmOpenRequested = true;
     std::shared_ptr<AppContext> app = Ui().liveCtx;
-    if (!app) return;
+    if (!app) {
+        // No live context (teardown): no notes queue exists to inform — reset only.
+        CloseConfirm();
+        return;
+    }
+    const bool elevated = app->elevated;
     std::shared_ptr<std::atomic<int>> plan = req.planCount;
-    app->jobs.Submit([app, key = p.key, plan] {
-        std::vector<ProcKey> members;
-        std::wstring err;
-        if (ops::PlanTerminateTree(key, &members, &err)) {
-            plan->store(static_cast<int>(members.size()));
-        } else {
-            plan->store(-2);
-            PostNote(app->notes, Notification::Kind::JobFailed,
-                     Fmt(L"无法规划进程树：{}", err.empty() ? std::wstring(L"未知错误") : err));
-        }
-    });
+    if (app->jobs.Submit([app, elevated, key = p.key, plan] {
+            std::vector<ProcKey> members;
+            std::wstring err;
+            if (ops::PlanTerminateTree(key, &members, &err)) {
+                plan->store(static_cast<int>(members.size()));
+            } else {
+                plan->store(-2);
+                // P2 (V14): same admin-hint suffix as every other failure note.
+                PostNote(app->notes, Notification::Kind::JobFailed,
+                         Fmt(L"无法规划进程树：{}{}", err.empty() ? std::wstring(L"未知错误") : err,
+                             ui::AdminHintSuffix(elevated)));
+            }
+        }) == 0) {
+        // P2 (V14): refused submission must never be silent.
+        PostNote(app->notes, Notification::Kind::JobFailed,
+                 L"操作队列未运行，进程树规划未提交（应用可能正在退出）");
+        CloseConfirm();
+    }
 }
 
 // Confirm request builders (ProcKey/name/path locked here).
 void RequestConfirmKill(const ProcInfo& p) {
+    CloseConfirm();
     auto& req = Ui().confirm;
-    req = ConfirmRequest{};
-    req.kind = ConfirmKind::Kill;
+    req.kind = ui::ConfirmKind::Kill;
     req.key = p.key;
     req.pid = p.key.pid;
     req.name = p.name;
@@ -224,9 +157,9 @@ void RequestConfirmKill(const ProcInfo& p) {
 }
 
 void RequestConfirmTrim(const ProcInfo& p) {
+    CloseConfirm();
     auto& req = Ui().confirm;
-    req = ConfirmRequest{};
-    req.kind = ConfirmKind::TrimWorkingSet;
+    req.kind = ui::ConfirmKind::TrimWorkingSet;
     req.key = p.key;
     req.pid = p.key.pid;
     req.name = p.name;
@@ -235,9 +168,9 @@ void RequestConfirmTrim(const ProcInfo& p) {
 }
 
 void RequestConfirmPurgeStandby() {
+    CloseConfirm();
     auto& req = Ui().confirm;
-    req = ConfirmRequest{};
-    req.kind = ConfirmKind::PurgeStandby;
+    req.kind = ui::ConfirmKind::PurgeStandby;
     Ui().confirmOpenRequested = true;
 }
 
@@ -249,6 +182,13 @@ ImVec4 ColDone() { return ImVec4(0.45f, 0.80f, 0.45f, 1.0f); }
 ImVec4 ColFail() { return ImVec4(0.92f, 0.36f, 0.36f, 1.0f); }
 ImVec4 ColWarn() { return ImVec4(0.95f, 0.78f, 0.30f, 1.0f); }
 ImVec4 ColInfo() { return ImVec4(0.55f, 0.72f, 0.95f, 1.0f); }
+
+// Module paths read best tail-first (file name at the end); ellipsize the front.
+std::wstring TruncateModulePath(const std::wstring& s) {
+    constexpr size_t kMax = 90;
+    if (s.size() <= kMax) return s;
+    return L"…" + s.substr(s.size() - (kMax - 1));
+}
 
 ImVec4 NoteColor(Notification::Kind k) {
     switch (k) {
@@ -298,35 +238,66 @@ void DrawToasts() {
 // Confirm dialogs (modal, centered; two-stage destructive-op gate).
 // ===========================================================================
 
+// --autotest dialogclick observation point (V14): the driver asserts on this to
+// regression-test the REAL rendered dialog (single-frame regression sentinel +
+// action-button geometry for synthetic mouse injection).
+DialogAutotestState g_dialogAutotest;
+
 void DrawConfirmDialogs() {
-    ConfirmRequest& req = Ui().confirm;
-    if (req.kind == ConfirmKind::None) return;
-
-    // Tree plan polling: open the dialog only once the plan job reported back.
-    if (req.kind == ConfirmKind::KillTree && req.planCount && !Ui().confirmOpenRequested) {
-        const int v = req.planCount->load();
-        if (v == -2) {  // planning failed; a failure toast was already posted
-            req = ConfirmRequest{};
-            return;
-        }
-        if (v >= 0) Ui().confirmOpenRequested = true;
+    ui::ConfirmRequest& req = Ui().confirm;
+    if (req.kind == ui::ConfirmKind::None) {
+        g_dialogAutotest = DialogAutotestState{};
+        return;
     }
-    if (!Ui().confirmOpenRequested) return;
+    g_dialogAutotest.requestActive = true;
 
-    ImGui::OpenPopup("##confirm");
-    Ui().confirmOpenRequested = false;
+    // Tree plan failure: a failure toast was already posted by the plan job.
+    if (req.kind == ui::ConfirmKind::KillTree && req.planCount && req.planCount->load() == -2) {
+        CloseConfirm();
+        return;
+    }
+
+    // Bug F1 fix (2026-09): the old code returned early when confirmOpenRequested
+    // was false, so BeginPopupModal() ran only on the single frame the request was
+    // created. The modal was rendered for exactly one frame and could never receive
+    // a click ("终止进程/终止进程树 没有任何效果"), and the abandoned ImGui popup
+    // stayed in the popup stack as an invisible blocking modal. Now the modal is
+    // BEGUN every frame while a request is active; OpenPopup is issued exactly once.
+    if (Ui().confirmOpenRequested) {
+        if (!ImGui::IsPopupOpen("##confirm")) {
+            ImGui::OpenPopup("##confirm");
+            Ui().confirmOpened = true;
+        }
+        Ui().confirmOpenRequested = false;
+    }
+    if (!Ui().confirmOpened) return;  // tree plan still pending
+
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f, 0.0f), ImVec2(460.0f, FLT_MAX));
-    if (!ImGui::BeginPopupModal("##confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (!ImGui::BeginPopupModal("##confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        // Modal was open before but is gone now: dismissed with Esc (the only
+        // dismiss path outside the buttons). Clear the request — never leave a
+        // stale request or a zombie invisible modal behind.
+        if (!ImGui::IsPopupOpen("##confirm") && !Ui().confirmOpenRequested) CloseConfirm();
+        g_dialogAutotest.modalOpen = false;
+        g_dialogAutotest.framesOpen = 0;
+        return;
+    }
+    g_dialogAutotest.modalOpen = true;
+    ++g_dialogAutotest.framesOpen;
+    // P2 (V14): the tree plan lands asynchronously — show an honest progress line
+    // instead of an empty dialog, and keep the action disabled until it arrives.
+    const bool planPending = req.kind == ui::ConfirmKind::KillTree && req.planCount &&
+                             req.planCount->load() < 0;
 
     const wchar_t* title = L"确认";
     const wchar_t* action = L"确认";
     switch (req.kind) {
-        case ConfirmKind::Kill: title = L"确认终止进程"; action = L"终止进程"; break;
-        case ConfirmKind::KillTree: title = L"确认终止进程树"; action = L"终止进程树"; break;
-        case ConfirmKind::TrimWorkingSet: title = L"确认释放工作集"; action = L"释放工作集"; break;
-        case ConfirmKind::PurgeStandby: title = L"确认清理待机列表"; action = L"清理待机列表"; break;
+        case ui::ConfirmKind::Kill: title = L"确认终止进程"; action = L"终止进程"; break;
+        case ui::ConfirmKind::KillTree: title = L"确认终止进程树"; action = L"终止进程树"; break;
+        case ui::ConfirmKind::TrimWorkingSet: title = L"确认释放工作集"; action = L"释放工作集"; break;
+        case ui::ConfirmKind::PurgeStandby: title = L"确认清理待机列表"; action = L"清理待机列表"; break;
         default: break;
     }
     ImGui::PushStyleColor(ImGuiCol_Text, ColFail());
@@ -335,23 +306,30 @@ void DrawConfirmDialogs() {
     ImGui::Separator();
 
     switch (req.kind) {
-        case ConfirmKind::Kill:
+        case ui::ConfirmKind::Kill:
             ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
-            ImGui::TextUnformatted(U8(Fmt(L"路径：{}", req.path.empty() ? std::wstring(L"—") : req.path)));
+            // P2 (V14): long image paths overflow the 460px modal — wrap them.
+            ImGui::TextWrapped("%s",
+                               U8(Fmt(L"路径：{}", req.path.empty() ? std::wstring(L"—") : req.path)));
             if (req.serviceHost) {
                 ImGui::TextColored(ColFail(), "%s",
                                    U8(L"警告：该进程是服务宿主，终止可能影响系统服务。"));
             }
             ImGui::TextDisabled("%s", U8(L"此操作无法撤销。"));
             break;
-        case ConfirmKind::KillTree: {
+        case ui::ConfirmKind::KillTree: {
             ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
-            int planned = -1;
-            if (req.planCount) planned = req.planCount->load();
-            // PlanTerminateTree returns descendants only; TreeResult.planned includes
-            // the root, so display planned + 1 (target included) to match that count.
-            ImGui::TextUnformatted(
-                U8(Fmt(L"预计终止 {} 个（含目标进程，执行时可能变化）", planned + 1)));
+            if (planPending) {
+                ImGui::TextDisabled("%s", U8(L"正在规划进程树…（完成后显示预计终止数量）"));
+            } else {
+                int planned = -1;
+                if (req.planCount) planned = req.planCount->load();
+                // PlanTerminateTree returns descendants only; TreeResult.planned
+                // includes the root, so display planned + 1 (target included) to
+                // match that count.
+                ImGui::TextUnformatted(
+                    U8(Fmt(L"预计终止 {} 个（含目标进程，执行时可能变化）", planned + 1)));
+            }
             if (req.serviceHost) {
                 ImGui::TextColored(ColFail(), "%s",
                                    U8(L"警告：该进程是服务宿主，终止将影响其承载的全部服务。"));
@@ -359,13 +337,13 @@ void DrawConfirmDialogs() {
             ImGui::TextDisabled("%s", U8(L"此操作无法撤销。"));
             break;
         }
-        case ConfirmKind::TrimWorkingSet:
+        case ui::ConfirmKind::TrimWorkingSet:
             ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
             ImGui::TextWrapped(
                 "%s", U8(L"将提示系统尽量释放该进程的物理工作集内存。工作集页换出后再次访问需要"
                           "重新读入，该进程短期可能变卡；此操作不会回收进程正在使用的内存。"));
             break;
-        case ConfirmKind::PurgeStandby:
+        case ui::ConfirmKind::PurgeStandby:
             ImGui::TextWrapped(
                 "%s", U8(L"仅释放系统文件缓存（待机列表），不会回收进程正在使用的内存；系统随后"
                           "按需重新缓存。需要管理员权限。"));
@@ -378,25 +356,35 @@ void DrawConfirmDialogs() {
     // V8-P1-2: keyboard focus lands on CANCEL (not the destructive action), and the
     // action button is removed from keyboard nav entirely, so Space/Enter in the
     // freshly opened modal can never fire a terminate.
-    ImGui::SetKeyboardFocusHere(0);
+    // Bug F1 fix (2026-09): SetKeyboardFocusHere must run ONCE when the modal
+    // appears. Issuing it every frame re-submits a nav move targeting the cancel
+    // button, and NavMoveRequestApplyResult() (imgui.cpp) calls ClearActiveID()
+    // whenever the mouse-held button is not the nav target — the mouse capture of
+    // the action button is stolen between mouse-down and mouse-up, silently eating
+    // every confirm click (same root cause as the phase-3 startup dialog).
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
     if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
-        req = ConfirmRequest{};
+        CloseConfirm();
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
     ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    ImGui::BeginDisabled(planPending);
     const bool actionPressed =
         ImGui::Button(U8(action), ImVec2(120.0f, 0.0f));
+    const ImVec2 btnMin = ImGui::GetItemRectMin();
+    const ImVec2 btnMax = ImGui::GetItemRectMax();
+    ImGui::EndDisabled();
     ImGui::PopItemFlag();
+    g_dialogAutotest.actionMinX = btnMin.x;
+    g_dialogAutotest.actionMinY = btnMin.y;
+    g_dialogAutotest.actionMaxX = btnMax.x;
+    g_dialogAutotest.actionMaxY = btnMax.y;
     if (actionPressed) {
-        switch (req.kind) {
-            case ConfirmKind::Kill: SubmitKill(req.key, req.name); break;
-            case ConfirmKind::KillTree: SubmitKillTree(req.key, req.name); break;
-            case ConfirmKind::TrimWorkingSet: SubmitTrimWorkingSet(req.key, req.name); break;
-            case ConfirmKind::PurgeStandby: SubmitPurgeStandby(); break;
-            default: break;
-        }
-        req = ConfirmRequest{};
+        // ExecuteConfirmedAction posts a JobFailed note itself when the queue
+        // refuses the job — the toast pipeline reports it either way.
+        ui::ExecuteConfirmedAction(Ui().liveCtx, req);
+        CloseConfirm();
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -476,10 +464,12 @@ const ProcInfo* FindByPid(const Snapshot& snap, uint32_t pid) {
     return nullptr;
 }
 
-// Detail-kind bit set fetched whenever the selection changes.
+// Detail-kind bit set fetched whenever the selection changes (F4: includes the
+// module list — collected by DetailsProvider but never requested/rendered before).
 constexpr uint32_t kDetailKinds =
     static_cast<uint32_t>(ops::DetailKind::Signature) | static_cast<uint32_t>(ops::DetailKind::CmdLine) |
-    static_cast<uint32_t>(ops::DetailKind::UserInfo) | static_cast<uint32_t>(ops::DetailKind::GuiObjects);
+    static_cast<uint32_t>(ops::DetailKind::UserInfo) | static_cast<uint32_t>(ops::DetailKind::GuiObjects) |
+    static_cast<uint32_t>(ops::DetailKind::Modules);
 
 class ProcessesPage final : public IPage {
 public:
@@ -548,6 +538,12 @@ private:
         }
         widths_[11] = static_cast<float>(ctx.cfg.GetDouble(L"colW_badges", kDefaultWidths[11]));
         widths_[12] = static_cast<float>(ctx.cfg.GetDouble(L"colW_desc", kDefaultWidths[12]));
+        // P0-2 (F2 review): the description (and name) slots hold STRETCH WEIGHTS.
+        // Older builds persisted pixels (hundreds) into these slots, collapsing the
+        // name column on every start; any legacy value > 10 cannot be a weight.
+        constexpr float kMaxPlausibleWeight = 10.0f;
+        if (widths_[0] > kMaxPlausibleWeight || widths_[0] <= 0.0f) widths_[0] = kDefaultWidths[0];
+        if (widths_[12] > kMaxPlausibleWeight || widths_[12] <= 0.0f) widths_[12] = kDefaultWidths[12];
     }
 
     void PersistSort(AppContext& ctx) {
@@ -575,7 +571,10 @@ private:
             save(i, std::wstring(L"colW_") + ui::SortColumnId(static_cast<ui::SortColumn>(i)), false);
         }
         save(11, L"colW_badges", false);
-        save(12, L"colW_desc", false);
+        // P0-2 (F2 review): the description column is WidthStretch — persist its
+        // stretch WEIGHT (the old code wrote WidthGiven pixels into the weight slot,
+        // collapsing the name column on every subsequent start).
+        save(12, L"colW_desc", true);
         save(0, L"colW_name", true);  // stretch weight for the name column
         if (changed) lastWidthSave_ = ImGui::GetTime();
     }
@@ -747,7 +746,11 @@ private:
     }
 
     void DrawRow(AppContext& ctx, const ProcInfo& p) {
+        // P2-11 (F2 review): identify rows by the stable ProcKey (pid + createTime),
+        // not a display index — a refresh that reorders rows mid-interaction must
+        // never retarget an open context menu / tooltip to a different process.
         ImGui::PushID(static_cast<int>(p.key.pid));
+        ImGui::PushID(static_cast<int>(p.key.createTime & 0x7fffffff));
         ImGui::TableNextRow();
 
         // Name + row interaction (selection, double click, context menu).
@@ -775,6 +778,7 @@ private:
         ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatNumber(p.contextSwitchesPerSec)));
         ImGui::TableNextColumn(); DrawBadges(p);
         ImGui::TableNextColumn(); DrawDescription(p);
+        ImGui::PopID();
         ImGui::PopID();
     }
 
@@ -894,10 +898,10 @@ private:
         field(L"描述", meta != nullptr ? meta->description : std::wstring());
         field(L"公司", meta != nullptr ? meta->company : std::wstring());
         field(L"版本", meta != nullptr ? meta->version : std::wstring());
-        DrawSignatureField(ctx, p);
-        DrawCmdLineField(ctx, p);
-        field(L"用户名", DrawUserNameField(ctx, p));
-        field(L"GDI / USER 对象", DrawGuiObjectsField(ctx, p));
+        DrawSignatureField(ctx, p, alive);
+        DrawCmdLineField(ctx, p, alive);
+        field(L"用户名", alive ? DrawUserNameField(ctx, p) : std::wstring(L"—"));
+        field(L"GDI / USER 对象", alive ? DrawGuiObjectsField(ctx, p) : std::wstring(L"—"));
 
         // Parent process: show name and allow jumping (by ProcKey in this snapshot).
         const ProcInfo* parent = p.parentPid != 0 ? FindByPid(snap, p.parentPid) : nullptr;
@@ -918,6 +922,7 @@ private:
 
         field(L"窗口标题", p.windowTitle);
         field(L"会话 ID", Fmt(L"{}", p.sessionId));
+        DrawModulesSection(ctx, p, alive);
         ImGui::EndChild();
     }
 
@@ -932,11 +937,16 @@ private:
         }
     }
 
-    void DrawSignatureField(AppContext& ctx, const ProcInfo& p) const {
+    void DrawSignatureField(AppContext& ctx, const ProcInfo& p, bool alive) const {
         const ops::ProcessDetails* d = ctx.details->Peek(p.key);
         const wchar_t* text = L"查询中…";
         ImVec4 color(0.6f, 0.6f, 0.6f, 1.0f);
-        if (d != nullptr && d->sigResolved) {
+        if (!alive) {
+            // P2-2 (F2 review): an exited process is never queried — showing
+            // "查询中…" forever would be dishonest.
+            text = L"已退出，无法查询";
+            color = ColWarn();
+        } else if (d != nullptr && d->sigResolved) {
             switch (d->sig) {
                 case ops::SigState::Valid:
                     text = L"有效签名";
@@ -963,10 +973,14 @@ private:
         ImGui::TextColored(color, "%s", U8(text));
     }
 
-    void DrawCmdLineField(AppContext& ctx, const ProcInfo& p) const {
+    void DrawCmdLineField(AppContext& ctx, const ProcInfo& p, bool alive) const {
         const ops::ProcessDetails* d = ctx.details->Peek(p.key);
         std::wstring value = L"—";
-        if (d != nullptr) value = d->cmdLineAvail ? d->cmdLine : L"不可用（无读取权限）";
+        if (!alive) {
+            value = L"已退出，无法查询";
+        } else if (d != nullptr) {
+            value = d->cmdLineAvail ? d->cmdLine : L"不可用（无读取权限）";
+        }
         ImGui::TextDisabled("%s", U8(L"命令行"));
         ImGui::SameLine(110.0f);
         ImGui::TextWrapped("%s", U8(value));
@@ -982,6 +996,73 @@ private:
         const ops::ProcessDetails* d = ctx.details->Peek(p.key);
         if (d != nullptr && d->guiResolved) return Fmt(L"{} / {}", d->gdiObjects, d->userObjects);
         return L"—";
+    }
+
+    // ---- F4: module list -------------------------------------------------------
+    // Signature verification runs on the ops worker; results are cached per module
+    // path (DriverPage slot pattern). -1 = in flight, else ops::SigState as int.
+    void EnsureModuleSig(const std::wstring& path) {
+        if (path.empty()) return;
+        auto it = moduleSigs_.find(path);
+        if (it != moduleSigs_.end()) return;
+        std::shared_ptr<std::atomic<int>> slot = std::make_shared<std::atomic<int>>(-1);
+        moduleSigs_.emplace(path, slot);
+        std::shared_ptr<AppContext> app = Ui().liveCtx;
+        if (!app || app->jobs.Submit([app, slot, path] {
+                slot->store(static_cast<int>(ops::VerifyFileSignature(path)));
+            }) == 0) {
+            moduleSigs_.erase(path);  // queue down (teardown): keep the row honest
+        }
+    }
+
+    void DrawModulesSection(AppContext& ctx, const ProcInfo& p, bool alive) {
+        if (!alive) return;  // P2-2: dead process — nothing honest to list here
+        const ops::ProcessDetails* d = ctx.details->Peek(p.key);
+        const bool entryDone = d != nullptr && d->sigResolved;  // job completed overall
+        const bool resolved = d != nullptr && d->modulesResolved;
+        const ui::ModuleSectionState state =
+            ui::DecideModuleSection(entryDone, resolved, ctx.elevated,
+                                    d != nullptr ? d->modules.size() : 0);
+
+        ImGui::Separator();
+        if (state != ui::ModuleSectionState::Ready) {
+            ImGui::TextColored(ColWarn(), "%s", U8(ui::ModuleSectionText(state)));
+            return;
+        }
+        ImGui::TextUnformatted(U8(Fmt(L"模块（{} 个）", d->modules.size())));
+        ImGui::TextDisabled("%s",
+                            U8(L"点击模块校验文件签名；未签名或签名无效的模块可能是风险项"));
+        ImGui::BeginChild("##modulelist", ImVec2(0.0f, 200.0f), ImGuiChildFlags_Borders);
+        for (const std::wstring& mod : d->modules) {
+            const std::wstring shown = mod.empty() ? std::wstring(L"—") : mod;
+            ImGui::PushID(static_cast<int>(&mod - d->modules.data()));
+            if (ImGui::Selectable(U8(TruncateModulePath(shown)))) {
+                EnsureModuleSig(mod);
+            }
+            if (ImGui::IsItemHovered() && shown.size() > 90) {
+                ImGui::SetTooltip("%s", U8(mod));
+            }
+            // badge column
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60.0f);
+            auto it = moduleSigs_.find(mod);
+            const ui::ModuleBadge badge =
+                it == moduleSigs_.end() ? ui::ModuleBadge::Pending
+                                        : ui::ModuleBadgeForSig(it->second->load());
+            switch (badge) {
+                case ui::ModuleBadge::Valid:
+                    ImGui::TextColored(ColDone(), "%s", U8(ModuleBadgeLabel(badge)));
+                    break;
+                case ui::ModuleBadge::Invalid:
+                case ui::ModuleBadge::Unsigned:
+                    ImGui::TextColored(ColWarn(), "%s", U8(ModuleBadgeLabel(badge)));
+                    break;
+                default:
+                    ImGui::TextDisabled("%s", U8(ModuleBadgeLabel(badge)));
+                    break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
     }
 
     // ---- state ----------------------------------------------------------------
@@ -1026,6 +1107,8 @@ private:
     ProcKey detailKey_{};
     uint64_t lastDetailTick_ = 0;
     int metaBudget_ = 3;
+    // F4: per-module-path signature verification cache (ops worker results).
+    std::unordered_map<std::wstring, std::shared_ptr<std::atomic<int>>> moduleSigs_;
 };
 
 // ===========================================================================
@@ -1078,6 +1161,9 @@ public:
 
         const SystemInfo& sys = Ui().snap ? Ui().snap->sys : SystemInfo{};
         DrawMemoryBars(sys);
+        // P1-5 (F2 review): GPU data is produced every 2 s by the collector —
+        // render adapter utilization/memory + per-process top 5 consumers.
+        DrawGpuBlock(*Ui().snap);
         ui3::DrawAlertControls(ctx);  // phase-3: threshold alert controls (additive row)
     }
 
@@ -1163,6 +1249,118 @@ private:
             ImGui::TextDisabled("%s", U8(L"提交"));
         }
     }
+
+    // ---- P1-5 (F2 review): GPU block ----------------------------------------
+    static std::wstring GpuUtilText(double v) {
+        return v == v ? Fmt(L"{:.1f}%", v) : std::wstring(L"—");  // NaN = unavailable
+    }
+
+    // Aggregates the (luid, pid) rows per pid: utilization summed and clamped to
+    // 100, memory summed; rows whose utilization is unavailable still contribute
+    // their memory. Returns at most `top` entries, highest utilization first.
+    struct GpuProcRow {
+        const ProcInfo* proc = nullptr;
+        double utilPercent = kUnavail;
+        uint64_t dedicated = 0, shared = 0;
+        bool hasUtil = false;
+    };
+    static std::vector<GpuProcRow> TopGpuProcs(const Snapshot& snap, size_t top) {
+        std::vector<GpuProcRow> merged;
+        for (const GpuProcUsage& g : snap.gpuProcs) {
+            GpuProcRow* row = nullptr;
+            for (GpuProcRow& r : merged) {
+                if (r.proc != nullptr && r.proc->key.pid == g.key.pid) { row = &r; break; }
+            }
+            if (row == nullptr) {
+                merged.push_back(GpuProcRow{FindByPid(snap, g.key.pid), kUnavail, 0, 0, false});
+                row = &merged.back();
+            }
+            if (g.utilPercent == g.utilPercent) {
+                row->utilPercent = row->hasUtil ? row->utilPercent + g.utilPercent : g.utilPercent;
+                row->hasUtil = true;
+            }
+            if (g.dedicatedBytes != kUnavailU64) row->dedicated += g.dedicatedBytes;
+            if (g.sharedBytes != kUnavailU64) row->shared += g.sharedBytes;
+        }
+        for (GpuProcRow& r : merged) {
+            if (r.hasUtil && r.utilPercent > 100.0) r.utilPercent = 100.0;
+        }
+        std::stable_sort(merged.begin(), merged.end(), [](const GpuProcRow& a, const GpuProcRow& b) {
+            const double ua = a.hasUtil ? a.utilPercent : -1.0;
+            const double ub = b.hasUtil ? b.utilPercent : -1.0;
+            return ua > ub;
+        });
+        if (merged.size() > top) merged.resize(top);
+        return merged;
+    }
+
+    static void DrawGpuBlock(const Snapshot& snap) {
+        ImGui::Separator();
+        ImGui::TextUnformatted(U8(L"GPU"));
+        if (snap.sys.gpus.empty()) {
+            // honest empty state: first tick not in yet, or no adapters present
+            ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s",
+                               U8(L"暂无 GPU 数据（等待采集，或本机无适配器）"));
+            return;
+        }
+        if (ImGui::BeginTable("gpuadapters", 4, ImGuiTableFlags_RowBg |
+                                                   ImGuiTableFlags_BordersInnerH |
+                                                   ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn(U8(L"适配器"), ImGuiTableColumnFlags_WidthStretch, 2.4f);
+            ImGui::TableSetupColumn(U8(L"利用率"), ImGuiTableColumnFlags_WidthFixed, 72.0f);
+            ImGui::TableSetupColumn(U8(L"显存已用"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableSetupColumn(U8(L"显存总量"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableHeadersRow();
+            for (const GpuAdapterInfo& a : snap.sys.gpus) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                const std::wstring aname =
+                    a.name.empty() ? std::wstring(L"—") : TruncateModulePath(a.name);
+                ImGui::TextUnformatted(U8(aname));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(GpuUtilText(a.utilPercent)));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(a.memUsed != kUnavailU64
+                                              ? FormatBytes(a.memUsed)
+                                              : std::wstring(L"—")));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(a.memTotal != kUnavailU64
+                                              ? FormatBytes(a.memTotal)
+                                              : std::wstring(L"—")));
+            }
+            ImGui::EndTable();
+        }
+        const std::vector<GpuProcRow> top = TopGpuProcs(snap, 5);
+        if (!top.empty()) {
+            ImGui::TextDisabled("%s", U8(L"按进程 GPU 占用（Top 5，跨适配器合计）"));
+            if (ImGui::BeginTable("gpuprocs", 4, ImGuiTableFlags_RowBg |
+                                                     ImGuiTableFlags_BordersInnerH |
+                                                     ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 2.4f);
+                ImGui::TableSetupColumn(U8(L"利用率"), ImGuiTableColumnFlags_WidthFixed, 72.0f);
+                ImGui::TableSetupColumn(U8(L"专用显存"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                ImGui::TableSetupColumn(U8(L"共享显存"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                ImGui::TableHeadersRow();
+                for (const GpuProcRow& r : top) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const std::wstring name =
+                        r.proc != nullptr ? Fmt(L"{} ({})", r.proc->name, r.proc->key.pid)
+                                          : std::wstring(L"已退出进程");
+                    ImGui::TextUnformatted(U8(name));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(GpuUtilText(r.hasUtil ? r.utilPercent : kUnavail)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(r.dedicated > 0 ? FormatBytes(r.dedicated)
+                                                              : std::wstring(L"—")));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(r.shared > 0 ? FormatBytes(r.shared)
+                                                           : std::wstring(L"—")));
+                }
+                ImGui::EndTable();
+            }
+        }
+    }
 };
 
 // ===========================================================================
@@ -1172,7 +1370,19 @@ private:
 void DrainNotifications(AppContext& ctx) {
     std::vector<Notification> out;
     ctx.notes.Drain(&out);
-    for (const Notification& n : out) PushToast(n.kind, n.text);
+    for (const Notification& n : out) {
+        // P2-1 (F2 review): details-provider notes fire on every row selection —
+        // high-frequency noise. They update the status bar only; toasts are
+        // reserved for destructive/observable ops.
+        const bool detailsNoise = n.text.rfind(L"进程详情", 0) == 0 ||
+                                  n.text.rfind(L"进程签名", 0) == 0 ||
+                                  n.text.rfind(L"无法读取进程详情", 0) == 0;
+        if (detailsNoise) {
+            Ui().lastNote = n.text;
+            continue;
+        }
+        PushToast(n.kind, n.text);
+    }
 }
 
 void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
@@ -1240,6 +1450,11 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     ImGui::BeginChild("##statusbar", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY,
                       ImGuiWindowFlags_NoScrollbar);
     ImGui::Text("帧 %.1f ms", ctx.frameMs);
+    // P2-3 (F2 review): paused collection needs a global indicator.
+    if (Ui().paused) {
+        ImGui::SameLine();
+        ImGui::TextColored(ColWarn(), "%s", U8(L"[已暂停]"));
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
@@ -1351,15 +1566,23 @@ void DrawShell(AppContext& ctx) {
     const float statusH = ImGui::GetTextLineHeightWithSpacing() + 6.0f;
     ImGui::BeginChild("##pagearea", ImVec2(0.0f, -statusH), ImGuiChildFlags_None);
     if (ImGui::BeginTabBar("##pages")) {
+        // P1-1 (F2 review): session restore wrote activePage but the TabBar never
+        // consumed it. Arm a one-shot SetSelected for the restored index on the
+        // first rendered frame after (re)registration.
         for (size_t i = 0; i < ctx.pages.size(); ++i) {
             IPage* page = ctx.pages[i].get();
-            if (ImGui::BeginTabItem(U8(page->Title()))) {
+            ImGuiTabItemFlags tabFlags = 0;
+            if (Ui().tabSelectArmed && static_cast<int>(i) == ctx.activePage) {
+                tabFlags |= ImGuiTabItemFlags_SetSelected;
+            }
+            if (ImGui::BeginTabItem(U8(page->Title()), nullptr, tabFlags)) {
                 ctx.activePage = static_cast<int>(i);
                 page->Draw(ctx);
                 ImGui::EndTabItem();
             }
         }
         ImGui::EndTabBar();
+        Ui().tabSelectArmed = false;
     }
     ImGui::EndChild();
     DrawStatusBar(ctx, *Ui().snap);
@@ -1370,5 +1593,19 @@ void DrawShell(AppContext& ctx) {
     DrawToasts();
     DrawConfirmDialogs();
 }
+
+// --- --autotest dialogclick (V14) -------------------------------------------
+// Arms the kill confirm through the exact same RequestConfirmKill() path the row
+// context menu uses; the state recorded by DrawConfirmDialogs lets the driver in
+// app/AutotestDialog.cpp aim synthetic mouse events at the REAL rendered button.
+
+void ArmKillConfirmForAutotest(uint32_t pid, uint64_t createTime, const wchar_t* name) {
+    ProcInfo p;
+    p.key = ProcKey{pid, createTime};
+    p.name = name != nullptr ? name : L"";
+    RequestConfirmKill(p);
+}
+
+const DialogAutotestState& DialogAutotestStateForAutotest() { return g_dialogAutotest; }
 
 }  // namespace stm

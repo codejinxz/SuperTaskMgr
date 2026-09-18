@@ -16,7 +16,9 @@
 #include "app/ui3/AsyncFetch.h"
 #include "app/ui3/PageHelpers.h"
 #include "app/ui/Pages.h"
+#include "app/ui/ConfirmAction.h"
 #include "app/ui/UiText.h"
+#include "collect/LhmSource.h"
 #include "collect/NetTables.h"
 #include "collect/Sensors.h"
 #include "core/Str.h"
@@ -100,12 +102,30 @@ bool BecameActive(uint64_t& lastFrame) {
 
 void LowerFilter(const std::string& utf8, std::wstring& out) { out = LowerCopy(Utf8ToWide(utf8)); }
 
+// P1-4 (F2 review): ShellExecuteExW(runas) blocks until the UAC dialog closes —
+// it must never run on the UI thread. Every in-page elevate button goes through
+// the ops worker; cancel/failure posts a toast (same as the toolbar button).
+void RequestElevateRestart(AppContext& ctx) {
+    SaveSessionFromCtx(ctx, nullptr);
+    std::shared_ptr<AppContext> app = LiveP3Ctx();
+    if (!app) return;
+    if (app->jobs.Submit([app] {
+            if (ops::RelaunchAsAdmin(L"--relaunched")) {
+                app->wantExit = true;
+            } else {
+                PushNote(*app, Notification::Kind::JobFailed, L"提权重启失败或已取消");
+            }
+        }) == 0) {
+        PushNote(ctx, Notification::Kind::JobFailed,
+                 L"操作队列未运行，提权重启未执行（应用可能正在退出）");
+    }
+}
+
 // Shared "以管理员身份重启" button (same flow as the shell toolbar button).
 void DrawElevateButton(AppContext& ctx) {
     if (ctx.elevated || !ops::CanElevate()) return;
     if (ImGui::Button(U8(L"以管理员身份重启"))) {
-        SaveSessionFromCtx(ctx, nullptr);
-        if (ops::RelaunchAsAdmin(L"--relaunched")) ctx.wantExit = true;
+        RequestElevateRestart(ctx);
     }
 }
 
@@ -215,9 +235,13 @@ private:
                 etw_ = actual;
                 ctx.cfg.SetBool(L"netEtw", actual);  // persist truth / rollback
                 if (actual != etwDesired_) {
+                    // P2-7 (F2 review): StartTrace can fail for reasons other than
+                    // elevation (session limit, policy); state the honest scope.
                     PushNote(ctx, Notification::Kind::JobFailed,
-                             etwDesired_ ? L"按进程流量（ETW）开启失败：需要管理员权限"
-                                         : L"按进程流量（ETW）关闭失败：需要管理员权限");
+                             etwDesired_
+                                 ? L"按进程流量（ETW）开启失败（原因详见日志：常见为缺少管理员"
+                                   L"权限或 ETW 会话数已达上限/被策略阻止）"
+                                 : L"按进程流量（ETW）关闭失败（原因详见日志）");
                 } else {
                     PushNote(ctx, Notification::Kind::Info,
                              actual ? L"已开启按进程流量统计（ETW）"
@@ -580,6 +604,7 @@ private:
     };
 
     void RequestConfirm(const ops::StartupItem& it, bool enable) {
+        pend_ = PendOp{};
         pend_.active = true;
         pend_.openRequested = true;
         pend_.enable = enable;
@@ -616,7 +641,12 @@ private:
         ImGui::TextDisabled("%s",
                             U8(L"写入前会先备份原值到本地日志目录，可随时恢复。"));
         ImGui::Separator();
-        ImGui::SetKeyboardFocusHere(0);
+        // Bug F1 fix (2026-09): focus the cancel button ONCE on the appearing frame.
+        // The old per-frame SetKeyboardFocusHere(0) re-submitted a nav move every
+        // frame; when it applied, NavMoveRequestApplyResult() cleared the ActiveId
+        // of the mouse-held confirm button, so 确认启用/确认禁用 could never receive
+        // the click (mouse-down captured, mouse-up silently dropped).
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
         if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
             pend_ = PendOp{};
             ImGui::CloseCurrentPopup();
@@ -634,22 +664,14 @@ private:
     }
 
     void Submit(AppContext& ctx, const ops::StartupItem& item, bool enable) {
-        std::shared_ptr<AppContext> app = LiveP3Ctx();
-        if (!app) return;
-        const bool elevated = ctx.elevated;
-        app->jobs.Submit([app, item, enable, elevated] {
-            std::wstring err;
-            if (ops::SetStartupEnabled(item, enable, &err)) {
-                PushNote(*app, Notification::Kind::JobDone,
-                         Fmt(L"已{}启动项「{}」", enable ? L"启用" : L"禁用", item.name));
-            } else {
-                PushNote(*app, Notification::Kind::JobFailed,
-                         Fmt(L"{}启动项「{}」失败：{}{}",
-                             enable ? L"启用" : L"禁用", item.name,
-                             err.empty() ? std::wstring(L"未知错误") : err,
-                             FailSuffix(elevated)));
-            }
-        });
+        (void)ctx;
+        ui::ConfirmRequest req;
+        req.kind = ui::ConfirmKind::StartupToggle;
+        req.startupEnable = enable;
+        req.startupItem = item;
+        // ExecuteConfirmedAction always reports the outcome through the notes -> toast
+        // pipeline (including a refused submission), so a click can never be a no-op.
+        ui::ExecuteConfirmedAction(LiveP3Ctx(), req);
         refetchPending_ = true;  // rebuild the list once the op lands
     }
 
@@ -923,12 +945,19 @@ private:
             std::shared_ptr<AppContext> app = LiveP3Ctx();
             std::shared_ptr<DepPlan> plan = pend_.plan;
             if (app) {
-                app->jobs.Submit([app, plan, name = s.name] {
-                    std::vector<std::wstring> deps = ops::GetDependentServices(name);
+                // P2 (V14): a refused submission must not leave the dialog hanging
+                // on "正在查询依赖…" — mark the plan ready and toast the failure.
+                if (app->jobs.Submit([app, plan, name = s.name] {
+                        std::vector<std::wstring> deps = ops::GetDependentServices(name);
+                        std::lock_guard<std::mutex> lock(plan->mu);
+                        plan->names = std::move(deps);
+                        plan->ready = true;
+                    }) == 0) {
                     std::lock_guard<std::mutex> lock(plan->mu);
-                    plan->names = std::move(deps);
                     plan->ready = true;
-                });
+                    PushNote(*app, Notification::Kind::JobFailed,
+                             L"操作队列未运行，依赖服务查询未提交（应用可能正在退出）");
+                }
             } else {
                 std::lock_guard<std::mutex> lock(plan->mu);
                 plan->ready = true;
@@ -990,7 +1019,10 @@ private:
                                 U8(L"启动失败时通常是因为缺少管理员权限或服务已被禁用。"));
         }
         ImGui::Separator();
-        ImGui::SetKeyboardFocusHere(0);
+        // Bug F1 fix: focus the cancel button once on the appearing frame (the
+        // per-frame SetKeyboardFocusHere steals the mouse ActiveId from the
+        // confirm button between mouse-down and mouse-up — see StartupPage).
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
         if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
             pend_ = PendOp{};
             ImGui::CloseCurrentPopup();
@@ -1011,20 +1043,24 @@ private:
         std::shared_ptr<AppContext> app = LiveP3Ctx();
         if (!app) return;
         const bool elevated = ctx.elevated;
-        app->jobs.Submit([app, s, start, elevated] {
-            std::wstring err;
-            const bool ok = start ? ops::StartServiceByName(s.name, &err)
-                                  : ops::StopServiceByName(s.name, false, &err);
-            if (ok) {
-                PushNote(*app, Notification::Kind::JobDone,
-                         Fmt(L"已{}服务「{}」", start ? L"启动" : L"停止", s.displayName));
-            } else {
-                PushNote(*app, Notification::Kind::JobFailed,
-                         Fmt(L"{}服务「{}」失败：{}{}", start ? L"启动" : L"停止",
-                             s.displayName, err.empty() ? std::wstring(L"未知错误") : err,
-                             FailSuffix(elevated)));
-            }
-        });
+        if (app->jobs.Submit([app, s, start, elevated] {
+                std::wstring err;
+                const bool ok = start ? ops::StartServiceByName(s.name, &err)
+                                      : ops::StopServiceByName(s.name, false, &err);
+                if (ok) {
+                    PushNote(*app, Notification::Kind::JobDone,
+                             Fmt(L"已{}服务「{}」", start ? L"启动" : L"停止", s.displayName));
+                } else {
+                    PushNote(*app, Notification::Kind::JobFailed,
+                             Fmt(L"{}服务「{}」失败：{}{}", start ? L"启动" : L"停止",
+                                 s.displayName, err.empty() ? std::wstring(L"未知错误") : err,
+                                 FailSuffix(elevated)));
+                }
+            }) == 0) {
+            // Queue not running (teardown): never fail silently.
+            PushNote(*app, Notification::Kind::JobFailed,
+                     L"操作队列未运行，指令未能提交（应用可能正在退出）");
+        }
         refetchPending_ = true;
     }
 
@@ -1225,9 +1261,12 @@ private:
 };
 
 // ===========================================================================
-// SensorPage: grouped cards (CPU / GPU / fans) + disk health table.
-// Data: collect::ReadSensors via jobs, min 10 s (SMART/temperature queries are
-// heavy). The honest trichotomy of SensorReading::State drives the rendering.
+// SensorPage (W2 redesign): honest four-state readings grouped into vertical
+// full-width sections (P1-3: nothing clips at any window width), per-group
+// 可选显示 toggles persisted in the config, and an optional LibreHardwareMonitor
+// (LHM) data source — OFF by default, localhost-only, probed through the ops
+// queue (P1-4 contract: no UAC/network work on the UI thread).
+// Data: collect::ReadSensors via jobs, min 10 s; LHM polls share the same beat.
 // ===========================================================================
 
 class SensorPage final : public IPage {
@@ -1236,19 +1275,16 @@ public:
     const wchar_t* Title() const override { return L"传感器"; }
 
     void Draw(AppContext& ctx) override {
-        BecameActive(lastFrame_);
-        fetch_.MaybeFetch(Produce, false);  // 10 s rule + manual refresh only
+        const bool becameActive = BecameActive(lastFrame_);
+        LoadPrefsOnce(ctx);
+        fetch_.MaybeFetch(Produce, becameActive);  // >=10 s beat + manual refresh
+        if (lhmOn_) lhmFetch_.MaybeFetch(LhmProduce, becameActive);  // same beat
+        PollLhmProbe(ctx);
         std::shared_ptr<const Result> res = fetch_.Peek();
 
-        if (ImGui::Button(U8(L"刷新"))) fetch_.MaybeFetch(Produce, true);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                "%s",
-                U8(L"手动刷新：立即重新读取传感器（可越过 10 秒最小间隔；SMART/温度查询"
-                   L"较重，自动刷新受该间隔限制）"));
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", U8(L"仅使用公开的用户模式数据源，不内置内核驱动"));
+        DrawToolbar(ctx, res.get());
+        DrawVisibilityRow(ctx);
+        DrawLhmSection(ctx);
         ImGui::Separator();
 
         if (res == nullptr) {
@@ -1270,42 +1306,312 @@ public:
         }
 
         const SensorSnapshot& snap = res->data;
-        const float half = (ImGui::GetContentRegionAvail().x -
-                            ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        DrawGroup(ctx, "##grp_cpu", half, L"CPU", snap.cpu);
-        ImGui::SameLine();
-        DrawGroup(ctx, "##grp_gpu", half, L"GPU", snap.gpu);
-        ImGui::SameLine();
-        DrawGroup(ctx, "##grp_fan", half, L"风扇", snap.fans);
-        ImGui::NewLine();
-        DrawDisks(ctx, snap.disks);
+        const std::vector<SensorReading> lhm = CurrentLhmRows();
+
+        // Vertical full-width groups; each 可选显示 via cfg (P2 requirement).
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Cpu)) {
+            BeginGroup("##grp_cpu", L"CPU");
+            DrawReadings(ctx, snap.cpu);
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Cpu));
+            DrawCoreTable(ctx, snap.cpuCores);
+            EndGroup();
+        }
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Gpu)) {
+            BeginGroup("##grp_gpu", L"GPU");
+            DrawReadings(ctx, snap.gpu);
+            DrawReadings(ctx, snap.gpus);
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Gpu));
+            EndGroup();
+        }
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Mem)) {
+            BeginGroup("##grp_mem", L"内存");
+            DrawReadings(ctx, snap.memory);
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Mem));
+            EndGroup();
+        }
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Disk)) {
+            BeginGroup("##grp_disk", L"磁盘");
+            DrawDisks(ctx, snap.disks);
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Disk));
+            EndGroup();
+        }
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Net)) {
+            BeginGroup("##grp_net", L"网络");
+            DrawReadings(ctx, snap.network);
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Net));
+            EndGroup();
+        }
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Battery)) {
+            BeginGroup("##grp_battery", L"电池");
+            DrawReadings(ctx, snap.battery);   // NoHardware entry = honest empty state
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Battery));
+            EndGroup();
+        }
+        if (SensorGroupVisible(ctx.cfg, SensorGroup::Fan)) {
+            BeginGroup("##grp_fan", L"风扇");
+            DrawReadings(ctx, snap.fans);      // honest NeedDriver entries
+            DrawReadings(ctx, FilterLhm(lhm, LhmGroup::Fan));
+            EndGroup();
+        }
     }
 
 private:
     using Result = AsyncFetch<SensorSnapshot>::Result;
+    using LhmResult = AsyncFetch<std::vector<SensorReading>>::Result;
     static SensorSnapshot Produce(std::wstring* err) { return ReadSensors(err); }
-
-    static bool AllEmpty(const SensorSnapshot& s) {
-        return s.cpu.empty() && s.gpu.empty() && s.disks.empty() && s.fans.empty();
+    static std::vector<SensorReading> LhmProduce(std::wstring* err) {
+        std::vector<SensorReading> out;
+        PollLhm(&out, err);  // localhost-only client, ~1 s bounded timeouts
+        return out;
     }
 
-    static void DrawGroup(AppContext& ctx, const char* id, float width,
-                          const wchar_t* title, const std::vector<SensorReading>& items) {
-        ImGui::BeginChild(id, ImVec2(width, 0.0f),
+    static bool AllEmpty(const SensorSnapshot& s) {
+        return s.cpu.empty() && s.gpu.empty() && s.disks.empty() && s.fans.empty() &&
+               s.cpuCores.empty() && s.gpus.empty() && s.network.empty() &&
+               s.battery.empty() && s.memory.empty();
+    }
+
+    // ---- preferences (cfg-persisted) ----------------------------------------
+    void LoadPrefsOnce(AppContext& ctx) {
+        if (prefsLoaded_) return;
+        prefsLoaded_ = true;
+        lhmPort_ = static_cast<uint16_t>(std::max(
+            1024, std::min(65535, static_cast<int>(ctx.cfg.GetInt(L"lhmPort", 8085)))));
+        lhmOn_ = ctx.cfg.GetBool(L"lhmEnabled", false);
+        if (lhmOn_) {
+            // Restored from a previous session: re-probe before trusting it.
+            SetLhmOptions(stm::LhmOptions{lhmOn_, lhmPort_});
+            StartLhmProbe(ctx);
+        }
+    }
+
+    // ---- LHM source (off by default; jobs-validated) -------------------------
+    struct LhmProbe {
+        std::mutex mu;
+        bool ready = false;
+        bool ok = false;
+        size_t count = 0;
+        std::wstring err;
+    };
+
+    void StartLhmProbe(AppContext& /*ctx*/) {
+        SetLhmOptions(stm::LhmOptions{true, lhmPort_});
+        lhmProbe_ = std::make_shared<LhmProbe>();
+        std::shared_ptr<LhmProbe> probe = lhmProbe_;
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        if (!app) {
+            std::lock_guard<std::mutex> lock(probe->mu);
+            probe->ready = true;
+            probe->err = L"操作队列未运行";
+            return;
+        }
+        app->jobs.Submit([app, probe] {
+            std::vector<SensorReading> out;
+            std::wstring err;
+            const bool ok = PollLhm(&out, &err);
+            std::lock_guard<std::mutex> lock(probe->mu);
+            probe->ok = ok;
+            probe->count = out.size();
+            probe->err = err;
+            probe->ready = true;
+        });
+    }
+
+    // Drives the probe state machine; never blocks the UI (PollLhm runs on the
+    // ops worker). Failure => revert to off with an honest note (P2 requirement).
+    void PollLhmProbe(AppContext& ctx) {
+        if (!lhmProbe_) return;
+        bool ready = false, ok = false;
+        size_t count = 0;
+        std::wstring err;
+        {
+            std::lock_guard<std::mutex> lock(lhmProbe_->mu);
+            ready = lhmProbe_->ready;
+            ok = lhmProbe_->ok;
+            count = lhmProbe_->count;
+            err = lhmProbe_->err;
+        }
+        if (!ready) return;
+        lhmProbe_.reset();
+        if (ok) {
+            lhmOn_ = true;
+            ctx.cfg.SetBool(L"lhmEnabled", true);
+            PushNote(ctx, Notification::Kind::Info,
+                     Fmt(L"已连接 LibreHardwareMonitor 数据源（{} 项读数，仅本机 127.0.0.1）",
+                         count));
+        } else {
+            lhmOn_ = false;
+            ctx.cfg.SetBool(L"lhmEnabled", false);
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     Fmt(L"未检测到 LibreHardwareMonitor 数据源（确认 LHM 已运行并启用"
+                         L" Remote Web Server）：{}",
+                         err.empty() ? std::wstring(L"连接失败") : err));
+        }
+    }
+
+    void DrawLhmSection(AppContext& ctx) {
+        ImGui::TextUnformatted(U8(L"LibreHardwareMonitor 数据源"));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s",
+                            U8(L"需自行运行 LibreHardwareMonitor 并启用其 Web 服务器；"
+                               L"本工具仅读本机 127.0.0.1，不上传"));
+        if (lhmProbe_) {
+            ImGui::TextDisabled("%s", U8(L"正在检测数据源…"));
+            return;
+        }
+        bool on = lhmOn_;
+        if (ImGui::Checkbox(U8(L"启用（实验性）"), &on)) {
+            if (on) {
+                StartLhmProbe(ctx);  // validate through the ops queue before use
+            } else {
+                SetLhmOptions(stm::LhmOptions{false, lhmPort_});
+                lhmOn_ = false;
+                ctx.cfg.SetBool(L"lhmEnabled", false);
+                PushNote(ctx, Notification::Kind::Info, L"已关闭 LibreHardwareMonitor 数据源");
+            }
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        int port = lhmPort_;
+        if (ImGui::InputInt(U8(L"端口"), &port, 0, 0)) {
+            port = std::max(1024, std::min(65535, port));
+            if (port != lhmPort_) {
+                lhmPort_ = static_cast<uint16_t>(port);
+                ctx.cfg.SetInt(L"lhmPort", lhmPort_);
+                if (lhmOn_) StartLhmProbe(ctx);  // re-validate with the new port
+            }
+        }
+        if (!lhmOn_) {
+            ImGui::TextDisabled("%s", U8(L"已关闭"));
+        } else {
+            std::shared_ptr<const LhmResult> lres = lhmFetch_.Peek();
+            if (lres == nullptr) {
+                ImGui::TextDisabled("%s", U8(L"等待下一次轮询…"));
+            } else if (!lres->err.empty()) {
+                ImGui::TextColored(ColWarn(), "%s",
+                                   U8(Fmt(L"未检测到数据源（确认 LHM 已运行并启用 Remote Web "
+                                          L"Server）：{}",
+                                          lres->err)));
+            } else {
+                ImGui::TextColored(ColDone(), "%s",
+                                   U8(Fmt(L"已连接（{} 项读数，标注［LHM］）", lres->data.size())));
+            }
+        }
+    }
+
+    // Current LHM readings (empty when disabled / not fetched yet).
+    std::vector<SensorReading> CurrentLhmRows() const {
+        std::vector<SensorReading> rows;
+        if (!lhmOn_) return rows;
+        std::shared_ptr<const LhmResult> res = lhmFetch_.Peek();
+        if (res == nullptr || !res->err.empty()) return rows;
+        return res->data;
+    }
+
+    static std::vector<SensorReading> FilterLhm(const std::vector<SensorReading>& rows,
+                                                LhmGroup group) {
+        std::vector<SensorReading> out;
+        for (const SensorReading& r : rows) {
+            if (LhmGroupOf(r.label) == group) out.push_back(r);
+        }
+        return out;
+    }
+
+    // ---- visibility toggles ---------------------------------------------------
+    void DrawVisibilityRow(AppContext& ctx) {
+        ImGui::TextDisabled("%s", U8(L"可选显示："));
+        auto checkbox = [&](SensorGroup g) {
+            bool v = SensorGroupVisible(ctx.cfg, g);
+            if (ImGui::Checkbox(U8(Fmt(L"{}", SensorGroupTitle(g))), &v)) {
+                ctx.cfg.SetBool(SensorGroupCfgKey(g), v);
+            }
+        };
+        checkbox(SensorGroup::Cpu);
+        ImGui::SameLine();
+        checkbox(SensorGroup::Gpu);
+        ImGui::SameLine();
+        checkbox(SensorGroup::Mem);
+        ImGui::SameLine();
+        checkbox(SensorGroup::Disk);
+        ImGui::NewLine();
+        checkbox(SensorGroup::Net);
+        ImGui::SameLine();
+        checkbox(SensorGroup::Battery);
+        ImGui::SameLine();
+        checkbox(SensorGroup::Fan);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", U8(L"（风扇默认关闭：无内核驱动时仅能如实报告“需要驱动支持”）"));
+        ImGui::Separator();
+    }
+
+    // ---- group scaffolding (vertical, full width: P1-3) -----------------------
+    static void BeginGroup(const char* id, const wchar_t* title) {
+        ImGui::BeginChild(id, ImVec2(0.0f, 0.0f),
                           ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
         ImGui::TextUnformatted(U8(title));
         ImGui::Separator();
-        if (items.empty()) {
-            ImGui::TextDisabled("%s", U8(L"本机无此类传感器数据"));
-        } else {
-            for (const SensorReading& s : items) DrawReading(ctx, s);
+    }
+    static void EndGroup() { ImGui::EndChild(); }
+
+    static void DrawReadings(AppContext& ctx, const std::vector<SensorReading>& items) {
+        for (const SensorReading& s : items) DrawReading(ctx, s);
+    }
+
+    // Per-core frequency + utilization table (cpuCores: MHz and % rows paired by
+    // core index; aggregate fallback rows render as plain readings instead).
+    void DrawCoreTable(AppContext& ctx, const std::vector<SensorReading>& cores) {
+        struct CoreRow {
+            double mhz = kUnavail;
+            double util = kUnavail;
+        };
+        std::map<int, CoreRow> byIdx;
+        std::vector<SensorReading> aggregates;
+        for (const SensorReading& r : cores) {
+            bool isFreq = false;
+            const int idx = SensorCoreIndex(r.label, &isFreq);
+            if (idx < 0) {
+                aggregates.push_back(r);
+                continue;
+            }
+            CoreRow& row = byIdx[std::max(0, idx)];
+            if (isFreq) {
+                row.mhz = r.state == SensorReading::State::Ok ? r.value : kUnavail;
+            } else {
+                row.util = r.state == SensorReading::State::Ok ? r.value : kUnavail;
+            }
         }
-        ImGui::EndChild();
+        if (byIdx.empty()) {
+            DrawReadings(ctx, aggregates);  // e.g. "CPU 频率" aggregate fallback
+            return;
+        }
+        for (const SensorReading& r : aggregates) DrawReading(ctx, r);
+        if (ImGui::BeginTable("coretable", 3, ImGuiTableFlags_RowBg |
+                                                  ImGuiTableFlags_BordersInnerH |
+                                                  ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn(U8(L"核心"), ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn(U8(L"频率 (MHz)"), ImGuiTableColumnFlags_WidthFixed, 130.0f);
+            ImGui::TableSetupColumn(U8(L"占用率"), ImGuiTableColumnFlags_WidthFixed, 130.0f);
+            ImGui::TableHeadersRow();
+            for (const auto& kv : byIdx) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(Fmt(L"核心 {}", kv.first)));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(kv.second.mhz == kv.second.mhz
+                                              ? Fmt(L"{:.0f}", kv.second.mhz)
+                                              : std::wstring(L"—")));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(kv.second.util == kv.second.util
+                                              ? Fmt(L"{:.1f}%", kv.second.util)
+                                              : std::wstring(L"—")));
+            }
+            ImGui::EndTable();
+        }
     }
 
     static void DrawReading(AppContext& ctx, const SensorReading& s) {
-        ImGui::TextDisabled("%s", U8(Truncate(s.label, 30)));
-        if (s.label.size() > 30 && ImGui::IsItemHovered()) {
+        ImGui::TextDisabled("%s", U8(Truncate(s.label, 44)));
+        if (s.label.size() > 44 && ImGui::IsItemHovered()) {
             ImGui::SetTooltip("%s", U8(s.label));
         }
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 170.0f);
@@ -1318,8 +1624,7 @@ private:
                 if (!ctx.elevated && ops::CanElevate()) {
                     ImGui::SameLine();
                     if (ImGui::SmallButton(U8(L"提权重启"))) {
-                        SaveSessionFromCtx(ctx, nullptr);
-                        if (ops::RelaunchAsAdmin(L"--relaunched")) ctx.wantExit = true;
+                        RequestElevateRestart(ctx);  // P1-4: jobs worker, not UI thread
                     }
                 }
                 break;
@@ -1336,55 +1641,67 @@ private:
     }
 
     static void DrawDisks(AppContext& ctx, const std::vector<DiskHealth>& disks) {
-        ImGui::BeginChild("##grp_disk", ImVec2(0.0f, 0.0f),
-                          ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
-        ImGui::TextUnformatted(U8(L"磁盘健康"));
-        ImGui::Separator();
         if (disks.empty()) {
             ImGui::TextDisabled("%s", U8(L"本机未发现可查询的磁盘"));
-        } else {
-            const int flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-                              ImGuiTableFlags_SizingFixedFit;
-            if (ImGui::BeginTable("disks", 5, flags)) {
-                ImGui::TableSetupColumn(U8(L"型号"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
-                ImGui::TableSetupColumn(U8(L"总线"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn(U8(L"健康"), ImGuiTableColumnFlags_WidthFixed, 90.0f);
-                ImGui::TableSetupColumn(U8(L"温度"), ImGuiTableColumnFlags_WidthFixed, 180.0f);
-                ImGui::TableSetupColumn(U8(L"通电时长"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
-                ImGui::TableHeadersRow();
-                for (const DiskHealth& d : disks) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(
-                        U8(d.model.empty() ? std::wstring(L"—") : d.model));
-                    if (ImGui::IsItemHovered() && !d.serial.empty()) {
-                        ImGui::SetTooltip("%s", U8(Fmt(L"序列号：{}", d.serial)));
-                    }
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(
-                        U8(d.busType.empty() ? std::wstring(L"—") : d.busType));
-                    ImGui::TableNextColumn();
-                    if (d.health.find(L"良好") != std::wstring::npos) {
-                        ImGui::TextColored(ColDone(), "%s", U8(d.health));
-                    } else if (d.health.find(L"警告") != std::wstring::npos) {
-                        ImGui::TextColored(ColFail(), "%s", U8(d.health));
-                    } else {
-                        ImGui::TextColored(
-                            ColMuted(), "%s",
-                            U8(d.health.empty() ? std::wstring(L"未知") : d.health));
-                    }
-                    ImGui::TableNextColumn();
-                    DrawTempCell(ctx, d);
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(
-                        U8(d.powerOnHours == kUnavailU64
-                               ? std::wstring(L"—")
-                               : Fmt(L"{} 小时", d.powerOnHours)));
-                }
-                ImGui::EndTable();
-            }
+            return;
         }
-        ImGui::EndChild();
+        const int flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                          ImGuiTableFlags_SizingFixedFit;
+        if (ImGui::BeginTable("disks", 7, flags)) {
+            ImGui::TableSetupColumn(U8(L"型号"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn(U8(L"总线"), ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn(U8(L"健康"), ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn(U8(L"温度"), ImGuiTableColumnFlags_WidthFixed, 150.0f);
+            ImGui::TableSetupColumn(U8(L"备件%"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn(U8(L"磨损%"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn(U8(L"通电时长"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableHeadersRow();
+            for (const DiskHealth& d : disks) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(
+                    U8(d.model.empty() ? std::wstring(L"—") : Truncate(d.model, 40)));
+                if (ImGui::IsItemHovered() && !d.serial.empty()) {
+                    std::wstring tip = Fmt(L"序列号：{}", d.serial);
+                    if (d.critWarnValid && d.critWarnBits != 0) {
+                        tip += Fmt(L"\nNVMe 关键警告位非零（0x{:02X}）", d.critWarnBits);
+                    }
+                    ImGui::SetTooltip("%s", U8(tip));
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(
+                    U8(d.busType.empty() ? std::wstring(L"—") : d.busType));
+                ImGui::TableNextColumn();
+                if (d.health.find(L"良好") != std::wstring::npos) {
+                    ImGui::TextColored(ColDone(), "%s", U8(d.health));
+                } else if (d.health.find(L"警告") != std::wstring::npos) {
+                    ImGui::TextColored(ColFail(), "%s", U8(d.health));
+                } else {
+                    ImGui::TextColored(
+                        ColMuted(), "%s",
+                        U8(d.health.empty() ? std::wstring(L"未知") : d.health));
+                }
+                ImGui::TableNextColumn();
+                DrawTempCell(ctx, d);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(
+                    d.sparePct == UINT32_MAX
+                        ? std::wstring(L"—")
+                        : (d.spareThreshPct == UINT32_MAX
+                               ? Fmt(L"{}%", d.sparePct)
+                               : Fmt(L"{}%（阈值 {}%）", d.sparePct, d.spareThreshPct))));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(d.wearPct == UINT32_MAX
+                                              ? std::wstring(L"—")
+                                              : Fmt(L"{}%", d.wearPct)));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(
+                    U8(d.powerOnHours == kUnavailU64
+                           ? std::wstring(L"—")
+                           : Fmt(L"{} 小时", d.powerOnHours)));
+            }
+            ImGui::EndTable();
+        }
     }
 
     static void DrawTempCell(AppContext& ctx, const DiskHealth& d) {
@@ -1397,8 +1714,7 @@ private:
                 if (!ctx.elevated && ops::CanElevate()) {
                     ImGui::SameLine();
                     if (ImGui::SmallButton(U8(L"提权"))) {
-                        SaveSessionFromCtx(ctx, nullptr);
-                        if (ops::RelaunchAsAdmin(L"--relaunched")) ctx.wantExit = true;
+                        RequestElevateRestart(ctx);  // P1-4: jobs worker, not UI thread
                     }
                 }
                 break;
@@ -1413,7 +1729,29 @@ private:
         }
     }
 
+    void DrawToolbar(AppContext& ctx, const Result* res) {
+        (void)ctx;
+        if (res != nullptr) {
+            ImGui::TextUnformatted(U8(L"仅使用公开的用户模式数据源，不内置内核驱动"));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(U8(L"刷新"))) MaybeFetchNow();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "%s",
+                U8(L"手动刷新：立即重新读取传感器（可越过 10 秒最小间隔；SMART/温度查询"
+                   L"较重，自动刷新受该间隔限制）"));
+        }
+    }
+
+    void MaybeFetchNow() { fetch_.MaybeFetch(Produce, true); }
+
     AsyncFetch<SensorSnapshot> fetch_{10.0};
+    AsyncFetch<std::vector<SensorReading>> lhmFetch_{10.0};
+    std::shared_ptr<LhmProbe> lhmProbe_;
+    bool prefsLoaded_ = false;
+    bool lhmOn_ = false;       // validated state (probe-passed), persisted in cfg
+    uint16_t lhmPort_ = 8085;
     uint64_t lastFrame_ = kNeverDrawn;
 };
 

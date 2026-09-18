@@ -5,6 +5,14 @@
 //   State::NeedDriver — not reachable in user mode at all (fan speeds, per-core CPU temp)
 //   State::NoHardware — adapter/disk present but this sensor absent
 // NEVER report 0 in place of missing data. No kernel driver ships with this app.
+//
+// F3 extension (2026-09-18, architect-approved): additive only. New members are
+// the vectors cpuCores/gpus/network/battery/memory, the double uptimeSec and the
+// DiskHealth fields below (sparePct..critWarnValid). Existing members keep their
+// exact semantics; the four-state honesty model governs every new reading too
+// (Ok = documented user-mode source: PDH / GetIfTable2 / CallNtPowerInformation /
+// GlobalMemoryStatusEx / GetPerformanceInfo / NVML; an optional external
+// LibreHardwareMonitor source lives in collect/LhmSource.h, OFF by default).
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,6 +34,14 @@ struct DiskHealth {
     double tempC = 0.0;        // NVMe composite temp / ATA temperature; NeedAdmin => state
     SensorReading::State tempState = SensorReading::State::NeedAdmin;
     uint64_t powerOnHours = UINT64_MAX;  // UINT64_MAX = unavailable
+    // --- F3 addition (2026-09-18): NVMe SMART/health log detail. All pct fields
+    // use UINT32_MAX = unavailable (ATA/USB drives, or log not readable — never
+    // a fake 0). critWarnBits is meaningful only when critWarnValid is true.
+    uint32_t sparePct = UINT32_MAX;        // NVMe "Available Spare" %
+    uint32_t spareThreshPct = UINT32_MAX;  // NVMe "Available Spare Threshold" %
+    uint32_t wearPct = UINT32_MAX;         // NVMe "Percentage Used" (endurance wear) %
+    uint8_t critWarnBits = 0;              // NVMe critical warning bitmap (log[0])
+    bool critWarnValid = false;            // true only after a successful NVMe log read
 };
 
 struct SensorSnapshot {
@@ -34,6 +50,18 @@ struct SensorSnapshot {
     std::vector<DiskHealth> disks;      // SMART-derived
     std::vector<SensorReading> fans;    // expected: NeedDriver entries only (honest)
     std::wstring notes;                 // aggregate honesty notes for the page header
+    // --- F3 additions (2026-09-18), all governed by the four-state model ---
+    std::vector<SensorReading> cpuCores;  // per-core freq (MHz, CallNtPowerInformation)
+                                          // + utilization (%, PDH Processor Information)
+    std::vector<SensorReading> gpus;      // engine-level util 3D/Copy/VideoDecode/Encode
+                                          // (PDH GPU Engine), VRAM dedicated/shared
+                                          // (PDH GPU Adapter Memory), NVML temp when present
+    std::vector<SensorReading> network;   // per-adapter recv/send B/s + link speed (GetIfTable2)
+    std::vector<SensorReading> battery;   // AC/DC, charge %, remaining time (CallNtPowerInformation
+                                          // SystemBatteryState); NoHardware entry when absent
+    std::vector<SensorReading> memory;    // physical/committed/paged pool/nonpaged pool
+                                          // (GlobalMemoryStatusEx + GetPerformanceInfo)
+    double uptimeSec = 0.0;               // system uptime in seconds (GetTickCount64)
 };
 
 // Blocking read (run on ops job queue). Never throws; partial results allowed.

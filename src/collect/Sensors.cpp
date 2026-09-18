@@ -1,23 +1,40 @@
-// Sensors.cpp — phase 3 (contract Sensors.h). Every reading follows the honest
-// trichotomy of R6: Ok = real value from a documented user-mode source;
-// NeedAdmin = source exists but is elevation-gated; NeedDriver = unreachable in
-// user mode (fan speeds — no kernel driver ships with this app); NoHardware =
-// adapter/disk present but this sensor absent. NEVER a 0 in place of data.
+// Sensors.cpp — phase 3 + F3 extension (contract Sensors.h). Every reading
+// follows the honest trichotomy of R6: Ok = real value from a documented
+// user-mode source; NeedAdmin = source exists but is elevation-gated;
+// NeedDriver = unreachable in user mode (fan speeds — no kernel driver ships
+// with this app); NoHardware = adapter/disk present but this sensor absent.
+// NEVER a 0 in place of data.
 //
 //   CPU frequency  CallNtPowerInformation(ProcessorInformation=11)  documented, no admin
+//   CPU per-core % PDH \Processor Information(*)\% Processor Time (documented, R6 §6)
 //   CPU package T  WMI root\WMI\MSAcpi_ThermalZoneTemperature     admin on this box
 //   GPU temp/util  nvml.dll from System32 (driver-supplied) when present; otherwise the
 //                  gpu vector stays EMPTY with an honesty note (IGCL skipped: complex
 //                  interface, see R6 §4). No fake readings for Intel iGPU boxes.
+//   GPU engine %   PDH \GPU Engine(*)\Utilization Percentage per engtype_* (R6 §4);
+//                  VRAM dedicated/shared via \GPU Adapter Memory(*)
+//   Network        GetIfTable2 per-adapter octet deltas over a shared 350 ms window
+//                  (F3) + link speed; loopback excluded, non-Up adapters skipped
+//   Battery        CallNtPowerInformation(SystemBatteryState=5) — NoHardware when absent
+//   Memory         GlobalMemoryStatusEx + GetPerformanceInfo (K32 bound dynamically)
 //   Disks          MSFT_PhysicalDisk (coarse health) + NVMe health log page 0x02 /
-//                  ATA SMART via SMART_RCV_DRIVE_DATA for temperature + power-on hours.
+//                  ATA SMART via SMART_RCV_DRIVE_DATA for temperature + power-on hours
+//                  + spare/wear/critical-warning detail (F3).
 //   Fans           NeedDriver, always.
 //
 // Blocking call: run on the ops job queue. Never throws; partial results allowed.
+// The F3 delta window adds one ~350 ms sleep per read (page refreshes are >=10 s).
+#include <winsock2.h>  // must precede iphlpapi/netioapi (LEAN_AND_MEAN hides winsock)
+#include <ws2tcpip.h>  // pulls ws2ipdef.h -> defines _WS2IPDEF_ for netioapi MIB_* decls
 #include "collect/Sensors.h"
+#include "collect/CollectDetail.h"  // cd:: PDH wildcard helpers (same library)
 #include "core/HandleGuard.h"
 #include "core/Log.h"
 #include "core/Str.h"
+#include <windows.h>
+#include <iphlpapi.h>   // GetIfTable2 / FreeMibTable (iphlpapi is on the link line)
+#include <netioapi.h>   // MIB_IF_TABLE2 / MIB_IF_ROW2
+#include <psapi.h>      // PERFORMANCE_INFORMATION (bound dynamically below)
 #include <winioctl.h>   // SMART_* / STORAGE_* ioctls (also defines DEVICE_TYPE)
 #include <ntddstor.h>   // StorageDeviceProtocolSpecificProperty + NVMe log page
 #include <objbase.h>
@@ -415,7 +432,8 @@ bool Load(Fns* f, HMODULE* modOut, std::wstring* notes) {
     return true;
 }
 
-void Read(std::vector<SensorReading>* gpu, std::wstring* notes) {
+void Read(std::vector<SensorReading>* gpu, std::wstring* notes,
+          std::vector<SensorReading>* tempsOut = nullptr) {
     Fns f;
     HMODULE mod = nullptr;
     if (!Load(&f, &mod, notes)) return;
@@ -444,7 +462,8 @@ void Read(std::vector<SensorReading>* gpu, std::wstring* notes) {
             r.value = static_cast<double>(tempC);
             r.unit = L"°C";
             r.state = SensorReading::State::Ok;
-            gpu->push_back(std::move(r));
+            gpu->push_back(r);                       // existing contract vector
+            if (tempsOut) tempsOut->push_back(r);    // F3: reuse in the gpus group
         }
         if (f.util) {
             Utilization u{};
@@ -526,7 +545,9 @@ std::wstring CStrFromDesc(const BYTE* base, ULONG off) {
 
 // IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceProtocolSpecificProperty) ->
 // NVMe Get Log Page 0x02 SMART/Health (documented "Working with NVMe drives").
-bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8_t* critWarn) {
+// F3: also reports available spare % / spare threshold % alongside pctUsed.
+bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8_t* critWarn,
+                uint32_t* sparePct, uint32_t* spareThreshPct) {
     constexpr size_t kLog = 512;
     std::vector<BYTE> buf(sizeof(STORAGE_PROPERTY_QUERY) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) +
                           kLog);
@@ -560,6 +581,9 @@ bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8
     // anything outside becomes "unknown" instead of a fake reading.)
     *critWarn = log[0];
     *pctUsed = log[5];
+    // F3: spare fields; 0xFF is unpopulated padding, reported as unavailable.
+    *sparePct = log[3] == 0xFF ? UINT32_MAX : log[3];
+    *spareThreshPct = log[4] == 0xFF ? UINT32_MAX : log[4];
     const uint16_t tempK = static_cast<uint16_t>(log[1] | (log[2] << 8));
     constexpr double kMinC = -20.0, kMaxC = 120.0;
     const double c = static_cast<double>(tempK) - 273.15;
@@ -737,8 +761,9 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
             uint64_t poh = UINT64_MAX;
             uint32_t pct = 0;
             uint8_t crit = 0;
+            uint32_t spare = UINT32_MAX, spareTh = UINT32_MAX;  // F3 NVMe detail
             if (proto == BusProto::Nvme) {
-                ok = NvmeHealth(h.get(), &t, &poh, &pct, &crit);
+                ok = NvmeHealth(h.get(), &t, &poh, &pct, &crit, &spare, &spareTh);
             } else {
                 ok = AtaSmart(h.get(), static_cast<uint8_t>(n), &t, &poh);
             }
@@ -750,7 +775,7 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
                 if (h1 != INVALID_HANDLE_VALUE) {  // V9 P0-1: not NULL on failure
                     const stm::UniqueHandle h1g(h1);
                     ok = proto == BusProto::Nvme
-                             ? NvmeHealth(h1g.get(), &t, &poh, &pct, &crit)
+                             ? NvmeHealth(h1g.get(), &t, &poh, &pct, &crit, &spare, &spareTh)
                              : AtaSmart(h1g.get(), static_cast<uint8_t>(n), &t, &poh);
                 } else if (::GetLastError() == ERROR_ACCESS_DENIED) {
                     ++needAdmin;
@@ -769,6 +794,13 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
                     if (crit != 0) d.health = L"警告";       // real SMART critical warning
                     else if (pct > 100) d.health = L"警告";  // worn beyond rated endurance
                     else if (d.health == L"未知") d.health = L"良好";
+                    // F3 detail (honest: only from a real log page read; 0xFF padding
+                    // byte is already mapped to UINT32_MAX inside NvmeHealth).
+                    d.critWarnValid = true;
+                    d.critWarnBits = crit;
+                    d.wearPct = pct == 0xFF ? UINT32_MAX : pct;
+                    d.sparePct = spare;
+                    d.spareThreshPct = spareTh;
                 }
             } else if (d.tempState != SensorReading::State::NeedAdmin) {
                 d.tempState = SensorReading::State::NoHardware;
@@ -785,6 +817,439 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
     }
 }
 
+// ===========================================================================
+// F3: shared 350 ms delta window. One PDH query carries the rate counters
+// (per-core CPU % via Processor Information; per-engtype GPU Engine; GPU
+// Adapter Memory dedicated/shared) and two GetIfTable2 samples give
+// per-adapter octet rates. All Ok readings come from documented user-mode
+// sources (R6 §4/§6); a missing source yields ONE NoHardware placeholder
+// entry — never fabricated zeros.
+// ===========================================================================
+constexpr DWORD kDeltaWindowMs = 350;
+
+// PDH engine type token -> short display name; nullptr = keep the raw token.
+const wchar_t* EngineTypeLabel(const std::wstring& raw) {
+    if (raw == L"3D") return L"3D";
+    if (raw == L"Copy") return L"Copy";
+    if (raw == L"VideoDecode") return L"视频解码";
+    if (raw == L"VideoEncode") return L"视频编码";
+    if (raw == L"VideoProcessing") return L"视频处理";
+    return nullptr;
+}
+
+double ClampPct(double v) {
+    return v < 0.0 ? 0.0 : (v > 100.0 ? 100.0 : v);
+}
+
+void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorReading>* gpuOut,
+                     std::vector<SensorReading>* netOut, std::wstring* notes) {
+    PDH_HQUERY q = nullptr;
+    PDH_HCOUNTER procUtil = nullptr, gpuEng = nullptr, gpuDed = nullptr, gpuShr = nullptr;
+    bool haveProc = false, haveEng = false, haveDed = false, haveShr = false;
+    MIB_IF_TABLE2* ifT0 = nullptr;
+    MIB_IF_TABLE2* ifT1 = nullptr;
+    struct Cleanup {
+        PDH_HQUERY q = nullptr;
+        MIB_IF_TABLE2* t0 = nullptr;
+        MIB_IF_TABLE2* t1 = nullptr;
+        ~Cleanup() {
+            if (t0) ::FreeMibTable(t0);
+            if (t1) ::FreeMibTable(t1);
+            if (q) ::PdhCloseQuery(q);
+        }
+    } cleanup;
+
+    if (::PdhOpenQueryW(nullptr, 0, &q) == ERROR_SUCCESS && q != nullptr) {
+        cleanup.q = q;
+        std::wstring tpl;
+        if (stm::cd::PdhLocalizeEnglishPath(L"\\Processor Information(*)\\% Processor Time", &tpl)) {
+            haveProc = stm::cd::PdhAddWildcardCounter(q, tpl, &procUtil);
+        }
+        if (stm::cd::PdhLocalizeEnglishPath(L"\\GPU Engine(*)\\Utilization Percentage", &tpl)) {
+            haveEng = stm::cd::PdhAddWildcardCounter(q, tpl, &gpuEng);
+        }
+        if (stm::cd::PdhLocalizeEnglishPath(L"\\GPU Adapter Memory(*)\\Dedicated Usage", &tpl)) {
+            haveDed = stm::cd::PdhAddWildcardCounter(q, tpl, &gpuDed);
+        }
+        if (stm::cd::PdhLocalizeEnglishPath(L"\\GPU Adapter Memory(*)\\Shared Usage", &tpl)) {
+            haveShr = stm::cd::PdhAddWildcardCounter(q, tpl, &gpuShr);
+        }
+        if (haveProc || haveEng) stm::cd::PdhCollect(q);  // rate counters need a warm-up sample
+    }
+
+    const bool haveNet0 = ::GetIfTable2(&ifT0) == NO_ERROR && ifT0 != nullptr;
+    cleanup.t0 = ifT0;
+    const ULONGLONG t0ms = ::GetTickCount64();
+    if (haveProc || haveEng || haveNet0) ::Sleep(kDeltaWindowMs);
+    if (haveProc || haveEng) stm::cd::PdhCollect(q);
+    const ULONGLONG t1ms = ::GetTickCount64();
+    const bool haveNet1 = haveNet0 && ::GetIfTable2(&ifT1) == NO_ERROR && ifT1 != nullptr;
+    cleanup.t1 = ifT1;
+    const double dtSec = static_cast<double>(t1ms - t0ms) / 1000.0;
+
+    // --- per-core CPU utilization (Processor Information, documented; R6 §6) ---
+    if (haveProc) {
+        std::vector<stm::cd::PdhArrayItem> items;
+        int added = 0;
+        if (stm::cd::PdhFmtArrayDouble(procUtil, &items)) {
+            for (const stm::cd::PdhArrayItem& it : items) {
+                if (!it.valid) continue;
+                if (it.name.empty() || it.name.find(L"_Total") != std::wstring::npos) continue;
+                // Instances are "0,3" (processor group, logical core): the number
+                // after the last comma labels the core.
+                std::wstring idx = it.name;
+                const size_t comma = idx.rfind(L',');
+                if (comma != std::wstring::npos) idx = idx.substr(comma + 1);
+                SensorReading r;
+                r.label = Fmt(L"CPU 核 {} 占用率", idx);
+                r.value = ClampPct(it.value);
+                r.unit = L"%";
+                r.state = SensorReading::State::Ok;
+                coreUtil->push_back(std::move(r));
+                ++added;
+            }
+        }
+        if (added == 0) {
+            SensorReading r;
+            r.label = L"CPU 每核占用率";
+            r.unit = L"%";
+            r.state = SensorReading::State::NoHardware;
+            coreUtil->push_back(r);
+            *notes += L"；Processor Information 无有效样本，每核占用率不可用";
+        }
+    } else {
+        SensorReading r;
+        r.label = L"CPU 每核占用率";
+        r.unit = L"%";
+        r.state = SensorReading::State::NoHardware;
+        coreUtil->push_back(r);
+        *notes += L"；Processor Information 计数器不可用，每核占用率不可用";
+    }
+
+    // --- GPU engine utilization, aggregated per engtype_* (R6 §4) ---
+    bool anyEngine = false;
+    if (haveEng) {
+        std::vector<stm::cd::PdhArrayItem> items;
+        if (stm::cd::PdhFmtArrayDouble(gpuEng, &items)) {
+            std::map<std::wstring, std::pair<double, int>> agg;  // engtype -> (sum, instances)
+            for (const stm::cd::PdhArrayItem& it : items) {
+                if (!it.valid) continue;
+                const size_t e = it.name.find(L"engtype_");
+                if (e == std::wstring::npos) continue;
+                const std::wstring type = it.name.substr(e + 8);  // len(L"engtype_") == 8
+                if (type.empty()) continue;
+                auto& slot = agg[type];
+                slot.first += ClampPct(it.value);
+                slot.second += 1;
+            }
+            for (const auto& kv : agg) {
+                SensorReading r;
+                const wchar_t* cn = EngineTypeLabel(kv.first);
+                r.label = cn ? Fmt(L"GPU {} 引擎占用率", cn) : Fmt(L"GPU 引擎占用率（{}）", kv.first);
+                r.value = ClampPct(kv.second.first);  // aggregate, clamped like per-engine
+                r.unit = L"%";
+                r.state = SensorReading::State::Ok;
+                gpuOut->push_back(std::move(r));
+                anyEngine = true;
+            }
+        }
+        if (!anyEngine) {
+            SensorReading r;
+            r.label = L"GPU 引擎占用率";
+            r.unit = L"%";
+            r.state = SensorReading::State::NoHardware;
+            gpuOut->push_back(r);
+            *notes += L"；GPU Engine 计数器在但无实例（独显休眠或无 GPU 活动）";
+        }
+    } else {
+        SensorReading r;
+        r.label = L"GPU 引擎占用率";
+        r.unit = L"%";
+        r.state = SensorReading::State::NoHardware;
+        gpuOut->push_back(r);
+        *notes += L"；GPU Engine 计数器不可用（需 Win10 1709+ 图形栈）";
+    }
+
+    // --- GPU adapter memory, summed over adapters (raw usage counters) ---
+    auto adapterMemoryBytes = [](PDH_HCOUNTER h) {
+        if (!h) return -1.0;
+        std::vector<stm::cd::PdhArrayItem> items;
+        if (!stm::cd::PdhFmtArrayDouble(h, &items)) return -1.0;
+        double sum = 0.0;
+        bool any = false;
+        for (const stm::cd::PdhArrayItem& it : items) {
+            if (!it.valid || it.value < 0.0) continue;
+            sum += it.value;
+            any = true;
+        }
+        return any ? sum : -1.0;
+    };
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    const double ded = adapterMemoryBytes(gpuDed);
+    if (ded >= 0.0) {
+        SensorReading r;
+        r.label = L"GPU 显存（专用）";
+        r.value = ded / kGiB;
+        r.unit = L"GiB";
+        r.state = SensorReading::State::Ok;
+        gpuOut->push_back(std::move(r));
+    }
+    const double shr = adapterMemoryBytes(gpuShr);
+    if (shr >= 0.0) {
+        SensorReading r;
+        r.label = L"GPU 显存（共享）";
+        r.value = shr / kGiB;
+        r.unit = L"GiB";
+        r.state = SensorReading::State::Ok;
+        gpuOut->push_back(std::move(r));
+    }
+    if (ded < 0.0 && shr < 0.0) {
+        SensorReading r;
+        r.label = L"GPU 显存";
+        r.unit = L"GiB";
+        r.state = SensorReading::State::NoHardware;
+        gpuOut->push_back(r);
+        if (!haveEng) *notes += L"；GPU Adapter Memory 计数器不可用";
+    }
+
+    // --- per-adapter network rates (GetIfTable2 octet deltas) ---
+    if (haveNet1) {
+        std::map<uint32_t, const MIB_IF_ROW2*> t0rows;
+        for (ULONG i = 0; i < ifT0->NumEntries; ++i) {
+            t0rows.emplace(ifT0->Table[i].InterfaceIndex, &ifT0->Table[i]);
+        }
+        int adapters = 0;
+        for (ULONG i = 0; i < ifT1->NumEntries; ++i) {
+            const MIB_IF_ROW2& r1 = ifT1->Table[i];
+            if (r1.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            if (r1.OperStatus != IfOperStatusUp) continue;
+            const auto it0 = t0rows.find(r1.InterfaceIndex);
+            if (it0 == t0rows.end()) continue;  // appeared mid-window: no honest delta yet
+            const MIB_IF_ROW2& r0 = *it0->second;
+            std::wstring name(r1.Alias);
+            if (name.empty()) name = r1.Description;
+            if (name.empty()) name = Fmt(L"接口 {}", static_cast<unsigned>(r1.InterfaceIndex));
+            auto rate = [&](uint64_t now, uint64_t prev) {
+                if (dtSec <= 0.0 || now < prev) return -1.0;  // counter reset is not a spike
+                return static_cast<double>(now - prev) / dtSec;
+            };
+            const double recv = rate(r1.InOctets, r0.InOctets);
+            const double send = rate(r1.OutOctets, r0.OutOctets);
+            SensorReading rr;
+            rr.label = name + L" 接收";
+            rr.unit = L"B/s";
+            if (recv >= 0.0) {
+                rr.value = recv;
+                rr.state = SensorReading::State::Ok;
+            } else {  // honest placeholder instead of a wrapped-around spike
+                rr.label += L"（计数器重置）";
+                rr.state = SensorReading::State::NoHardware;
+            }
+            netOut->push_back(std::move(rr));
+            SensorReading rs;
+            rs.label = name + L" 发送";
+            rs.unit = L"B/s";
+            if (send >= 0.0) {
+                rs.value = send;
+                rs.state = SensorReading::State::Ok;
+            } else {
+                rs.label += L"（计数器重置）";
+                rs.state = SensorReading::State::NoHardware;
+            }
+            netOut->push_back(std::move(rs));
+            if (r1.TransmitLinkSpeed > 0 && r1.TransmitLinkSpeed != UINT64_MAX) {
+                SensorReading rl;
+                rl.label = name + L" 链路速度";
+                rl.value = static_cast<double>(r1.TransmitLinkSpeed) / 1.0e6;
+                rl.unit = L"Mbps";
+                rl.state = SensorReading::State::Ok;
+                netOut->push_back(std::move(rl));
+            }
+            ++adapters;
+        }
+        if (adapters == 0) {
+            SensorReading r;
+            r.label = L"网络适配器吞吐";
+            r.unit = L"B/s";
+            r.state = SensorReading::State::NoHardware;
+            netOut->push_back(r);
+            *notes += L"；无非回环且在线的网卡";
+        }
+    } else {
+        *notes += haveNet0 ? L"；GetIfTable2 二次采样失败，本拍网卡速率不可用"
+                           : L"；GetIfTable2 不可用，网卡速率不可见";
+        SensorReading r;
+        r.label = L"网络适配器吞吐";
+        r.unit = L"B/s";
+        r.state = SensorReading::State::NoHardware;
+        netOut->push_back(r);
+    }
+}
+
+// ===========================================================================
+// F3: battery (CallNtPowerInformation SystemBatteryState=5, winnt.h layout).
+// No battery -> one NoHardware entry (honest; desktops are the normal case).
+// ===========================================================================
+#pragma pack(push, 4)
+struct BatteryStateRow {  // SYSTEM_BATTERY_STATE
+    BYTE AcOnLine;
+    BYTE BatteryPresent;
+    BYTE Charging;
+    BYTE Discharging;
+    BYTE Spare4[3];
+    DWORD MaxCapacity;
+    DWORD RemainingCapacity;
+    DWORD Rate;           // mW, current charge/discharge rate
+    DWORD EstimatedTime;  // seconds; 0xFFFFFFFF = unknown
+    DWORD DefaultAlert1;
+    DWORD DefaultAlert2;
+};
+#pragma pack(pop)
+static_assert(sizeof(BatteryStateRow) == 32, "SYSTEM_BATTERY_STATE layout");
+
+void ReadBattery(std::vector<SensorReading>* out, std::wstring* notes) {
+    const CallNtPowerInformationFn fn = CallNtPower();
+    BatteryStateRow bs{};
+    if (!fn || fn(5 /*SystemBatteryState*/, nullptr, 0, &bs, sizeof(bs)) != 0) {
+        SensorReading r;
+        r.label = L"电池状态";
+        r.unit = L"";
+        r.state = SensorReading::State::NoHardware;
+        out->push_back(r);
+        *notes += L"；电池状态读取失败（CallNtPowerInformation SystemBatteryState）";
+        return;
+    }
+    if (bs.BatteryPresent == 0) {
+        SensorReading r;
+        r.label = L"电池";
+        r.unit = L"";
+        r.state = SensorReading::State::NoHardware;
+        out->push_back(r);
+        *notes += L"；本机无电池（台式机/外接供电属正常）";
+        return;
+    }
+    SensorReading ac;
+    ac.label = bs.AcOnLine ? L"电池（交流供电）" : L"电池（电池供电）";
+    ac.value = bs.AcOnLine ? 1.0 : 0.0;
+    ac.unit = L"";
+    ac.state = SensorReading::State::Ok;
+    out->push_back(ac);
+    if (bs.MaxCapacity > 0) {
+        SensorReading r;
+        r.label = L"电池 剩余电量";
+        r.value = ClampPct(100.0 * static_cast<double>(bs.RemainingCapacity) /
+                           static_cast<double>(bs.MaxCapacity));
+        r.unit = L"%";
+        r.state = SensorReading::State::Ok;
+        out->push_back(std::move(r));
+    }
+    if (bs.EstimatedTime != 0 && bs.EstimatedTime != 0xFFFFFFFF) {  // 0/-1 = unknown
+        SensorReading r;
+        r.label = L"电池 剩余时间";
+        r.value = static_cast<double>(bs.EstimatedTime);
+        r.unit = L"s";
+        r.state = SensorReading::State::Ok;
+        out->push_back(std::move(r));
+    }
+    if ((bs.Charging || bs.Discharging) && bs.Rate > 0) {
+        SensorReading r;
+        r.label = bs.Charging ? L"电池 充电功率" : L"电池 放电功率";
+        r.value = static_cast<double>(bs.Rate) / 1000.0;
+        r.unit = L"W";
+        r.state = SensorReading::State::Ok;
+        out->push_back(std::move(r));
+    }
+}
+
+// ===========================================================================
+// F3: memory (GlobalMemoryStatusEx + GetPerformanceInfo). GetPerformanceInfo
+// is bound dynamically (K32GetPerformanceInfo in kernel32, psapi.dll
+// fallback) so the stm_collect link line stays unchanged.
+// ===========================================================================
+using GetPerfInfoFn = BOOL(WINAPI*)(PPERFORMANCE_INFORMATION, DWORD);
+
+GetPerfInfoFn GetPerfInfo() {
+    static GetPerfInfoFn fn = []() -> GetPerfInfoFn {
+        const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+        if (k32) {
+            const auto p = reinterpret_cast<GetPerfInfoFn>(::GetProcAddress(k32, "K32GetPerformanceInfo"));
+            if (p) return p;
+        }
+        // Deliberately never freed: process-lifetime binding, same as powrprof above.
+        const HMODULE psapi = ::LoadLibraryW(L"psapi.dll");
+        return psapi ? reinterpret_cast<GetPerfInfoFn>(::GetProcAddress(psapi, "GetPerformanceInfo"))
+                     : nullptr;
+    }();
+    return fn;
+}
+
+void ReadMemory(std::vector<SensorReading>* out, std::wstring* notes) {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    const bool haveMs = ::GlobalMemoryStatusEx(&ms) != FALSE;
+    const GetPerfInfoFn pf = GetPerfInfo();
+    PERFORMANCE_INFORMATION pi{};
+    pi.cb = sizeof(pi);
+    const bool havePi = pf != nullptr && pf(&pi, sizeof(pi)) != FALSE;
+    if (!haveMs && !havePi) {
+        SensorReading r;
+        r.label = L"内存";
+        r.unit = L"%";
+        r.state = SensorReading::State::NoHardware;
+        out->push_back(r);
+        *notes += L"；内存计数器读取失败（GlobalMemoryStatusEx/GetPerformanceInfo）";
+        return;
+    }
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    constexpr double kMiB = 1024.0 * 1024.0;
+    if (haveMs && ms.ullTotalPhys > 0) {
+        const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys);
+        const double total = static_cast<double>(ms.ullTotalPhys);
+        SensorReading pct;
+        pct.label = L"物理内存占用";
+        pct.value = ClampPct(100.0 * used / total);
+        pct.unit = L"%";
+        pct.state = SensorReading::State::Ok;
+        out->push_back(std::move(pct));
+        SensorReading usedR;
+        usedR.label = L"物理内存已用";
+        usedR.value = used / kGiB;
+        usedR.unit = L"GiB";
+        usedR.state = SensorReading::State::Ok;
+        out->push_back(std::move(usedR));
+        SensorReading totalR;
+        totalR.label = L"物理内存总量";
+        totalR.value = total / kGiB;
+        totalR.unit = L"GiB";
+        totalR.state = SensorReading::State::Ok;
+        out->push_back(std::move(totalR));
+    }
+    if (havePi) {
+        if (pi.CommitLimit > 0) {
+            SensorReading r;
+            r.label = L"提交内存占用";
+            r.value = ClampPct(100.0 * static_cast<double>(pi.CommitTotal) /
+                               static_cast<double>(pi.CommitLimit));
+            r.unit = L"%";
+            r.state = SensorReading::State::Ok;
+            out->push_back(std::move(r));
+        }
+        const double pageSize = static_cast<double>(pi.PageSize);
+        SensorReading paged;
+        paged.label = L"分页池";
+        paged.value = static_cast<double>(pi.KernelPaged) * pageSize / kMiB;
+        paged.unit = L"MiB";
+        paged.state = SensorReading::State::Ok;
+        out->push_back(std::move(paged));
+        SensorReading nonPaged;
+        nonPaged.label = L"非分页池";
+        nonPaged.value = static_cast<double>(pi.KernelNonpaged) * pageSize / kMiB;
+        nonPaged.unit = L"MiB";
+        nonPaged.state = SensorReading::State::Ok;
+        out->push_back(std::move(nonPaged));
+    }
+}
+
 }  // namespace
 
 SensorSnapshot ReadSensors(std::wstring* err) {
@@ -792,9 +1257,27 @@ SensorSnapshot ReadSensors(std::wstring* err) {
     std::wstring notes;
     try {
         ReadCpuTemp(&snap.cpu, &notes);
-        ReadCpuFreq(&snap.cpu, &notes);
-        nvml::Read(&snap.gpu, &notes);
+
+        std::vector<SensorReading> coreFreq;
+        ReadCpuFreq(&coreFreq, &notes);
+        for (const SensorReading& r : coreFreq) snap.cpu.push_back(r);  // existing contract
+
+        // F3: shared ~350 ms delta window (per-core %, GPU engine/VRAM, per-NIC rates).
+        std::vector<SensorReading> coreUtil, gpuEngine, net;
+        ReadDeltaWindow(&coreUtil, &gpuEngine, &net, &notes);
+        snap.cpuCores = std::move(coreFreq);
+        snap.cpuCores.insert(snap.cpuCores.end(), coreUtil.begin(), coreUtil.end());
+
+        std::vector<SensorReading> gpuTemps;
+        nvml::Read(&snap.gpu, &notes, &gpuTemps);
+        snap.gpus = std::move(gpuEngine);
+        snap.gpus.insert(snap.gpus.end(), gpuTemps.begin(), gpuTemps.end());
+        snap.network = std::move(net);
+
         ReadDisks(&snap.disks, &notes);
+        ReadBattery(&snap.battery, &notes);
+        ReadMemory(&snap.memory, &notes);
+        snap.uptimeSec = static_cast<double>(::GetTickCount64()) / 1000.0;
 
         SensorReading fan;
         fan.label = L"风扇转速";
@@ -802,7 +1285,9 @@ SensorSnapshot ReadSensors(std::wstring* err) {
         fan.unit = L"rpm";
         fan.state = SensorReading::State::NeedDriver;
         snap.fans.push_back(fan);
-        notes += L"；风扇转速需要内核驱动（本应用不随包分发驱动，见调研 R6）；CPU 占用率见性能页（采集线程每核数据）";
+        notes += L"；风扇转速需要内核驱动（本应用不随包分发驱动，见调研 R6）；CPU 占用率另见性能页；"
+                 L"每核占用率/GPU 引擎与显存来自 PDH、网卡速率来自 GetIfTable2（350ms 增量窗口）；"
+                 L"每核温度等更多传感器可外接 LibreHardwareMonitor 数据源（默认关闭）";
     } catch (const std::exception& e) {
         if (err) *err = Fmt(L"传感器读取异常：{}", Utf8ToWide(e.what()));
         STM_LOG_ERROR("sensors", Fmt(L"ReadSensors 异常：{}", Utf8ToWide(e.what())));
