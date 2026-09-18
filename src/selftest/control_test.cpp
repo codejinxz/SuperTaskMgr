@@ -17,9 +17,67 @@
 #include <string>
 #include <vector>
 
+// export for tests (defined in ops/CrashLog.cpp, deliberately absent from the frozen
+// contract header): pure XML -> CrashEvent re-parse of a captured EvtRender blob.
+// selftest links stm_ops, so this free function resolves there.
+namespace stm {
+namespace ops {
+void ParseEventXml(const std::wstring& xml, CrashEvent* out);
+}  // namespace ops
+}  // namespace stm
+
 namespace {
 
 constexpr uint64_t kFileTime1Sec = 10'000'000ull;
+
+// --- real-machine fixtures (EvtRender XML, captured by the architect; trimmed to the
+// fields under test but faithful: single-quoted attributes, &#xA; entities) --------
+
+// Form A: WER "Application Error", named Data fields.
+const wchar_t* kWerNamed1000Xml =
+    L"<Event><System>"
+    L"<Provider Name='Application Error'/>"
+    L"<EventID>1000</EventID>"
+    L"<Level>2</Level>"
+    L"<TimeCreated SystemTime='2026-09-17T12:34:56.1234567Z'/>"
+    L"<Execution ProcessID='87360' ThreadID='9160'/>"
+    L"</System><EventData>"
+    L"<Data Name='AppName'>x.exe</Data>"
+    L"<Data Name='AppPath'>D:\\tools\\x.exe</Data>"
+    L"<Data Name='FaultingModulePath'>C:\\Windows\\System32\\ntdll.dll</Data>"
+    L"</EventData></Event>";
+
+// Form B: ".NET Runtime", one unnamed free-text Data blob with &#xA; line breaks
+// and no milliseconds in SystemTime (both tolerated by design).
+const wchar_t* kDotNetBlobXml =
+    L"<Event><System>"
+    L"<Provider Name='.NET Runtime'/>"
+    L"<EventID>1000</EventID>"
+    L"<Level>2</Level>"
+    L"<TimeCreated SystemTime='2026-09-18T08:00:00Z'/>"
+    L"<Execution ProcessID='4242' ThreadID='776'/>"
+    L"</System><EventData>"
+    L"<Data>Category: Runtime Error&#xA;Faulting application name: calc.exe, "
+    L"version 10.0.1.0, time stamp 0x6789&#xA;Faulting module name: CORECLR.DLL, "
+    L"version 9.0.0, faulting address 0x0000DEAD&#xA;Exception: "
+    L"System.DivideByZeroException</Data>"
+    L"</EventData></Event>";
+
+// EventID 1002 "Application Hang", named fields (real machine sample).
+const wchar_t* kHang1002Xml =
+    L"<Event><System>"
+    L"<Provider Name='Application Hang'/>"
+    L"<EventID>1002</EventID>"
+    L"<Level>3</Level>"
+    L"<TimeCreated SystemTime='2026-09-18T09:30:00.0000000Z'/>"
+    L"<Execution ProcessID='66976' ThreadID='21472'/>"
+    L"</System><EventData>"
+    L"<Data Name='AppName'>SuperTaskMgr.exe</Data>"
+    L"<Data Name='AppVersion'>0.0.0.0</Data>"
+    L"<Data Name='ProcessId'>0x105a0</Data>"
+    L"<Data Name='ExeFileName'>D:\\build\\SuperTaskMgr.exe</Data>"
+    L"<Data Name='HangType'>Unknown</Data>"
+    L"</EventData></Event>";
 
 uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
@@ -294,6 +352,140 @@ STM_TEST(ctrl_identity_dead_pid) {
     return true;
 }
 
+// Form A (WER, named Data): app/module map by field name; provider decides the
+// headline; ISO-8601 with fraction + Z parses to exact unix seconds.
+STM_TEST(crashlog_parse_wer_named) {
+    stm::ops::CrashEvent ev;
+    stm::ops::ParseEventXml(kWerNamed1000Xml, &ev);
+    if (ev.eventId != 1000) {
+        *err = stm::Fmt(L"eventId={}，期望 1000", ev.eventId);
+        return false;
+    }
+    if (ev.provider != L"Application Error") {
+        *err = L"provider 解析错误：" + ev.provider;
+        return false;
+    }
+    if (ev.level != 2) {
+        *err = stm::Fmt(L"level={}，期望 2", ev.level);
+        return false;
+    }
+    if (ev.unixTime != 1789648496) {  // 2026-09-17T12:34:56Z
+        *err = stm::Fmt(L"unixTime={}，期望 1789648496", ev.unixTime);
+        return false;
+    }
+    if (ev.app != L"x.exe") {
+        *err = L"app 应取 AppName 的 x.exe，实际：" + ev.app;
+        return false;
+    }
+    if (ev.module != L"ntdll.dll") {
+        *err = L"module 应取 FaultingModulePath 的镜像名，实际：" + ev.module;
+        return false;
+    }
+    if (ev.summary != L"应用崩溃：x.exe（模块 ntdll.dll）") {
+        *err = L"summary 不符合预期：" + ev.summary;
+        return false;
+    }
+    return true;
+}
+
+// Form B (.NET Runtime, unnamed blob): summary takes the first non-empty line, and
+// app/module come from the text heuristics (first *.exe; *.dll after "faulting
+// module", case-insensitive).
+STM_TEST(crashlog_parse_blob_unnamed) {
+    stm::ops::CrashEvent ev;
+    stm::ops::ParseEventXml(kDotNetBlobXml, &ev);
+    if (ev.provider != L".NET Runtime") {
+        *err = L"provider 解析错误：" + ev.provider;
+        return false;
+    }
+    if (ev.unixTime != 1789718400) {  // 2026-09-18T08:00:00Z（无毫秒 + Z）
+        *err = stm::Fmt(L"unixTime={}，期望 1789718400", ev.unixTime);
+        return false;
+    }
+    if (ev.app != L"calc.exe") {
+        *err = L"blob 启发式应提取首个 *.exe token（calc.exe），实际：" + ev.app;
+        return false;
+    }
+    if (ev.module != L"CORECLR.DLL") {
+        *err = L"blob 启发式应在 faulting module 后提取 *.dll，实际：" + ev.module;
+        return false;
+    }
+    if (ev.summary.rfind(L".NET 运行时错误：calc.exe", 0) != 0) {
+        *err = L"summary 应以 .NET 运行时错误 label + app 开头：" + ev.summary;
+        return false;
+    }
+    if (ev.summary.find(L"Category: Runtime Error") == std::wstring::npos) {
+        *err = L"summary 未包含 blob 首行非空文本：" + ev.summary;
+        return false;
+    }
+    return true;
+}
+
+// EventID 1002 (Application Hang): AppName maps to app, ExeFileName is not confused
+// with module, and the headline is the hang wording (not the crash one).
+STM_TEST(crashlog_parse_hang_1002) {
+    stm::ops::CrashEvent ev;
+    stm::ops::ParseEventXml(kHang1002Xml, &ev);
+    if (ev.eventId != 1002) {
+        *err = stm::Fmt(L"eventId={}，期望 1002", ev.eventId);
+        return false;
+    }
+    if (ev.provider != L"Application Hang") {
+        *err = L"provider 解析错误：" + ev.provider;
+        return false;
+    }
+    if (ev.level != 3) {
+        *err = stm::Fmt(L"level={}，期望 3", ev.level);
+        return false;
+    }
+    if (ev.unixTime != 1789723800) {  // 2026-09-18T09:30:00Z
+        *err = stm::Fmt(L"unixTime={}，期望 1789723800", ev.unixTime);
+        return false;
+    }
+    if (ev.app != L"SuperTaskMgr.exe") {
+        *err = L"app 应取 AppName，实际：" + ev.app;
+        return false;
+    }
+    if (!ev.module.empty()) {
+        *err = L"挂起事件不应有 module，实际：" + ev.module;
+        return false;
+    }
+    if (ev.summary.rfind(L"应用挂起：SuperTaskMgr.exe", 0) != 0) {
+        *err = L"summary 应以 应用挂起 label + app 开头：" + ev.summary;
+        return false;
+    }
+    return true;
+}
+
+// No usable Data at all (named fields that map to nothing, no blob): the entry must
+// degrade to the Execution ProcessID — never a "未知" placeholder.
+STM_TEST(crashlog_parse_unnamed_falls_back_to_pid) {
+    const std::wstring xml =
+        L"<Event><System>"
+        L"<Provider Name='Windows Error Reporting'/>"
+        L"<EventID>1001</EventID><Level>4</Level>"
+        L"<TimeCreated SystemTime='2026-09-18T10:00:00.500Z'/>"
+        L"<Execution ProcessID='87360' ThreadID='556'/>"
+        L"</System><EventData>"
+        L"<Data Name='ReportId'>1</Data><Data Name='P2'>1.2.3.4</Data>"
+        L"</EventData></Event>";
+    stm::ops::CrashEvent ev;
+    stm::ops::ParseEventXml(xml, &ev);
+    if (ev.app != L"PID 87360") {
+        *err = L"无可用 Data 时 app 应退化为 Execution ProcessID，实际：" + ev.app;
+        return false;
+    }
+    if (ev.summary.rfind(L"WER 报告：PID 87360", 0) != 0) {
+        *err = L"summary 应以 WER 报告 label + PID 开头：" + ev.summary;
+        return false;
+    }
+    if (ev.unixTime != 1789725600) {  // 2026-09-18T10:00:00Z（毫秒被容忍）
+        *err = stm::Fmt(L"unixTime={}，期望 1789725600", ev.unixTime);
+        return false;
+    }
+    return true;
+}
+
 // Crash-log query must not crash, stay within contract IDs and newest-first order.
 // A non-empty err is only a channel limitation (honest degradation), never a failure.
 STM_TEST(crashlog_query_ok) {
@@ -317,6 +509,16 @@ STM_TEST(crashlog_query_ok) {
             *err = L"存在空 summary 的事件";
             return false;
         }
+        if (ev.app.empty() || ev.app.find(L"未知") != std::wstring::npos) {
+            *err = L"存在空 app 或仍是未知占位的事件：" + ev.app;
+            return false;
+        }
+    }
+    for (size_t i = 0; i < evs.size() && i < 3; ++i) {  // first-3 spot check output
+        const auto& ev = evs[i];
+        printf("  [info] #%zu id=%u lv=%u app=%s mod=%s | %s\n", i, ev.eventId, ev.level,
+               stm::WideToUtf8(ev.app).c_str(), stm::WideToUtf8(ev.module).c_str(),
+               stm::WideToUtf8(ev.summary).c_str());
     }
     printf("  [info] 崩溃历史 %zu 条（近 50 上限，非管理员）\n", evs.size());
     return true;

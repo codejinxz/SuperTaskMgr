@@ -1,4 +1,5 @@
 // Application entry: single-instance, session handoff, service wiring, message loop.
+#include "app/AboutInfo.h"        // H-A: 窗口标题带版本（发布信息单一来源）
 #include "app/AppContext.h"
 #include "app/AutotestDialog.h"
 #include "app/D3DRenderer.h"
@@ -8,8 +9,10 @@
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/Pages.h"
 #include "app/ui/Tray.h"
-#include "app/ui3/GcPages.h"  // F4: 热键绑定 + 新页注册依赖的共享入口
+#include "app/ui3/GcPages.h"      // F4: 热键绑定 + 新页注册依赖的共享入口
 #include "app/ui3/Pages3.h"
+#include "app/ui3/ThemeCfg.h"     // H-A: 退出时剔除「恢复默认列宽」的软删除残留
+#include "app/ui3/Wallpaper.h"    // Phase-6 接线: AutoRestore/DrawBackground/ClampMask
 #include "core/FsUtil.h"
 #include "core/HandleGuard.h"
 #include "core/Log.h"
@@ -327,10 +330,45 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     cbs.quit = &ctx->wantExit;
     cbs.onResize = [](void* ud, int w, int h) { static_cast<D3DRenderer*>(ud)->Resize(w, h); };
     ui::Tray tray;
+    bool uiThemeReady = false;  // H-A: ImGui 上下文就绪前不响应主题系统广播
     // Tray messages ride the window-proc hook (Win32Window exposes no other way in).
     // F4#10: WM_HOTKEY（全局热键 Ctrl+Alt+M）也在此处理，复用托盘三分支显隐逻辑。
-    cbs.onMessage = [&tray, &win](HWND h, UINT msg, WPARAM wParam, LPARAM lParam,
-                                  bool* handled) -> LRESULT {
+    cbs.onMessage = [&tray, &win, &ctx, &uiThemeReady](HWND h, UINT msg, WPARAM wParam,
+                                                       LPARAM lParam,
+                                                       bool* handled) -> LRESULT {
+        // P3 任务三：标题栏 X -> 按 cfg closeAction 分派（持久化键 closeAction，
+        // 默认 0）。拦截 WM_CLOSE（置 handled，不交 DefWindowProc => 不销毁窗口）：
+        //   1 = 直接退出；2 = 最小化到托盘（SW_HIDE，托盘左键可恢复）；
+        //   0 = 置 pending 标志，由 DrawConfirmDialogs 每帧弹出三选一模态。
+        // 注意：--smoke / --autotest 的退出路径走 ctx->wantExit，从不经过 WM_CLOSE，
+        // 拦截不影响 headless 退出；托盘菜单「退出」也始终直接置 wantExit 不询问。
+        if (msg == WM_CLOSE) {
+            const int action =
+                ui::NormalizeCloseAction(ctx->cfg.GetInt(ui::kCloseActionCfgKey, 0));
+            if (action == 1) {
+                // Pass through (not handled): DefWindowProc destroys the window =>
+                // WM_DESTROY => quit. Keeps external graceful close (taskkill without
+                // /F) working when the user chose "always exit" (V18-P2-2).
+            } else if (action == 2) {
+                ShowWindow(h, SW_HIDE);
+                *handled = true;
+                return 0;
+            } else {
+                ctx->closeAskPending = true;
+                *handled = true;
+                return 0;
+            }
+        }
+        // H-A: 跟随系统主题实时切换 —— Windows 深浅色切换广播
+        // (WM_SETTINGCHANGE, lParam=="ImmersiveColorSet")。仅当 cfg 当前模式为
+        // System 时重新 Apply（实时读注册表）；不置 handled，托盘钩子照常处理。
+        if (msg == WM_SETTINGCHANGE && lParam != 0 && uiThemeReady) {
+            const wchar_t* section = reinterpret_cast<LPCWSTR>(lParam);
+            if (section != nullptr && lstrcmpiW(section, L"ImmersiveColorSet") == 0 &&
+                ThemeModeFromInt(ctx->cfg.GetInt(L"themeMode", 0)) == ThemeMode::System) {
+                Theme::Apply(ThemeMode::System);
+            }
+        }
         if (msg == WM_HOTKEY && wParam == static_cast<WPARAM>(ui3::kGcHotkeyId)) {
             ToggleMainWindowVisible(win.Hwnd());
             *handled = true;
@@ -339,17 +377,27 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         return tray.HandleMessage(h, msg, wParam, lParam, handled);
     };
     cbs.ud = &renderer;
-    if (!win.Create(inst, L"超级任务管理器", 1280, 800, cmdShow, cbs)) {
+    // H-A: 窗口标题带版本（AboutInfo.h::WindowTitleWithVersion，发布信息单一来源）。
+    if (!win.Create(inst, WindowTitleWithVersion().c_str(), 1280, 800, cmdShow, cbs)) {
         STM_LOG_ERROR("app", L"窗口创建失败");
         return 1;
     }
+    // P3 任务三：主窗句柄交给 AppContext，「最小化到托盘」的模态按钮据此 SW_HIDE。
+    ctx->mainHwnd = win.Hwnd();
     if (!renderer.Init(win.Hwnd(), win.Width(), win.Height())) {
         MessageBoxW(nullptr, L"D3D11 初始化失败（含 WARP 兜底）。", L"错误", MB_OK | MB_ICONERROR);
         return 1;
     }
     ImGuiLayer ui;
     if (!ui.Init(win.Hwnd(), &renderer)) return 1;
-    Theme::Apply();
+    // H-A: 启动即应用 cfg 持久的主题模式（themeMode，默认 0=Dark；System 在
+    // Apply 内解析注册表）。随后的系统深浅色广播由 onMessage 钩子处理。
+    Theme::Apply(ThemeModeFromInt(ctx->cfg.GetInt(L"themeMode", 0)));
+    uiThemeReady = true;
+    // 壁纸（Phase-6 接线）：D3D/ImGui 均就绪后，注册后端供外观菜单加载/清除用，
+    // 并恢复 %LOCALAPPDATA% 持久的壁纸副本（无副本时为安静空操作）。
+    RegisterWallpaperBackend(renderer.Device(), renderer.Context());
+    ui::WallpaperAutoRestore(renderer.Device(), renderer.Context());
 
     // Tray icon: skipped under --smoke / --autotest (CI renders headless-ish, no
     // shell icon churn).
@@ -380,6 +428,8 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     // Under --smoke every page's Draw is exercised in an offscreen window so
     // the new tabs' empty/error states are covered by the CI smoke run.
     ui3::SetSmokeDrawAll(smokeFrames > 0);
+    // H-A: --smoke 同时把「外观→自定义壁纸」控件组画进离屏窗口（渲染路径覆盖）。
+    SetAppearanceSmokePreview(smokeFrames > 0);
 
     // F4#10: 全局热键挂到主窗（UI 线程 == 窗口线程，RegisterHotKey 合法）；
     // headless（--smoke/--autotest）不注册，避免 CI 侧副作用。失败只记日志。
@@ -427,6 +477,11 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         QueryPerformanceCounter(&t0);
         renderer.BeginFrame();
         ui.NewFrame();
+        // 壁纸（Phase-6 接线，V18-P0 修正）：必须发生在 NewFrame 之后——背景绘制
+        // 列表只有在本帧内被追加过才会并入 DrawData（imgui 以 g.Time 戳判定），
+        // NewFrame 之前调用永不渲染。背景列表天然位于所有普通窗口之下。
+        ui::WallpaperDrawBackground(
+            ui::ClampMask(static_cast<float>(ctx->cfg.GetDouble(L"wallpaperMask", 0.45))));
         DrawShell(*ctx);  // drains notifications into toasts; one snapshot read per frame
         ui.Render();
         renderer.Present();
@@ -467,6 +522,9 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     if (smokeFrames == 0 && autotestMode.empty()) {
         SaveSessionFromCtx(*ctx, win.Hwnd());  // window rect / page / selection handoff
         ctx->cfg.Save(ConfigPath());
+        // H-A: 「恢复默认列宽」把 colW_* 软删除为 ""，Save 会把空值写回 —— 这里
+        // 按值过滤剔除，保证重启后配置文件不再残留这些键（重新调过的真实宽度保留）。
+        ui3::StripColWidthKeysFromFile(ConfigPath(), /*onlyEmptyValues=*/true);
     }
     tray.Remove();
     ui3::GcHotkeyUnbindWindow();   // F4#10: 退出反注册热键
@@ -475,6 +533,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     // running afterwards survives on ctx's shared_ptr (see comment above).
     ctx->collect.Stop();
     ctx->jobs.Shutdown(2000);
+    ui::WallpaperClear();  // V18-P2-6: release texture + stored copy explicitly
     ui.Shutdown();
     renderer.Shutdown();
     win.Destroy();

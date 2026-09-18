@@ -3,6 +3,7 @@
 // imgui_impl_dx11 example lifecycle). UI layer only; no app logic here.
 #include <d3d11.h>
 #include <dxgi.h>
+#include <cstdint>
 #include <wrl/client.h>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")

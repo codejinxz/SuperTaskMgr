@@ -3,13 +3,22 @@
 // Documented API only (wevtapi): EvtQuery(channel path, XPath) over "Application" and
 // "System" in reverse (newest-first) direction for EventID 1000 (app error) /
 // 1001 (WER report) / 1002 (app hang), then EvtRender(EvtRenderXml) and a small
-// self-contained XML field scan for TimeCreated / Provider / Level / EventData
-// App+module names. Both channels are readable without admin. No admin, no ETW,
-// no third-party deps. All EVT_HANDLEs are RAII-owned.
+// self-contained XML field scan for TimeCreated / Provider / Level / EventData.
+// Both channels are readable without admin. No admin, no ETW, no third-party deps.
+// All EVT_HANDLEs are RAII-owned.
 //
-// Field names are matched best-effort per the documented WER payload: 1000 uses
-// AppName/AppPath/FaultingModule(-Path); 1001/1002 reuse the same names when present
-// (WER payloads vary); unmatched fields stay honestly empty.
+// EventData has two real-world shapes and BOTH are parsed (P1 fix: shape B used to
+// degrade every .NET Runtime row to "未知/-"):
+//   A) named fields  — <Data Name='AppName'>x.exe</Data> (Application Error/Hang,
+//      WER): AppName/AppPath/Application -> app; FaultingModule*/Module -> module;
+//   B) unnamed blobs — <Data>Category: ...&#xA;Exception: ...</Data> (.NET Runtime):
+//      the first non-empty line feeds the summary; app/module come from best-effort
+//      text heuristics (first *.exe token; *.dll/*.sys token after "faulting
+//      module"/"模块"). Nothing extractable stays empty.
+// Entries where neither track yields an app fall back to the Execution ProcessID
+// ("PID 87360") — never a "未知" placeholder. Attribute values in both quote styles
+// (single/double) are accepted; numeric entities (&#xA;) decode; a CDATA payload
+// (not emitted by the renderer today) passes through verbatim.
 #include "ops/CrashLog.h"
 #include "core/Err.h"
 #include "core/Log.h"
@@ -45,16 +54,82 @@ std::wstring ReplaceAll(std::wstring s, const std::wstring& from, const std::wst
     return s;
 }
 
-// Best-effort XML entity decode (named entities; the EventLog renderer escapes the
-// usual five). &amp; is decoded LAST so "&amp;lt;" yields "&lt;", not "<".
+bool IsXmlSpace(wchar_t c) {
+    return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+}
+
+std::wstring Trim(const std::wstring& s) {
+    size_t b = 0;
+    size_t e = s.size();
+    while (b < e && IsXmlSpace(s[b])) ++b;
+    while (e > b && IsXmlSpace(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+// Best-effort XML entity decode: the five named entities plus numeric character
+// references (&#xA; / &#13; — the renderer escapes newlines numerically). Single-pass
+// left-to-right, so "&amp;lt;" yields "&lt;" (never re-decoded); a bare "&" or an
+// unparsable reference stays verbatim.
 std::wstring UnescapeXml(const std::wstring& s) {
     if (s.find(L'&') == std::wstring::npos) return s;
-    std::wstring out = ReplaceAll(s, L"&lt;", L"<");
-    out = ReplaceAll(out, L"&gt;", L">");
-    out = ReplaceAll(out, L"&quot;", L"\"");
-    out = ReplaceAll(out, L"&apos;", L"'");
-    out = ReplaceAll(out, L"&amp;", L"&");
+    static constexpr struct {
+        const wchar_t* ent;
+        wchar_t ch;
+    } kNamed[] = {
+        {L"&lt;", L'<'},    {L"&gt;", L'>'},   {L"&quot;", L'"'},
+        {L"&apos;", L'\''}, {L"&amp;", L'&'},
+    };
+    std::wstring out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] != L'&') {
+            out += s[i++];
+            continue;
+        }
+        bool matched = false;
+        for (const auto& e : kNamed) {
+            const size_t n = wcslen(e.ent);
+            if (s.compare(i, n, e.ent) == 0) {
+                out += e.ch;
+                i += n;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        if (i + 1 < s.size() && s[i + 1] == L'#') {  // numeric reference
+            size_t j = i + 2;
+            bool hex = false;
+            if (j < s.size() && (s[j] == L'x' || s[j] == L'X')) {
+                hex = true;
+                ++j;
+            }
+            wchar_t* endp = nullptr;
+            const unsigned long code =
+                wcstoul(s.c_str() + j, &endp, hex ? 16 : 10);
+            if (endp > s.c_str() + j && endp < s.c_str() + s.size() && *endp == L';' &&
+                code != 0 && code <= 0xFFFF) {
+                out += static_cast<wchar_t>(code);
+                i = static_cast<size_t>(endp - s.c_str()) + 1;
+                continue;
+            }
+        }
+        out += s[i++];  // bare '&': keep verbatim
+    }
     return out;
+}
+
+// Decode an element payload: a CDATA block (never emitted by EvtRender today, kept
+// for robustness) passes through verbatim; plain text gets entity-decoded.
+std::wstring DecodeXmlText(const std::wstring& raw) {
+    constexpr wchar_t kCdataOpen[] = L"<![CDATA[";
+    constexpr size_t kCdataOpenLen = 9;
+    if (raw.size() >= kCdataOpenLen + 3 && raw.compare(0, kCdataOpenLen, kCdataOpen) == 0 &&
+        raw.compare(raw.size() - 3, 3, L"]]>") == 0) {
+        return raw.substr(kCdataOpenLen, raw.size() - kCdataOpenLen - 3);
+    }
+    return UnescapeXml(raw);
 }
 
 // True when the char at `p` plausibly starts the tag we searched for (avoids matching
@@ -65,22 +140,46 @@ bool TagBoundary(const std::wstring& xml, size_t nameEnd) {
     return c == L'>' || c == L'/' || c == L' ';
 }
 
-// First attribute value of `attr` inside the "<tag ...>" element that starts the XML.
+// Value of attribute `attr` inside a "<Tag attr='v'>" tag text. Both quote styles
+// occur in the wild (EvtRender and common capture tooling differ), and the attribute
+// name must be a whole word: whitespace-preceded and immediately followed by '='.
+std::wstring AttrValueInTagText(const std::wstring& tagText, const wchar_t* attr) {
+    const size_t alen = wcslen(attr);
+    size_t p = tagText.find(attr);
+    while (p != std::wstring::npos) {
+        const size_t after = p + alen;
+        if (p > 0 && IsXmlSpace(tagText[p - 1]) && after < tagText.size() &&
+            tagText[after] == L'=') {
+            const size_t q = after + 1;
+            if (q < tagText.size()) {
+                const wchar_t quote = tagText[q];
+                if (quote == L'"' || quote == L'\'') {
+                    const size_t vend = tagText.find(quote, q + 1);
+                    if (vend != std::wstring::npos) {
+                        return UnescapeXml(tagText.substr(q + 1, vend - q - 1));
+                    }
+                }
+            }
+        }
+        p = tagText.find(attr, after);
+    }
+    return {};
+}
+
+// Attribute `attr` of the first "<tag ...>" element in the XML (empty when absent).
 std::wstring AttributeInFirstTag(const std::wstring& xml, const wchar_t* tag,
                                  const wchar_t* attr) {
     const std::wstring open = std::wstring(L"<") + tag;
     size_t p = xml.find(open);
-    if (p == std::wstring::npos || !TagBoundary(xml, p + open.size())) return {};
-    const size_t gt = xml.find(L'>', p);
-    if (gt == std::wstring::npos) return {};
-    const std::wstring tagText = xml.substr(p, gt - p);  // "<Provider Name=\"...\" ..."
-    const std::wstring pat = std::wstring(L" ") + attr + L"=\"";
-    const size_t a = tagText.find(pat);
-    if (a == std::wstring::npos) return {};
-    const size_t vstart = a + pat.size();
-    const size_t vend = tagText.find(L'"', vstart);
-    if (vend == std::wstring::npos) return {};
-    return UnescapeXml(tagText.substr(vstart, vend - vstart));
+    while (p != std::wstring::npos) {
+        if (TagBoundary(xml, p + open.size())) {
+            const size_t gt = xml.find(L'>', p);
+            if (gt == std::wstring::npos) return {};
+            return AttrValueInTagText(xml.substr(p, gt - p), attr);
+        }
+        p = xml.find(open, p + 1);
+    }
+    return {};
 }
 
 // Text of the first "<tag ...>value</tag>" element (empty when absent/self-closing).
@@ -97,10 +196,12 @@ std::wstring ElementText(const std::wstring& xml, const wchar_t* tag) {
     const std::wstring close = std::wstring(L"</") + tag + L">";
     const size_t ce = xml.find(close, gt);
     if (ce == std::wstring::npos) return {};
-    return UnescapeXml(xml.substr(gt + 1, ce - gt - 1));
+    return DecodeXmlText(xml.substr(gt + 1, ce - gt - 1));
 }
 
-// ISO-8601 "2026-09-18T03:14:15.1234567Z" -> unix seconds (SystemTime is UTC).
+// ISO-8601 "2026-09-18T03:14:15[.1234567][Z]" -> unix seconds (SystemTime is UTC).
+// swscanf stops after the seconds field, so optional fraction and the Z suffix (and
+// their absence) are all tolerated.
 int64_t ParseEventTime(const std::wstring& s) {
     SYSTEMTIME st{};
     if (swscanf_s(s.c_str(), L"%hu-%hu-%huT%hu:%hu:%hu", &st.wYear, &st.wMonth, &st.wDay,
@@ -123,8 +224,15 @@ uint32_t ToU32(const std::wstring& s) {
     return static_cast<uint32_t>(v);
 }
 
-// Parse every "<Data Name=\"X\">value</Data>" (self-closing forms yield empty values).
-void ParseEventData(const std::wstring& xml, std::vector<std::pair<std::wstring, std::wstring>>* out) {
+struct DataField {
+    std::wstring name;   // empty for unnamed (free-text blob) payloads
+    std::wstring value;
+};
+
+// Parse every "<Data ...>value</Data>" (self-closing forms yield empty values). Both
+// real shapes are kept: named fields AND unnamed blobs (the .NET Runtime payload is
+// one free-text Data element with &#xA; line breaks).
+void ParseEventData(const std::wstring& xml, std::vector<DataField>* out) {
     out->clear();
     size_t p = xml.find(L"<Data");
     while (p != std::wstring::npos) {
@@ -135,22 +243,12 @@ void ParseEventData(const std::wstring& xml, std::vector<std::pair<std::wstring,
         const size_t gt = xml.find(L'>', p);
         if (gt == std::wstring::npos) break;
         const bool selfClosing = xml[gt - 1] == L'/';
-        const std::wstring tagText = xml.substr(p, gt - p);
-        const std::wstring pat = L" Name=\"";
-        std::wstring name;
-        const size_t a = tagText.find(pat);
-        if (a != std::wstring::npos) {
-            const size_t vstart = a + pat.size();
-            const size_t vend = tagText.find(L'"', vstart);
-            if (vend != std::wstring::npos) {
-                name = tagText.substr(vstart, vend - vstart);
-            }
-        }
-        std::wstring value;
+        DataField f;
+        f.name = AttrValueInTagText(xml.substr(p, gt - p), L"Name");
         if (!selfClosing) {
             const size_t ce = xml.find(L"</Data>", gt);
             if (ce != std::wstring::npos) {
-                value = UnescapeXml(xml.substr(gt + 1, ce - gt - 1));
+                f.value = DecodeXmlText(xml.substr(gt + 1, ce - gt - 1));
                 p = ce + 7;
             } else {
                 p = gt;  // malformed: stop scanning this element, continue after it
@@ -158,54 +256,172 @@ void ParseEventData(const std::wstring& xml, std::vector<std::pair<std::wstring,
         } else {
             p = gt;
         }
-        if (!name.empty()) out->emplace_back(std::move(name), std::move(value));
+        if (!f.name.empty() || !f.value.empty()) out->push_back(std::move(f));
         p = xml.find(L"<Data", p);
     }
 }
 
-const std::wstring* FindData(const std::vector<std::pair<std::wstring, std::wstring>>& data,
-                             const wchar_t* name) {
+const std::wstring* FindNamed(const std::vector<DataField>& data, const wchar_t* name) {
     for (const auto& d : data) {
-        if (d.first == name) return &d.second;
+        if (d.name == name) return &d.value;
     }
     return nullptr;
 }
 
-std::wstring BuildSummary(uint32_t eventId, const std::wstring& app, const std::wstring& module) {
-    const wchar_t* head = eventId == 1000   ? L"应用崩溃"
-                          : eventId == 1001 ? L"错误报告"
-                          : eventId == 1002 ? L"应用无响应"
-                                            : L"异常事件";
-    std::wstring s = std::wstring(head) + L"：" + (app.empty() ? L"（应用未知）" : app);
+// First whitespace-delimited token (from `from` on) whose tail equals one of
+// `suffixes` (case-insensitive); common trailing punctuation is stripped.
+std::wstring FindTokenEndingWith(const std::wstring& text, size_t from,
+                                 const wchar_t* const* suffixes, size_t count) {
+    size_t i = from;
+    while (i < text.size()) {
+        while (i < text.size() && IsXmlSpace(text[i])) ++i;
+        size_t j = i;
+        while (j < text.size() && !IsXmlSpace(text[j])) ++j;
+        if (j > i) {
+            std::wstring tok = text.substr(i, j - i);
+            while (!tok.empty() &&
+                   (tok.back() == L',' || tok.back() == L';' || tok.back() == L':' ||
+                    tok.back() == L')' || tok.back() == L'"' || tok.back() == L'\'')) {
+                tok.pop_back();
+            }
+            for (size_t k = 0; k < count; ++k) {
+                const size_t n = wcslen(suffixes[k]);
+                if (tok.size() > n &&
+                    _wcsnicmp(tok.c_str() + tok.size() - n, suffixes[k], n) == 0) {
+                    return tok;
+                }
+            }
+        }
+        i = j;
+    }
+    return {};
+}
+
+// Case-insensitive search for `needle` at/after `from`; true + position when found.
+bool IFindFrom(const std::wstring& text, const wchar_t* needle, size_t from, size_t* pos) {
+    const size_t n = wcslen(needle);
+    for (size_t i = from; i + n <= text.size(); ++i) {
+        if (_wcsnicmp(text.c_str() + i, needle, n) == 0) {
+            *pos = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Blob heuristics (track B): the first *.exe token anywhere is the app; the first
+// *.dll/*.sys token after a "faulting module"/"模块" label is the module. Works with
+// the label glued to the token ("模块：ntdll.dll") and with "name:" style suffixes.
+std::wstring AppFromBlob(const std::wstring& blob) {
+    static const wchar_t* const kExe[] = {L".exe"};
+    const std::wstring tok = FindTokenEndingWith(blob, 0, kExe, 1);
+    return tok.empty() ? std::wstring() : ImageNameOf(tok);
+}
+
+std::wstring ModuleFromBlob(const std::wstring& blob) {
+    static const wchar_t* const kModule[] = {L".dll", L".sys"};
+    static const wchar_t* const kLabels[] = {L"faulting module", L"模块"};
+    for (const wchar_t* label : kLabels) {
+        const size_t labelLen = wcslen(label);
+        size_t pos = 0;
+        while (IFindFrom(blob, label, pos, &pos)) {
+            const std::wstring tok = FindTokenEndingWith(blob, pos + labelLen, kModule, 2);
+            if (!tok.empty()) return ImageNameOf(tok);
+            ++pos;
+        }
+    }
+    return {};
+}
+
+std::wstring FirstNonEmptyLine(const std::wstring& text) {
+    size_t p = 0;
+    while (p < text.size()) {
+        const size_t e = text.find(L'\n', p);
+        const std::wstring line =
+            Trim(text.substr(p, e == std::wstring::npos ? text.size() - p : e - p));
+        if (!line.empty()) return line;
+        if (e == std::wstring::npos) break;
+        p = e + 1;
+    }
+    return {};
+}
+
+std::wstring TruncateForSummary(const std::wstring& s) {
+    constexpr size_t kMax = 80;
+    if (s.size() <= kMax) return s;
+    return s.substr(0, kMax) + L"…";
+}
+
+// Chinese headline by provider (how the user reads the row); an unknown provider is
+// shown verbatim instead of being collapsed into a generic label.
+std::wstring ProviderHeadline(const std::wstring& provider, uint32_t eventId) {
+    if (_wcsicmp(provider.c_str(), L"Application Error") == 0) return L"应用崩溃";
+    if (_wcsicmp(provider.c_str(), L"Application Hang") == 0) return L"应用挂起";
+    if (_wcsicmp(provider.c_str(), L"Windows Error Reporting") == 0) return L"WER 报告";
+    if (_wcsicmp(provider.c_str(), L".NET Runtime") == 0) return L".NET 运行时错误";
+    if (!provider.empty()) return provider;
+    return eventId == 1000   ? L"应用崩溃"
+           : eventId == 1001 ? L"WER 报告"
+           : eventId == 1002 ? L"应用挂起"
+                             : L"异常事件";  // provider-less fallback
+}
+
+std::wstring BuildSummary(const std::wstring& provider, uint32_t eventId,
+                          const std::wstring& app, const std::wstring& module,
+                          const std::wstring& blobLine) {
+    std::wstring s = ProviderHeadline(provider, eventId);
+    if (!app.empty()) s += L"：" + app;
     if (!module.empty()) s += L"（模块 " + module + L"）";
+    if (!blobLine.empty()) s += L"：" + TruncateForSummary(blobLine);
     return s;
 }
 
-CrashEvent ParseEventXml(const std::wstring& xml) {
+CrashEvent ParseEventXmlImpl(const std::wstring& xml) {
     CrashEvent ev;
     ev.unixTime = ParseEventTime(AttributeInFirstTag(xml, L"TimeCreated", L"SystemTime"));
     ev.provider = AttributeInFirstTag(xml, L"Provider", L"Name");
     ev.eventId = ToU32(ElementText(xml, L"EventID"));
     ev.level = static_cast<uint16_t>(ToU32(ElementText(xml, L"Level")));
 
-    std::vector<std::pair<std::wstring, std::wstring>> data;
+    std::vector<DataField> data;
     ParseEventData(xml, &data);
-    if (const std::wstring* v = FindData(data, L"AppName")) {
-        ev.app = ImageNameOf(*v);
+
+    // Track A: named payload fields (WER / Application Error / Application Hang).
+    for (const wchar_t* n : {L"AppName", L"AppPath", L"Application"}) {
+        if (!ev.app.empty()) break;
+        if (const std::wstring* v = FindNamed(data, n)) ev.app = ImageNameOf(*v);
     }
-    if (ev.app.empty()) {
-        if (const std::wstring* v = FindData(data, L"AppPath")) ev.app = ImageNameOf(*v);
+    for (const wchar_t* n :
+         {L"FaultingModule", L"FaultingModulePath", L"ModuleName", L"ModulePath", L"Module"}) {
+        if (!ev.module.empty()) break;
+        if (const std::wstring* v = FindNamed(data, n)) ev.module = ImageNameOf(*v);
     }
-    if (const std::wstring* v = FindData(data, L"FaultingModule")) {
-        ev.module = ImageNameOf(*v);
-    }
-    if (ev.module.empty()) {
-        if (const std::wstring* v = FindData(data, L"FaultingModulePath")) {
-            ev.module = ImageNameOf(*v);
+
+    // Track B: unnamed free-text payloads (.NET Runtime shape) — best effort.
+    std::wstring blob;
+    for (const DataField& d : data) {
+        if (d.name.empty() && !d.value.empty()) {
+            blob += d.value;
+            blob += L'\n';
         }
     }
-    if (ev.app.empty()) ev.app = ev.provider;  // better than nothing for summary text
-    ev.summary = BuildSummary(ev.eventId, ev.app, ev.module);
+    const std::wstring blobLine = blob.empty() ? std::wstring() : FirstNonEmptyLine(blob);
+    if (ev.app.empty()) ev.app = AppFromBlob(blob);
+    if (ev.module.empty()) ev.module = ModuleFromBlob(blob);
+
+    // WER 1001: the P1 named parameter IS the crashing application (real-machine
+    // sample: P1=powershell.exe) — use it before the bare-PID fallback (V15-P2-1).
+    if (ev.app.empty() && ev.eventId == 1001) {
+        if (const std::wstring* v = FindNamed(data, L"P1")) ev.app = ImageNameOf(*v);
+    }
+
+    // Last resort: the bare process id beats any "未知" placeholder (never lie).
+    if (ev.app.empty()) {
+        const std::wstring pid = AttributeInFirstTag(xml, L"Execution", L"ProcessID");
+        if (!pid.empty()) ev.app = L"PID " + pid;
+    }
+
+    ev.summary = BuildSummary(ev.provider, ev.eventId, ev.app, ev.module, blobLine);
     return ev;
 }
 
@@ -264,7 +480,7 @@ bool QueryOneChannel(const wchar_t* channel, uint32_t maxCount,
                                           static_cast<DWORD>(buf.size() * sizeof(wchar_t)),
                                           buf.empty() ? nullptr : buf.data(), &used, &props);
                 if (ok) {
-                    out->push_back(ParseEventXml(std::wstring(buf.data())));
+                    out->push_back(ParseEventXmlImpl(std::wstring(buf.data())));
                     rendered = true;
                     break;
                 }
@@ -285,6 +501,13 @@ bool QueryOneChannel(const wchar_t* channel, uint32_t maxCount,
 CrashEvent Take(const std::vector<CrashEvent>& v, size_t* i) { return v[(*i)++]; }
 
 }  // namespace
+
+// export for tests: pure XML -> CrashEvent parsing (no I/O, no globals). Declared in
+// src/selftest/control_test.cpp, deliberately NOT in the frozen contract header; the
+// selftest binary links stm_ops, so the symbol resolves there.
+void ParseEventXml(const std::wstring& xml, CrashEvent* out) {
+    *out = ParseEventXmlImpl(xml);
+}
 
 std::vector<CrashEvent> QueryCrashEvents(uint32_t maxCount, std::wstring* err) {
     std::vector<CrashEvent> result;

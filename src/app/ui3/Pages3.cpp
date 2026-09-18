@@ -87,6 +87,29 @@ bool ContainsLower(const std::wstring& hay, const std::wstring& needle) {
     return LowerCopy(hay).find(needle) != std::wstring::npos;
 }
 
+// P2 (2026-09-18, "CPU 温度信息增强"): refine the shared LHM classifier for
+// CPU-group fidelity. LhmGroupOf (PageHelpers.h, frozen) matches "cpu" well for
+// Intel-style paths (".../ Temperatures / CPU Core #1［LHM］"), but AMD-style
+// per-core temperature sensors carry no "cpu" token (".../ Temperatures /
+// Core (Tctl/Tdie)", "CCD1 (Tdie)") and fell into Other — those readings
+// vanished from the CPU group. Conservative fix local to the sensor page: a
+// base-classifier "Other" row is promoted to CPU only when the node path names
+// a TEMPERATURE section AND a per-core/package token. Everything else stays
+// Other because the temperature gate fails ("Voltages / VCore", "Clocks /
+// Core #1", DIMM temps … never leak into CPU).
+LhmGroup LhmGroupOfCpuTemps(const std::wstring& lhmLabel) {
+    const LhmGroup base = LhmGroupOf(lhmLabel);
+    if (base != LhmGroup::Other) return base;
+    const std::wstring s = LowerCopy(lhmLabel);
+    if (s.find(L"temperature") == std::wstring::npos) return LhmGroup::Other;
+    const bool coreLike = s.find(L"core") != std::wstring::npos ||
+                          s.find(L"package") != std::wstring::npos ||
+                          s.find(L"tctl") != std::wstring::npos ||
+                          s.find(L"tdie") != std::wstring::npos ||
+                          s.find(L"ccd") != std::wstring::npos;
+    return coreLike ? LhmGroup::Cpu : LhmGroup::Other;
+}
+
 std::wstring Truncate(const std::wstring& s, size_t maxChars) {
     if (s.size() <= maxChars) return s;
     return s.substr(0, maxChars) + L"…";
@@ -1350,9 +1373,15 @@ public:
 
         // Vertical full-width groups; each 可选显示 via cfg (P2 requirement).
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Cpu)) {
-            BeginGroup("##grp_cpu", L"CPU", snap.cpu.size() + snap.cpuCores.size());
+            const std::vector<SensorReading> cpuLhm = FilterLhm(lhm, LhmGroup::Cpu);
+            BeginGroup("##grp_cpu", L"CPU",
+                       snap.cpu.size() + snap.cpuCores.size() + cpuLhm.size());
             readings(snap.cpu);
-            readings(FilterLhm(lhm, LhmGroup::Cpu));
+            readings(cpuLhm);
+            // P2 诚实文案（用户反馈"CPU 温度太少不准确"）：每核 DTS 温度必须内核
+            // 驱动才能读，本应用不内置驱动；指明 LHM 外接数据源这条出路。
+            ImGui::TextDisabled("%s", U8(L"CPU 每核 DTS 温度需要内核驱动读取（本应用不内置）；"
+                                        L"安装并运行 LibreHardwareMonitor 后，上面会自动显示其提供的每核温度。"));
             DrawCoreTable(ctx, snap.cpuCores);
             EndGroup();
         }
@@ -1562,7 +1591,9 @@ private:
                                                 LhmGroup group) {
         std::vector<SensorReading> out;
         for (const SensorReading& r : rows) {
-            if (LhmGroupOf(r.label) == group) out.push_back(r);
+            // P2: extended classifier — AMD-style per-core temps without a
+            // "cpu" token reach the CPU group too (see LhmGroupOfCpuTemps).
+            if (LhmGroupOfCpuTemps(r.label) == group) out.push_back(r);
         }
         return out;
     }

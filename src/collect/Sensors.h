@@ -20,6 +20,20 @@
 // readings too. Multi-value rule: a sensor kind with several instances/sources
 // (ACPI thermal zones, NVML GPUs, per-engtype GPU engines, disks, NICs) yields
 // one reading PER instance — never an aggregate in place of the set.
+//
+// P2 extension (2026-09-18, "CPU 温度信息增强"; additive, no struct change):
+// SensorSnapshot::extra additionally carries the remaining USER-MODE thermal
+// sources, one reading per instance, each label prefixed with its provenance —
+//   "WMI 温度 N/（实例）"      Win32_Temperature (ROOT\CIMV2)
+//   "WMI 热区计数器 N/（实例）" Win32_PerfFormattedData_Counters_ThermalZoneInformation
+//   "DPTF 温度（参与者）"      Intel DPTF TEMPERATURE set (root\Intel_DPTF, fallback
+//                              root\Intel(DPTF)); namespace absent -> silent skip
+// (ACPI zones keep their "ACPI 热区 N/（InstanceName）" labels in `cpu`.) All
+// rows are Ok-only and plausibility-gated — a source that fails, is elevation-
+// gated or reports garbage simply yields nothing. Per-core CPU DTS temperatures
+// (MSR 0x19C/0x1A2/0x1B1) remain State::NeedDriver territory: they need a
+// kernel driver, which this app never ships (red line); the sensor page states
+// this and surfaces the optional LibreHardwareMonitor bridge instead.
 #include <cstdint>
 #include <string>
 #include <vector>

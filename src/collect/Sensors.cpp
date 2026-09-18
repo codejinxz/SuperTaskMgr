@@ -28,9 +28,17 @@
 //                  ATA SMART via SMART_RCV_DRIVE_DATA for temperature + power-on hours
 //                  + spare/wear/critical-warning detail (F3). One DiskHealth PER
 //                  physical drive, never aggregated (G-B: confirmed per-disk).
-//   Extra (G-B)    best-effort WMI temperature classes outside the ACPI zone
-//                  (Win32_Temperature, MSStorageDriver_FailurePredictData per-
-//                  drive SMART temps); empty group = nothing found = not shown.
+//   Extra (G-B)    best-effort WMI temperature classes outside the ACPI zone;
+//                  empty group = nothing found = not shown. P2 (2026-09-18,
+//                  "CPU 温度信息增强") exhausts the documented USER-MODE thermal
+//                  sources here, one reading PER INSTANCE, every label prefixed
+//                  with its provenance ("WMI 温度 N/（实例）" for Win32_Temperature,
+//                  "WMI 热区计数器 N/（实例）" for the PerfProc thermal-zone counter,
+//                  "DPTF 温度（参与者）" for the Intel DPTF TEMPERATURE set when its
+//                  namespace exists). Per-core DTS temperatures (MSR 0x19C/0x1A2/
+//                  0x1B1) stay unreachable by design: they require a kernel
+//                  driver and this app ships none (red line) — the sensor page
+//                  says so and offers the optional LibreHardwareMonitor bridge.
 //   Fans           NeedDriver, always.
 //
 // Blocking call: run on the ops job queue. Never throws; partial results allowed.
@@ -1370,23 +1378,37 @@ void ReadMemory(std::vector<SensorReading>* out, std::wstring* notes) {
 // G-B: "extra" — best-effort readings from documented WMI temperature classes
 // OUTSIDE MSAcpi_ThermalZoneTemperature. The snapshot group is displayed only
 // when non-empty, so every failure path stays silent: absence promises nothing.
+// P2 (2026-09-18): each source is enumerated instance by instance and every
+// label carries its provenance prefix, so same-name readings from different
+// providers can never collide (contract: "同类传感器多值逐项展示").
 // ===========================================================================
 void ReadExtraSensors(std::vector<SensorReading>* out) {
     // 1) Win32_Temperature (ROOT\CIMV2, DMTF temperature sensor): CurrentReading
-    //    in tenths of degrees. Almost never implemented by a real provider — an
-    //    absent class is the normal case and simply yields nothing.
+    //    per instance. Almost never implemented by a real provider — an absent
+    //    class is the normal case and simply yields nothing. Unit caveat: the
+    //    value arrives in tenths, but providers differ between tenths of Kelvin
+    //    (ACPI-style) and tenths of °C (DMTF sensor model); the two readings
+    //    can never BOTH fall inside the plausible window, so pick the one that
+    //    fits and drop the row entirely when neither does (never a fake temp).
     {
         const WmiResult w = WmiQuery(L"ROOT\\CIMV2",
-                                     L"SELECT CurrentReading FROM Win32_Temperature",
-                                     {L"CurrentReading"});
+                                     L"SELECT InstanceName, CurrentReading FROM Win32_Temperature",
+                                     {L"InstanceName", L"CurrentReading"});
         int added = 0;
         for (const WmiRow& row : w.rows) {
             const auto it = row.find(L"CurrentReading");
             if (it == row.end() || !it->second.present || !it->second.isNum) continue;
-            const double c = static_cast<double>(it->second.num) / 10.0 - 273.15;
-            if (c < -60.0 || c > 250.0) continue;  // implausible -> skip, no fake
+            const double raw = static_cast<double>(it->second.num);
+            if (raw == 0.0) continue;  // empty-register sentinel; a real 0.0 °C reading is implausible (V15-P2-3)
+            double c = raw / 10.0 - 273.15;  // tenths of Kelvin first
+            if (c < -60.0 || c > 250.0) c = raw / 10.0;  // else tenths of °C
+            if (c < -60.0 || c > 250.0) continue;        // implausible -> skip, no fake
             SensorReading r;
-            r.label = Fmt(L"WMI 温度传感器 {}", added);
+            r.label = Fmt(L"WMI 温度 {}", added);
+            const auto in = row.find(L"InstanceName");
+            if (in != row.end() && in->second.present && !in->second.str.empty()) {
+                r.label = Fmt(L"WMI 温度（{}）", in->second.str);
+            }
             r.value = c;
             r.unit = L"°C";
             r.state = SensorReading::State::Ok;
@@ -1437,6 +1459,75 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             ++added;
         }
     }
+    // 3) Win32_PerfFormattedData_Counters_ThermalZoneInformation (ROOT\CIMV2,
+    //    PerfProc): one instance per ACPI thermal zone. Documented unit is
+    //    tenths of Kelvin, but firmware providers differ — this box (measured,
+    //    \_TZ.TZ00) reports raw=301, i.e. 30.1 °C under a tenths-of-°C reading
+    //    and a bogus -243 °C under the documented one. Same unit ladder as
+    //    source 1: tenths of K first (the documented unit wins whenever it is
+    //    plausible), tenths of °C as the only alternative, anything else is
+    //    dropped. Reads without elevation; absent/broken on many desktops —
+    //    any failure or implausible value stays silent.
+    {
+        const WmiResult w = WmiQuery(
+            L"ROOT\\CIMV2",
+            L"SELECT Name, Temperature FROM "
+            L"Win32_PerfFormattedData_Counters_ThermalZoneInformation",
+            {L"Name", L"Temperature"});
+        int added = 0;
+        for (const WmiRow& row : w.rows) {
+            const auto it = row.find(L"Temperature");
+            if (it == row.end() || !it->second.present || !it->second.isNum) continue;
+            const double raw = static_cast<double>(it->second.num);
+            if (raw == 0.0) continue;  // empty-register sentinel; never report a fake 0.0 °C (V15-P2-3)
+            double c = raw / 10.0 - 273.15;  // documented tenths of Kelvin first
+            if (c < -60.0 || c > 250.0) c = raw / 10.0;  // measured tenths-of-°C units
+            if (c < -60.0 || c > 250.0) continue;        // implausible -> skip, no fake
+            SensorReading r;
+            r.label = Fmt(L"WMI 热区计数器 {}", added);
+            const auto in = row.find(L"Name");
+            if (in != row.end() && in->second.present && !in->second.str.empty()) {
+                r.label = Fmt(L"WMI 热区计数器（{}）", in->second.str);
+            }
+            r.value = c;
+            r.unit = L"°C";
+            r.state = SensorReading::State::Ok;
+            out->push_back(std::move(r));
+            ++added;
+        }
+    }
+    // 4) Intel DPTF (Dynamic Platform and Thermal Framework) participants: the
+    //    driver-owned TEMPERATURE instance set under root\Intel_DPTF (older
+    //    drivers: root\Intel(DPTF)), CurrentTemperature in tenths of Kelvin
+    //    per the DPTF spec. Undocumented by Intel publicly and absent without
+    //    the driver — a missing namespace classifies as notSupported and is
+    //    skipped SILENTLY (the normal case); only plausible Ok rows surface.
+    for (const wchar_t* ns : {L"ROOT\\Intel_DPTF", L"ROOT\\Intel(DPTF)"}) {
+        const WmiResult w = WmiQuery(ns,
+                                     L"SELECT InstanceName, CurrentTemperature FROM TEMPERATURE",
+                                     {L"InstanceName", L"CurrentTemperature"});
+        if (w.notSupported) continue;  // namespace/class absent: quiet skip
+        int added = 0;
+        for (const WmiRow& row : w.rows) {
+            const auto it = row.find(L"CurrentTemperature");
+            if (it == row.end() || !it->second.present || !it->second.isNum) continue;
+            const double c = static_cast<double>(it->second.num) / 10.0 - 273.15;
+            if (c < -60.0 || c > 250.0) continue;  // implausible -> skip, no fake
+            SensorReading r;
+            r.label = L"DPTF 温度";
+            const auto in = row.find(L"InstanceName");
+            if (in != row.end() && in->second.present && !in->second.str.empty()) {
+                r.label = Fmt(L"DPTF 温度（{}）", in->second.str);
+            }
+            r.value = c;
+            r.unit = L"°C";
+            r.state = SensorReading::State::Ok;
+            r.source = L"DPTF";
+            out->push_back(std::move(r));
+            ++added;
+        }
+        if (added > 0) break;  // this namespace delivered; don't double-report
+    }
 }
 }  // namespace
 SensorSnapshot ReadSensors(std::wstring* err) {
@@ -1470,6 +1561,7 @@ SensorSnapshot ReadSensors(std::wstring* err) {
         snap.fans.push_back(fan);
         notes += L"；风扇转速需要内核驱动（本应用不随包分发驱动，见调研 R6）；CPU 占用率另见性能页；"
                  L"每核占用率/GPU 引擎与显存来自 PDH、网卡速率来自 GetIfTable2（350ms 增量窗口）；"
+                 L"热区/热区计数器/DPTF 温度均为区域级读数而非每核 DTS；"
                  L"每核温度等更多传感器可外接 LibreHardwareMonitor 数据源（默认关闭）";
     } catch (const std::exception& e) {
         if (err) *err = Fmt(L"传感器读取异常：{}", Utf8ToWide(e.what()));

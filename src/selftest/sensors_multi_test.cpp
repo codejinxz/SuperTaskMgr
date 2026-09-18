@@ -11,11 +11,15 @@
 #include "selftest/TestFramework.h"
 #include "collect/Sensors.h"
 #include "core/Str.h"
+#include <objbase.h>
+#include <wbemidl.h>
 #include <windows.h>
 #include <cstdint>
 #include <set>
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "oleaut32")  // selftest-only: SysAllocString for the DPTF probe
 
 namespace {
 
@@ -40,6 +44,37 @@ unsigned CountPhysicalDrives() {
         }
     }
     return n;
+}
+
+// Independent oracle for the P2 DPTF probe: is the vendor namespace installed
+// at all? Mirrors the local-GUID pattern of collect/Sensors.cpp (wbemuuid.lib
+// is not linked); pure reachability question, no data is read here.
+bool WmiNamespaceReachable(const wchar_t* ns) {
+    constexpr GUID kProbeCLSID_WbemLocator = {
+        0x4590f811, 0x1d3a, 0x11d0, {0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
+    constexpr GUID kProbeIID_IWbemLocator = {
+        0xdc12a687, 0x737f, 0x11cf, {0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
+    const HRESULT ci = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(ci) && ci != RPC_E_CHANGED_MODE) return false;
+    struct CoGuard {
+        HRESULT hr;
+        ~CoGuard() {
+            if (SUCCEEDED(hr)) ::CoUninitialize();
+        }
+    } guard{ci};
+    IWbemLocator* loc = nullptr;
+    const HRESULT hr = ::CoCreateInstance(kProbeCLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                                          kProbeIID_IWbemLocator,
+                                          reinterpret_cast<void**>(&loc));
+    if (FAILED(hr) || loc == nullptr) return false;
+    BSTR bns = ::SysAllocString(ns);
+    IWbemServices* svc = nullptr;
+    const HRESULT cs = loc->ConnectServer(bns, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                                          &svc);
+    if (bns != nullptr) ::SysFreeString(bns);
+    loc->Release();
+    if (svc != nullptr) svc->Release();
+    return cs == S_OK;  // anything else (incl. WBEM_E_INVALID_NAMESPACE) = absent
 }
 
 }  // namespace
@@ -228,6 +263,108 @@ STM_TEST(sensors_disks_per_disk) {
                     return false;
                 }
             }
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// sensors_temp_sources_labeled (P2, "CPU 温度信息增强"): every user-mode
+// thermal source surfaces one reading per instance and every temperature label
+// carries its provenance prefix — "ACPI 热区" (cpu group), "WMI 温度" /
+// "WMI 热区计数器" / "…（WMI SMART）" / "DPTF 温度" (extra). Labels are
+// pairwise distinct across the union so two providers can never merge into one
+// row. Non-admin box (measured baseline): when nothing reads Ok, at least one
+// NeedAdmin entry must exist — never a silent gap.
+// ---------------------------------------------------------------------------
+STM_TEST(sensors_temp_sources_labeled) {
+    std::wstring serr;
+    const stm::SensorSnapshot snap = stm::ReadSensors(&serr);
+
+    auto hasProvenance = [](const std::wstring& label) {
+        for (const wchar_t* mark : {L"ACPI 热区", L"WMI", L"DPTF"}) {
+            if (label.find(mark) != std::wstring::npos) return true;
+        }
+        return false;
+    };
+
+    std::vector<const stm::SensorReading*> temps;
+    for (const std::vector<stm::SensorReading>* group : {&snap.cpu, &snap.extra}) {
+        for (const stm::SensorReading& r : *group) {
+            if (r.unit != L"°C") continue;  // temperature readings only
+            if (!hasProvenance(r.label)) {
+                *err = stm::Fmt(L"温度条目缺少来源前缀：{}", r.label);
+                return false;
+            }
+            if (!IsKnownState(r.state)) {
+                *err = stm::Fmt(L"温度条目状态未知：{}", r.label);
+                return false;
+            }
+            temps.push_back(&r);
+        }
+    }
+    for (size_t i = 0; i < temps.size(); ++i) {
+        for (size_t j = i + 1; j < temps.size(); ++j) {
+            if (temps[i]->label == temps[j]->label) {
+                *err = stm::Fmt(L"温度条目 label 跨来源重复：{}", temps[i]->label);
+                return false;
+            }
+        }
+    }
+    bool anyOk = false, anyNeedAdmin = false;
+    for (const stm::SensorReading* r : temps) {
+        if (r->state == State::Ok) {
+            anyOk = true;
+            if (r->value < -60.0 || r->value > 250.0) {
+                *err = stm::Fmt(L"温度 Ok 读数越界：{} = {}°C", r->label, r->value);
+                return false;
+            }
+        }
+        if (r->state == State::NeedAdmin) anyNeedAdmin = true;
+    }
+    if (!anyOk && !anyNeedAdmin) {
+        *err = L"无 Ok 温度读数（非管理员常态）且无 NeedAdmin 条目（诚实回退缺失）";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// sensors_dptf_silent_when_absent (P2): Intel DPTF is driver-optional. When
+// its WMI namespace is NOT installed (the common desktop case), the snapshot
+// must stay silent — no DPTF-labeled reading may appear anywhere, because
+// absence promises nothing. When the namespace IS installed, every DPTF
+// reading must be Ok + plausible + tagged source=DPTF (the collector only
+// pushes such rows; denial yields nothing rather than a placeholder).
+// ---------------------------------------------------------------------------
+STM_TEST(sensors_dptf_silent_when_absent) {
+    std::wstring serr;
+    const stm::SensorSnapshot snap = stm::ReadSensors(&serr);
+
+    std::vector<const stm::SensorReading*> dptf;
+    for (const std::vector<stm::SensorReading>* group : {&snap.cpu, &snap.extra}) {
+        for (const stm::SensorReading& r : *group) {
+            if (r.label.find(L"DPTF") != std::wstring::npos) dptf.push_back(&r);
+        }
+    }
+
+    const bool nsPresent = WmiNamespaceReachable(L"ROOT\\Intel_DPTF") ||
+                           WmiNamespaceReachable(L"ROOT\\Intel(DPTF)");
+    if (!nsPresent && !dptf.empty()) {
+        *err = stm::Fmt(L"DPTF 命名空间不存在却出现 {} 条 DPTF 读数（违反静默跳过）",
+                        dptf.size());
+        return false;
+    }
+    for (const stm::SensorReading* r : dptf) {
+        if (r->state != State::Ok || r->unit != L"°C" || r->value < -60.0 ||
+            r->value > 250.0) {
+            *err = stm::Fmt(L"DPTF 读数只应 Ok 且温度合理：{} = {}{}（状态 {}）", r->label,
+                            r->value, r->unit, static_cast<int>(r->state));
+            return false;
+        }
+        if (r->source != L"DPTF") {
+            *err = stm::Fmt(L"DPTF 读数缺少 source 标记：{}", r->label);
+            return false;
         }
     }
     return true;

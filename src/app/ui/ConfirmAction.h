@@ -14,11 +14,14 @@
 //    of failing silently (the "没有任何反应" class of bug).
 //  - Depends only on core/ + ops/ (+ the AppContext aggregate), never on ImGui,
 //    so stm_selftest (core+collect+ops link) can include it.
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 #include "app/AppContext.h"
+#include "app/ui3/MemCleanup.h"     // P3 任务一：一键优化候选/聚合（纯逻辑）
 #include "app/ui3/ProcControlUi.h"  // ui3::PriorityLabel（优先级文案单一来源）
 #include "core/ProcData.h"
 #include "core/Str.h"
@@ -44,6 +47,9 @@ struct ConfirmKind {
         Resume,          // 恢复进程（低风险，可直接提交、不开确认框）
         SetPriority,     // 设置优先级（设置前经 ConfirmDialog 确认；priority 字段）
         SetAffinity,     // 设置亲和性（亲和性模态本身即确认；affinityMask 字段）
+        // --- P3 新增 ---
+        MemCleanup,      // 一键内存优化（cleanupItems/cleanupSelected/cleanupPurgeStandby）
+        CloseAsk,        // 关闭行为询问（任务三：非 ops job，由 UI 直接处理，不走执行表）
     };
 };
 
@@ -65,7 +71,22 @@ struct ConfirmRequest {
     // F4#2: SetPriority -> priority; SetAffinity -> affinityMask (nonzero).
     ops::ProcPriority priority = ops::ProcPriority::Normal;
     uint64_t affinityMask = 0;
+    // P3 任务三 CloseAsk only: 「记住我的选择」复选框（勾选时才写 cfg closeAction）。
+    bool rememberChoice = false;
+    // P3 任务一 MemCleanup only: 打开模态时冻结的 Top10 候选与逐项勾选状态；
+    // ops 执行时照常做身份复核（createTime）与保护名单硬门禁。
+    std::vector<ui3::CleanupCandidate> cleanupItems;
+    std::vector<bool> cleanupSelected;
+    bool cleanupPurgeStandby = false;
 };
+
+// ---------------------------------------------------------------------------
+// P3 任务三：标题栏关闭行为（cfg closeAction，持久化到 config.json）。
+//   0 = 每次询问（默认，弹三选一模态）  1 = 直接退出  2 = 最小化到托盘。
+// 非法值一律归一为 0（宁多问一次，不做危险假设）。
+// ---------------------------------------------------------------------------
+inline constexpr wchar_t kCloseActionCfgKey[] = L"closeAction";
+inline int NormalizeCloseAction(int64_t v) { return v == 1 ? 1 : v == 2 ? 2 : 0; }
 
 // Non-empty suffix appended to failure notes when not elevated (H5 requirement:
 // the user must see why an op may have failed and what to try next).
@@ -254,6 +275,51 @@ inline std::function<void()> MakeSetAffinityJob(std::shared_ptr<AppContext> app,
     };
 }
 
+// ---------------------------------------------------------------------------
+// P3 任务一：一键内存优化 —— 确认后以「单个 job」批量执行：逐项 TrimWorkingSet
+// （ops 内照常做 createTime 身份复核 + 保护名单硬门禁；单项失败只计数不中断），
+// 可选附加一次 PurgeStandbyList（失败如实补发单独 note）。结果聚合成一条 toast。
+// ---------------------------------------------------------------------------
+
+inline std::function<void()> MakeMemCleanupJob(std::shared_ptr<AppContext> app,
+                                               std::vector<ui3::CleanupCandidate> items,
+                                               std::vector<bool> selected,
+                                               bool purgeStandby) {
+    const bool elevated = app->elevated;
+    return [app, elevated, items = std::move(items), selected = std::move(selected),
+            purgeStandby] {
+        ui3::CleanupOutcome out;
+        const size_t n = std::min(items.size(), selected.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (!selected[i]) continue;
+            std::wstring err;
+            const bool ok = ops::TrimWorkingSet(items[i].key, &err);
+            const uint64_t bytes =
+                items[i].privateWorkingSet == kUnavailU64 ? 0 : items[i].privateWorkingSet;
+            ui3::RecordTrimResult(out, ok, bytes);
+            if (!ok && out.firstError.empty()) out.firstError = err;  // V15-P2-2
+        }
+        if (purgeStandby) {
+            out.purgeAttempted = true;
+            std::wstring err;
+            out.purgeOk = ops::PurgeStandbyList(&err);
+            if (!out.purgeOk) {
+                PostConfirmNote(*app, Notification::Kind::JobFailed,
+                                Fmt(L"清理系统待机缓存失败：{}{}",
+                                    err.empty() ? std::wstring(L"未知错误") : err,
+                                    AdminHintSuffix(elevated)));
+            }
+        }
+        PostConfirmNote(*app, out.failed > 0 ? Notification::Kind::Warn
+                                             : Notification::Kind::JobDone,
+                        ui3::FormatCleanupDoneText(out) +
+                            (out.firstError.empty()
+                                 ? std::wstring()
+                                 : Fmt(L"（首个失败：{}{}）", out.firstError,
+                                       AdminHintSuffix(elevated))));
+    };
+}
+
 // Execute the confirmed action: the ONLY entry point a confirm-dialog confirm
 // button should call. Returns true when the op job was queued; a false return is
 // always accompanied by an immediately-posted JobFailed notification (never silent).
@@ -270,6 +336,14 @@ inline bool ExecuteConfirmedAction(std::shared_ptr<AppContext> ctx, const Confir
         case ConfirmKind::Resume: job = MakeResumeJob(ctx, req); break;
         case ConfirmKind::SetPriority: job = MakeSetPriorityJob(ctx, req); break;
         case ConfirmKind::SetAffinity: job = MakeSetAffinityJob(ctx, req); break;
+        case ConfirmKind::MemCleanup:
+            job = MakeMemCleanupJob(ctx, req.cleanupItems, req.cleanupSelected,
+                                    req.cleanupPurgeStandby);
+            break;
+        case ConfirmKind::CloseAsk:
+            // 关闭行为不是 ops job：三个按钮由 DrawConfirmDialogs 直接处理
+            // （wantExit / ShowWindow(SW_HIDE)），不经本执行表。
+            return false;
         case ConfirmKind::None:
         default: return false;
     }
