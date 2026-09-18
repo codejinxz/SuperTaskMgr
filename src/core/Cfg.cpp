@@ -124,11 +124,22 @@ bool Config::Save(const std::wstring& path) const {
     }
     j += L"}\n";
     const std::string u8 = WideToUtf8(j);
+    // Atomic write (arch section 7): temp file + MoveFileExW REPLACE_EXISTING, so a
+    // crash mid-write can never leave a truncated config/session behind.
+    const std::wstring tmp = path + L".tmp";
     FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+    if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || !f) return false;
     const bool ok = fwrite(u8.data(), 1, u8.size(), f) == u8.size();
     fclose(f);
-    return ok;
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 const std::pair<std::wstring, std::wstring>* Config::Find(std::wstring_view key) const {

@@ -52,7 +52,10 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
                  IsProcessElevated() ? L"1" : L"0", smokeFrames);
 
     ops::SingleInstance si;
-    if (!si.TryAcquire(1000)) {
+    // 3s wait: elevation relaunch hands the mutex over while the old instance tears
+    // down; a slow teardown must not make the new instance bail (final review V11-P2-6).
+    if (!si.TryAcquire(3000)) {
+        if (smokeFrames > 0) return 1;  // CI: never block on a MessageBox (V11-P2-7)
         MessageBoxW(nullptr, L"超级任务管理器已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -150,9 +153,11 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
 
     // Frame loop: vsync-paced; collection happens on its own thread.
+    // Minimized => relax the collection cadence to 2 s (phase-4 budget item).
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     int frames = 0;
+    bool wasIconic = IsIconic(win.Hwnd()) != FALSE;
     while (!ctx->wantExit) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -160,6 +165,14 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
             DispatchMessageW(&msg);
         }
         if (ctx->wantExit) break;
+
+        const bool iconic = IsIconic(win.Hwnd()) != FALSE;
+        if (iconic != wasIconic) {
+            // Restore reads cfg live so toolbar interval changes made while running
+            // survive a minimize/restore cycle (final review V11-P1-2).
+            ctx->collect.SetInterval(iconic ? 2000 : ClampInterval(ctx->cfg.GetInt(L"intervalMs", 1000)));
+            wasIconic = iconic;
+        }
 
         QueryPerformanceCounter(&t0);
         renderer.BeginFrame();

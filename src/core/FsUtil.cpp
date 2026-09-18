@@ -1,13 +1,20 @@
 #include "core/FsUtil.h"
 #include <windows.h>
 #include <shlobj.h>
+#include <vector>
 
 namespace stm {
 
 std::wstring ExePath() {
-    wchar_t buf[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    return buf;
+    // Long-path friendly: query with a growing buffer instead of fixed MAX_PATH.
+    std::vector<wchar_t> buf(1024);
+    for (;;) {
+        const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) return {};
+        if (n < buf.size() - 1) return std::wstring(buf.data(), n);
+        if (buf.size() >= 32768) return std::wstring(buf.data(), n);  // give up at limit
+        buf.resize(buf.size() * 2);
+    }
 }
 
 std::wstring ExeDir() {

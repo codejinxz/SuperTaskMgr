@@ -1,12 +1,13 @@
 #pragma once
 // Win32 top-level window hosting the D3D11 swap chain (thin shell; no business logic).
 #include <windows.h>
+#include <atomic>
 #include <functional>
 
 namespace stm {
 
 struct WindowCallbacks {
-    bool* quit = nullptr;                                // set on WM_DESTROY
+    std::atomic<bool>* quit = nullptr;                   // set on WM_DESTROY (cross-thread)
     void (*onResize)(void* ud, int w, int h) = nullptr;  // WM_SIZE (w/h may be 0 while minimizing)
     void* ud = nullptr;
     // Optional custom-message hook (tray icon etc.). Runs before the built-in switch;

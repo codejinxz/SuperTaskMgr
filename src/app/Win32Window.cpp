@@ -33,7 +33,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
             break;
         case WM_DESTROY:
-            if (self && self->cbs_.quit) *self->cbs_.quit = true;
+            if (self && self->cbs_.quit) self->cbs_.quit->store(true);
             return 0;
         default:
             break;

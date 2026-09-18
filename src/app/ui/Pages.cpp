@@ -1207,8 +1207,21 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     if (!ctx.elevated && ops::CanElevate()) {
         ImGui::SameLine();
         if (ImGui::Button(U8(L"以管理员身份重启"))) {
+            // ShellExecuteExW(runas) blocks on the UAC dialog: run it on the ops
+            // worker so the UI stays responsive while the prompt is up (phase-4 debt).
             SaveSessionFromCtx(ctx, nullptr);
-            if (ops::RelaunchAsAdmin(L"--relaunched")) ctx.wantExit = true;
+            if (auto app = Ui().liveCtx) {
+                app->jobs.Submit([app] {
+                    if (ops::RelaunchAsAdmin(L"--relaunched")) {
+                        app->wantExit = true;
+                    } else {
+                        Notification n;
+                        n.kind = Notification::Kind::JobFailed;
+                        n.text = L"提权重启失败或已取消";
+                        app->notes.Push(std::move(n));
+                    }
+                });
+            }
         }
     }
     ImGui::SameLine();
@@ -1231,6 +1244,17 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     ImGui::TextDisabled("|");
     ImGui::SameLine();
     ImGui::Text("采集 p95 %.1f ms", ctx.collect.TickP95Ms());
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    {
+        const size_t pending = ctx.jobs.PendingCount();
+        if (pending > 0) {
+            ImGui::TextColored(ColWarn(), "%s", U8(Fmt(L"操作队列 {}", pending)));
+        } else {
+            ImGui::TextDisabled("%s", U8(L"操作队列空闲"));
+        }
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
@@ -1294,7 +1318,9 @@ void SaveSessionFromCtx(const AppContext& ctx, HWND mainWnd) {
     s.sortKey = ui::SortColumnId(Ui().sortColumn);
     s.sortDir = Ui().sortDesc ? 1 : 0;
     s.intervalMs = static_cast<uint32_t>(ctx.cfg.GetInt(L"intervalMs", 1000));
-    if (mainWnd != nullptr) {
+    if (mainWnd != nullptr && !IsIconic(mainWnd)) {
+        // Minimized windows report -32000 coords; persisting them would restore the
+        // window off-screen (final review V11-P2-5) — keep the previous rect instead.
         RECT r{};
         if (GetWindowRect(mainWnd, &r)) {
             s.winX = r.left;
