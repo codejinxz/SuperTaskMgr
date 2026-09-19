@@ -1,26 +1,26 @@
 #pragma once
-// Header-only sorting primitives for the process table (arch section 8).
-// Shared between the UI (Pages.cpp) and selftest (ui_test.cpp); intentionally
-// free of ImGui/OS dependencies so stm_selftest can include it without app objects.
+// 进程表的仅头文件排序原语（架构第 8 节）。
+// 由 UI（Pages.cpp）与 selftest（ui_test.cpp）共享；刻意不依赖
+// ImGui/OS，使 stm_selftest 无需应用对象即可包含。
 //
-// Semantics (frozen by the architecture doc):
-//  - raw values compare, no locale collation for the name column
-//  - unavailable metrics (NaN / kUnavailU64) always sort LAST, both directions
-//  - pid ascending breaks ties, both directions
+// 语义（架构文档冻结）：
+//  - 原始值比较，名称列不做区域设置排序
+//  - 不可得指标（NaN / kUnavailU64）在两个方向上都恒排最后
+//  - 两个方向都以 pid 升序破平
 #include <cstdint>
 #include "core/ProcData.h"
 
 namespace stm {
 namespace ui {
 
-// Table columns 0..Count-1 are sortable; badges/description are not.
+// 表列 0..Count-1 可排序；徽标/描述不可排序。
 enum class SortColumn : int {
     Name = 0, Pid, Cpu, MemPrivate, Commit, Disk, Net, HardFaults, Handles, Threads,
     CtxSwitches,
     Count
 };
 
-// Stable identifier for config/session persistence ("sortKey" / "sortDir").
+// 供配置/会话持久化的稳定标识（"sortKey" / "sortDir"）。
 inline const wchar_t* SortColumnId(SortColumn c) {
     switch (c) {
         case SortColumn::Name:        return L"name";
@@ -38,7 +38,7 @@ inline const wchar_t* SortColumnId(SortColumn c) {
     }
 }
 
-// Inverse of SortColumnId; keeps the current value when id is unknown.
+// SortColumnId 的逆变换；id 未知时保持当前值。
 inline bool ParseSortColumn(const wchar_t* id, SortColumn* out) {
     if (!id || !out) return false;
     struct Entry { const wchar_t* id; SortColumn col; };
@@ -59,7 +59,7 @@ inline bool ParseSortColumn(const wchar_t* id, SortColumn* out) {
     return false;
 }
 
-// True when this column's value is "unavailable" for the row (rendered as em dash).
+// 该列对这一行的值是否"不可得"（渲染为破折号）。
 inline bool IsColumnUnavail(const ProcInfo& p, SortColumn c) {
     switch (c) {
         case SortColumn::Cpu:         return p.cpuPercent != p.cpuPercent;              // NaN
@@ -68,14 +68,14 @@ inline bool IsColumnUnavail(const ProcInfo& p, SortColumn c) {
         case SortColumn::Net:         return p.netBytesPerSec != p.netBytesPerSec;
         case SortColumn::HardFaults:  return p.pageFaultsPerSec != p.pageFaultsPerSec;
         case SortColumn::CtxSwitches: return p.contextSwitchesPerSec != p.contextSwitchesPerSec;
-        default:                      return false;  // name/pid/commit/handles/threads: never
+        default:                      return false;  // name/pid/commit/handles/threads：永不为不可得
     }
 }
 
 namespace sort_detail {
 inline int CmpU64(uint64_t a, uint64_t b) { return a < b ? -1 : (a > b ? 1 : 0); }
 inline int CmpU32(uint32_t a, uint32_t b) { return a < b ? -1 : (a > b ? 1 : 0); }
-inline int CmpDouble(double a, double b) { return a < b ? -1 : (a > b ? 1 : 0); }  // no NaN here
+inline int CmpDouble(double a, double b) { return a < b ? -1 : (a > b ? 1 : 0); }  // 此处无 NaN
 
 inline int CmpNameLower(const std::wstring& a, const std::wstring& b) {
     const size_t n = a.size() < b.size() ? a.size() : b.size();
@@ -88,8 +88,8 @@ inline int CmpNameLower(const std::wstring& a, const std::wstring& b) {
 }
 }  // namespace sort_detail
 
-// Ascending raw 3-way compare WITHOUT unavailable handling or tie-break.
-// Returns -1 when a first, +1 when b first, 0 when equal.
+// 升序原始三路比较，不含不可得处理与破平。
+// a 在前返回 -1，b 在前返回 +1，相等返回 0。
 inline int CompareColumnRaw(const ProcInfo& a, const ProcInfo& b, SortColumn c) {
     switch (c) {
         case SortColumn::Name:        return sort_detail::CmpNameLower(a.name, b.name);
@@ -107,13 +107,13 @@ inline int CompareColumnRaw(const ProcInfo& a, const ProcInfo& b, SortColumn c) 
     }
 }
 
-// Full ascending 3-way compare: unavailable last, pid ascending tie-break.
-// The single entry point the selftest exercises.
+// 完整升序三路比较：不可得在最后，pid 升序破平。
+// selftest 测试的唯一入口。
 inline int CompareColumn(const ProcInfo& a, const ProcInfo& b, SortColumn c) {
     const bool au = IsColumnUnavail(a, c);
     const bool bu = IsColumnUnavail(b, c);
-    if (au != bu) return au ? 1 : -1;  // unavailable rows always last
-    if (au) return 0;                  // both unavailable: equal bucket
+    if (au != bu) return au ? 1 : -1;  // 不可得行恒在最后
+    if (au) return 0;                  // 都不可得：同一桶
     int r = CompareColumnRaw(a, b, c);
     if (r == 0) {
         if (a.key.pid < b.key.pid) r = -1;
@@ -122,13 +122,13 @@ inline int CompareColumn(const ProcInfo& a, const ProcInfo& b, SortColumn c) {
     return r;
 }
 
-// std::sort predicate used by the UI table. desc flips value order only;
-// unavailable placement (last) and the pid tie-break (ascending) stay fixed.
+// UI 表格使用的 std::sort 谓词。desc 只翻转值顺序；
+// 不可得位置（最后）与 pid 破平（升序）保持不变。
 inline bool SortLess(const ProcInfo& a, const ProcInfo& b, SortColumn c, bool desc) {
     const bool au = IsColumnUnavail(a, c);
     const bool bu = IsColumnUnavail(b, c);
-    if (au != bu) return bu;   // a first iff b is the unavailable one
-    if (au) return false;      // same bucket: not less (stable_sort keeps arrival order)
+    if (au != bu) return bu;   // 当且仅当 b 是不可得方时 a 在前
+    if (au) return false;      // 同一桶：不小于（stable_sort 保持到达顺序）
     const int r = CompareColumnRaw(a, b, c);
     if (r != 0) return desc ? r > 0 : r < 0;
     return a.key.pid < b.key.pid;

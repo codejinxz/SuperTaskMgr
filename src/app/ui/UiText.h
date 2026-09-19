@@ -1,10 +1,10 @@
 #pragma once
-// UTF-8 rendering helper for the UI layer.
-// ImGui is a narrow-char API while every data string and UI label is wide; U8()
-// converts on first use and caches the result by string value so per-frame
-// repeated calls (thousands of table cells) do not re-convert.
-// std::unordered_map nodes are stable: pointers returned by U8() stay valid
-// until the cache is cleared (which only happens when it exceeds kMaxEntries).
+// UI 层的 UTF-8 渲染辅助。
+// ImGui 是窄字符 API，而所有数据字符串与 UI 标签都是宽字符；U8()
+// 首次使用时转换并按字符串值缓存结果，帧内成千上万次
+// 重复调用（海量表格单元格）不会反复转换。
+// std::unordered_map 节点稳定：U8() 返回的指针保持有效，
+// 直到缓存被清空（只在超过 kMaxEntries 时发生）。
 #include <cstddef>
 #include <string>
 #include <unordered_map>
@@ -14,7 +14,7 @@ namespace stm {
 namespace ui {
 
 inline const char* U8(const std::wstring& w) {
-    constexpr size_t kMaxEntries = 8192;  // names + labels; hard upper bound
+    constexpr size_t kMaxEntries = 8192;  // 名称 + 标签；硬上界
     thread_local std::unordered_map<std::wstring, std::string> cache;
     auto it = cache.find(w);
     if (it != cache.end()) return it->second.c_str();

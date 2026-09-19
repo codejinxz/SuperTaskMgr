@@ -1,9 +1,9 @@
-// collect3: phase-3 additions — connection tables (contract NetTables.h),
-// sensor honesty (contract Sensors.h) and the ETW per-pid rate toggle lifecycle
-// (CollectService, default OFF; admin-only feature, selftest covers both
-// permission branches). White-box include of the internal CollectDetail.h is
-// deliberate: the ETW event-rate probe needs EtwNetCollector directly, because
-// the frozen CollectService contract deliberately exposes no event counter.
+// collect3：第 3 阶段新增——连接表（契约 NetTables.h）、
+// 传感器诚实性（契约 Sensors.h）与 ETW 每 pid 速率开关生命周期
+//（CollectService，默认关；仅管理员功能，selftest 覆盖两种
+// 权限分支）。刻意白盒包含内部 CollectDetail.h：ETW 事件速率探测需要
+// 直接使用 EtwNetCollector，因为冻结的 CollectService 契约
+// 刻意不暴露事件计数器。
 #include "selftest/TestFramework.h"
 #include "collect/CollectDetail.h"
 #include "collect/CollectService.h"
@@ -49,7 +49,7 @@ STM_TEST(net_tables_ok) {
                 *err = L"TCP 条目 state=0";
                 return false;
             }
-            // Label must be a known Chinese state or non-empty hex fallback.
+            // 标签必须是已知中文状态或非空十六进制兜底。
             if (stm::TcpStateLabel(c.state).empty()) {
                 *err = L"TcpStateLabel 返回空";
                 return false;
@@ -85,8 +85,8 @@ STM_TEST(sensors_honest) {
     const stm::SensorSnapshot snap = stm::ReadSensors(&serr);
     using State = stm::SensorReading::State;
 
-    // CPU: at least one frequency reading Ok with value > 0 (documented API,
-    // no admin needed); temperature readings follow the trichotomy.
+    // CPU：至少一条频率读数 Ok 且值 > 0（有文档 API，无需管理员）；
+    // 温度读数遵循三分类。
     bool freqOk = false;
     for (const stm::SensorReading& r : snap.cpu) {
         if (r.unit == L"MHz") {
@@ -113,7 +113,7 @@ STM_TEST(sensors_honest) {
         return false;
     }
 
-    // GPU: only Ok readings may appear, and Ok requires value > 0.
+    // GPU：只允许出现 Ok 读数，且 Ok 要求值 > 0。
     for (const stm::SensorReading& r : snap.gpu) {
         if (r.state != State::Ok || r.value <= 0.0) {
             *err = stm::Fmt(L"GPU 读数非法：{}", r.label);
@@ -121,7 +121,7 @@ STM_TEST(sensors_honest) {
         }
     }
 
-    // Fans: exactly the NeedDriver honesty state, no fake rpm.
+    // 风扇：恰好是 NeedDriver 诚实状态，无假 rpm。
     if (snap.fans.empty()) {
         *err = L"fans 缺少 NeedDriver 读数";
         return false;
@@ -133,7 +133,7 @@ STM_TEST(sensors_honest) {
         }
     }
 
-    // Disks: real model line (never a blank placeholder), health always a real
+    // 磁盘：真实型号行（绝无空白占位），健康始终是真实
     // string; Ok temperature requires tempC > 0 (V10: 绝无 Ok+0 温度).
     for (const stm::DiskHealth& d : snap.disks) {
         if (d.model.empty()) {
@@ -157,7 +157,7 @@ STM_TEST(etw_toggle_lifecycle) {
     const bool admin = stm::IsProcessElevated();
     const std::wstring sessionName = stm::Fmt(L"SuperTaskMgr-Net-{}", ::GetCurrentProcessId());
 
-    // --- part 1: white-box event-rate probe (default-off feature, direct) ---
+    // --- 第 1 部分：白盒事件速率探测（默认关功能，直接调用）---
     {
         stm::cd::EtwNetCollector probe;
         if (probe.Start()) {
@@ -173,7 +173,7 @@ STM_TEST(etw_toggle_lifecycle) {
         }
     }
 
-    // --- part 2: CollectService wiring --------------------------------------
+    // --- 第 2 部分：CollectService 接线 --------------------------------------
     stm::CollectService svc;
     if (!svc.Start(500)) {
         *err = L"CollectService::Start 失败";
@@ -186,8 +186,8 @@ STM_TEST(etw_toggle_lifecycle) {
 
     svc.SetNetEtwEnabled(true);
     if (!admin) {
-        // StartTraceW fails with access denied: stays disabled, no crash, caps
-        // clean and netBytesPerSec untouched (kUnavail).
+        // StartTraceW 以拒绝访问失败：保持禁用、不崩溃、caps 干净、
+        // netBytesPerSec 不受影响（kUnavail）。
         if (svc.NetEtwEnabled()) {
             *err = L"非管理员竟然启用成功（环境与预期不符）";
             return false;
@@ -207,7 +207,7 @@ STM_TEST(etw_toggle_lifecycle) {
             return false;
         }
         for (const stm::ProcInfo& p : s->procs) {
-            if (p.netBytesPerSec == p.netBytesPerSec) {  // !isnan: must stay kUnavail
+            if (p.netBytesPerSec == p.netBytesPerSec) {  // 非NaN：必须保持 kUnavail
                 *err = L"未启用时 netBytesPerSec 非 kUnavail";
                 return false;
             }
@@ -216,7 +216,7 @@ STM_TEST(etw_toggle_lifecycle) {
         return true;
     }
 
-    // Admin branch: enable -> 2s -> disable -> re-enable -> destructor cleanup.
+    // 管理员分支：启用 -> 2s -> 禁用 -> 再启用 -> 析构清理。
     if (!svc.NetEtwEnabled()) {
         *err = L"管理员下 SetNetEtwEnabled(true) 未生效";
         return false;
@@ -237,7 +237,7 @@ STM_TEST(etw_toggle_lifecycle) {
     }
     size_t withNet = 0;
     for (const stm::ProcInfo& p : s->procs) {
-        if (p.netBytesPerSec == p.netBytesPerSec) ++withNet;  // finite = real delta
+        if (p.netBytesPerSec == p.netBytesPerSec) ++withNet;  // 有限值 = 真实差值
     }
     printf("[etw] 启用后含 netBytesPerSec 的进程数：%zu（差分第二 tick 起有效）\n", withNet);
 
@@ -253,8 +253,8 @@ STM_TEST(etw_toggle_lifecycle) {
     }
     svc.Stop();
 
-    // Enabled-at-destruction cleanup: the service must stop the session and
-    // join the consumer in its destructor, leaving no orphan session behind.
+    // 启用状态下析构的清理：服务必须在析构中停止会话并
+    // join 消费线程，不留孤儿会话。
     {
         stm::CollectService svc2;
         if (!svc2.Start(500)) {
@@ -266,8 +266,8 @@ STM_TEST(etw_toggle_lifecycle) {
             *err = L"svc2 启用失败";
             return false;
         }
-        ::Sleep(2200);  // let events flow through the tick path
-    }  // destructor: Stop + ETW teardown; must not hang or crash
+        ::Sleep(2200);  // 让事件流经 tick 路径
+    }  // 析构：Stop + ETW 拆除；不得挂起或崩溃
     if (stm::cd::EtwNetCollector::SessionExists(sessionName.c_str())) {
         *err = L"析构后残留 ETW 会话（孤儿会话）：" + sessionName;
         return false;

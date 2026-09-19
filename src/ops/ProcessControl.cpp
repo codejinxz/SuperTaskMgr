@@ -1,20 +1,20 @@
-// Process suspend/resume + priority/affinity control (contract ops/ProcessControl.h).
+// 进程挂起/恢复 + 优先级/亲和性控制（契约 ops/ProcessControl.h）。
 //
-// Execution protocol (identical to ops/ProcessOps.h):
-//  1. ProtectedList hard gate FIRST — suspending a critical process (csrss etc.) is
-//     worse than killing it, so Suspend/Resume/Priority/Affinity all pass the gate
-//     before any handle is opened. GetProcessControlInfo is read-only and ungated.
-//  2. OpenProcess with the minimal access right per operation.
-//  3. Identity re-verify: GetProcessTimes -> createTime within +-1s, else refuse with
+// 执行协议（与 ops/ProcessOps.h 一致）：
+//  1. ProtectedList 硬闸门先行——挂起关键进程（csrss 等）
+//     比杀掉它更糟，因此 Suspend/Resume/Priority/Affinity 都在任何
+//     句柄打开之前过闸。GetProcessControlInfo 只读且不过闸。
+//  2. 按操作所需的最小访问权 OpenProcess。
+//  3. 身份复核：GetProcessTimes -> createTime 相差 +-1s 内，否则拒绝并以
 //     "已退出或 PID 已被复用". Never trust pid alone.
 //
-// Suspend/Resume bind NtSuspendProcess/NtResumeProcess from ntdll dynamically. Both are
-// semi-documented (not in the MSDN kernel32/ntdll reference; stable since Vista and used
-// by PsSuspend/BGInfo-class tools). The documented per-thread fallback (Toolhelp thread
-// snapshot + OpenThread + SuspendThread/ResumeThread) covers the exotic case where the
-// exports are missing. The suspended flag is read via NtQuerySystemInformation(System-
-// ProcessInformation) thread State/WaitReason — also semi-documented layout, same source
-// the collector uses (cross-validated there by SelfCheckGate).
+// Suspend/Resume 从 ntdll 动态绑定 NtSuspendProcess/NtResumeProcess。两者均
+// 属半官方文档（MSDN kernel32/ntdll 参考未收录；自 Vista 起稳定，
+// PsSuspend/BGInfo 类工具在用）。有文档的按线程兜底（Toolhelp 线程
+// 快照 + OpenThread + SuspendThread/ResumeThread）覆盖导出缺失的
+// 罕见情形。suspended 标志经 NtQuerySystemInformation(System-
+// ProcessInformation) 的线程 State/WaitReason 读取——同样是半官方布局，
+// 与采集器同源（彼处已由 SelfCheckGate 交叉校验）。
 #include "ops/ProcessControl.h"
 #include "ops/ProcessOps.h"
 #include "core/Err.h"
@@ -31,20 +31,20 @@
 namespace stm::ops {
 namespace {
 
-constexpr uint64_t kFileTime1Sec = 10'000'000ull;  // FILETIME unit is 100 ns
+constexpr uint64_t kFileTime1Sec = 10'000'000ull;  // FILETIME 单位为 100 ns
 
-constexpr uint32_t kSystemProcessInformation = 5;  // SYSTEM_INFORMATION_CLASS
+constexpr uint32_t kSystemProcessInformation = 5;  // SYSTEM_INFORMATION_CLASS（系统信息类别）
 constexpr uint32_t kStatusInfoLengthMismatch = 0xC0000004u;
 constexpr uint32_t kStatusAccessDenied = 0xC0000022u;
 
-constexpr uint32_t kThreadStateWaiting = 5;   // KTHREAD_STATE::Waiting
-constexpr uint32_t kWaitReasonSuspended = 5;  // KWAIT_REASON::Suspended
+constexpr uint32_t kThreadStateWaiting = 5;   // KTHREAD_STATE::Waiting（等待）
+constexpr uint32_t kWaitReasonSuspended = 5;  // KWAIT_REASON::Suspended（挂起）
 
 constexpr DWORD kThreadSuspendError = 0xFFFFFFFFu;
 
 bool SameCreateTime(uint64_t a, uint64_t b) {
     const uint64_t d = a > b ? a - b : b - a;
-    return d <= kFileTime1Sec;  // +-1s tolerance, arch section 6.1
+    return d <= kFileTime1Sec;  // +-1s 容差，架构第 6.1 节
 }
 
 uint64_t FileTimeToU64(const FILETIME& ft) {
@@ -53,8 +53,8 @@ uint64_t FileTimeToU64(const FILETIME& ft) {
 
 enum class OpenVerdict { Opened, Gone, Denied };
 
-// Identity re-verify + minimal-access open (same protocol as ProcessOps.cpp OpenVerified:
-// on ACCESS_DENIED an elevated caller retries once with SeDebugPrivilege, released here).
+// 身份复核 + 最小权限打开（与 ProcessOps.cpp 的 OpenVerified 协议相同：
+// 拒绝访问时已提权的调用方带 SeDebugPrivilege 重试一次，在此释放）。
 OpenVerdict OpenVerifiedControl(const ProcKey& key, DWORD access, UniqueHandle* out,
                                 std::wstring* err) {
     out->reset();
@@ -103,8 +103,8 @@ OpenVerdict OpenVerifiedControl(const ProcKey& key, DWORD access, UniqueHandle* 
 }
 
 // ---------------------------------------------------------------------------
-// ntdll suspend/resume (semi-documented exports, dynamically bound like the
-// collector's NtQuerySystemInformation; ntdll is always loaded, never unloaded).
+// ntdll 挂起/恢复（半官方文档的导出函数，像采集器的
+// NtQuerySystemInformation 一样动态绑定；ntdll 总是已加载、永不卸载）。
 // ---------------------------------------------------------------------------
 using NtSuspendResumeFn = int32_t (WINAPI*)(HANDLE);
 
@@ -122,9 +122,9 @@ std::wstring NtStatusError(const wchar_t* what, uint32_t status) {
     return Fmt(L"{}失败（NTSTATUS 0x{:08X}）", what, status);
 }
 
-// Documented per-thread fallback (Toolhelp thread snapshot; SuspendThread/ResumeThread
-// once per thread of the target — the same one-count-per-thread semantics as the ntdll
-// exports). Used only when ntdll does not export the process-wide functions.
+// 有文档的按线程兜底（Toolhelp 线程快照；对目标的每个线程
+// 各调一次 SuspendThread/ResumeThread——与 ntdll 导出相同的
+// 每线程一次计数语义）。仅在 ntdll 缺少进程级导出时使用。
 bool PerThreadSuspendResume(uint32_t pid, bool suspend, std::wstring* err) {
     const wchar_t* what = suspend ? L"挂起" : L"恢复";
     HANDLE raw = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -140,7 +140,7 @@ bool PerThreadSuspendResume(uint32_t pid, bool suspend, std::wstring* err) {
         do {
             if (te.th32OwnerProcessID != pid) continue;
             UniqueHandle t(OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID));
-            if (!t) continue;  // exiting thread: benign
+            if (!t) continue;  // 正在退出的线程：良性
             const DWORD rc = suspend ? SuspendThread(t.get()) : ResumeThread(t.get());
             if (rc != kThreadSuspendError) ++acted;
         } while (Thread32Next(snap.get(), &te));
@@ -154,19 +154,19 @@ bool PerThreadSuspendResume(uint32_t pid, bool suspend, std::wstring* err) {
 }
 
 // ---------------------------------------------------------------------------
-// Suspended check: NtQSI(SystemProcessInformation) thread State/WaitReason, same
-// semi-documented x64 layout the collector parses (self-contained mirror; the struct
-// below only feeds this flag). suspendedAvail=false when the check cannot run honestly.
+// 挂起检查：NtQSI(SystemProcessInformation) 的线程 State/WaitReason，
+// 与采集器解析的半官方 x64 布局相同（自包含镜像；下方结构
+// 只为该标志服务）。检查无法诚实运行时 suspendedAvail=false。
 // ---------------------------------------------------------------------------
 struct NtUnicodeString {
-    uint16_t length;        // bytes, excluding the NUL terminator
+    uint16_t length;        // 字节数，不含 NUL 终止符
     uint16_t maximumLength;
     uint32_t pad;
     wchar_t* buffer;
 };
 static_assert(sizeof(NtUnicodeString) == 16);
 
-struct SystemThreadInfoX64 {  // SYSTEM_THREAD_INFORMATION, x64 (80 bytes)
+struct SystemThreadInfoX64 {  // SYSTEM_THREAD_INFORMATION，x64（80 字节）
     int64_t kernelTime;      // 0x00
     int64_t userTime;        // 0x08
     int64_t createTime;      // 0x10
@@ -225,7 +225,7 @@ static_assert(sizeof(SystemProcessInfoX64) == 0x100);
 static_assert(offsetof(SystemProcessInfoX64, numberOfThreads) == 0x04);
 static_assert(offsetof(SystemProcessInfoX64, uniqueProcessId) == 0x50);
 
-// True = verdict produced (*suspended valid, *avail=true); false = check unavailable.
+// true = 得出结论（*suspended 有效、*avail=true）；false = 检查不可用。
 bool QuerySuspendedFlag(uint32_t pid, bool* suspended, bool* avail) {
     *suspended = false;
     *avail = false;
@@ -259,13 +259,13 @@ bool QuerySuspendedFlag(uint32_t pid, bool* suspended, bool* avail) {
     while (p + sizeof(SystemProcessInfoX64) <= end) {
         const auto* e = reinterpret_cast<const SystemProcessInfoX64*>(p);
         if (e->nextEntryOffset != 0 && e->nextEntryOffset < sizeof(SystemProcessInfoX64)) {
-            walked = false;  // layout looks wrong on this OS build => honest unavailable
+            walked = false;  // 该 OS 构建上布局可疑 => 诚实地报不可用
             break;
         }
         if (reinterpret_cast<uintptr_t>(e->uniqueProcessId) == pid) {
             found = true;
-            allSusp = e->numberOfThreads > 0;  // zero threads => cannot claim suspended
-            const uint8_t* t = p + sizeof(SystemProcessInfoX64);  // thread array at +0x100
+            allSusp = e->numberOfThreads > 0;  // 零线程 => 不能断言已挂起
+            const uint8_t* t = p + sizeof(SystemProcessInfoX64);  // 线程数组位于 +0x100
             for (uint32_t i = 0; i < e->numberOfThreads; ++i) {
                 if (t + sizeof(SystemThreadInfoX64) > end) {
                     truncated = true;
@@ -279,7 +279,7 @@ bool QuerySuspendedFlag(uint32_t pid, bool* suspended, bool* avail) {
                 }
                 t += sizeof(SystemThreadInfoX64);
             }
-            break;  // pids are unique in the buffer
+            break;  // 缓冲内 pid 唯一
         }
         if (e->nextEntryOffset == 0) break;
         p += e->nextEntryOffset;
@@ -299,11 +299,11 @@ DWORD PriorityClassOf(ProcPriority p) {
         case ProcPriority::High: return HIGH_PRIORITY_CLASS;
         case ProcPriority::Realtime: return REALTIME_PRIORITY_CLASS;
     }
-    return NORMAL_PRIORITY_CLASS;  // unreachable for in-contract values (validated above)
+    return NORMAL_PRIORITY_CLASS;  // 契约内的取值不会走到这里（上文已校验）
 }
 
-// Shared prologue: protected hard gate -> identity-verified minimal open. Returns false
-// with *err set when the op must stop (refusal / gone / denied).
+// 共享前奏：保护硬闸门 -> 身份复核的最小权限打开。必须停止时
+// 返回 false 并设置 *err（拒绝 / 已消失 / 被拒）。
 bool GateAndOpen(const ProcKey& key, const wchar_t* verb, DWORD access, UniqueHandle* out,
                  std::wstring* err) {
     const std::wstring reason = ProtectedReason(key, L"", L"");
@@ -319,7 +319,7 @@ bool GateAndOpen(const ProcKey& key, const wchar_t* verb, DWORD access, UniqueHa
 
 bool SuspendProcess(const ProcKey& key, std::wstring* err) {
     UniqueHandle h;
-    // PROCESS_SUSPEND_RESUME is the documented minimal right for NtSuspendProcess.
+    // PROCESS_SUSPEND_RESUME 是 NtSuspendProcess 有文档的最小权限。
     if (!GateAndOpen(key, L"挂起", PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
                      &h, err)) {
         return false;
@@ -364,14 +364,14 @@ bool SetProcPriority(const ProcKey& key, ProcPriority p, std::wstring* err) {
         return false;
     }
     UniqueHandle h;
-    // SeIncreaseBasePriorityPrivilege governs High/Realtime; PROCESS_SET_INFORMATION
-    // carries SetPriorityClass.
+    // High/Realtime 受 SeIncreaseBasePriorityPrivilege 管辖；PROCESS_SET_INFORMATION
+    // 承载 SetPriorityClass。
     if (!GateAndOpen(key, L"设置优先级", PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
                      &h, err)) {
         return false;
     }
     if (p == ProcPriority::Realtime) {
-        // Extra warning only: the attempt is still made and failure propagates honestly.
+        // 仅额外告警：仍会尝试，失败如实向上传播。
         STM_LOG_WARN("ops", L"实时优先级请求 pid={}：需 SeIncreaseBasePriorityPrivilege，"
                             L"且可能饿死系统线程", key.pid);
     }
@@ -420,8 +420,8 @@ bool SetProcAffinity(const ProcKey& key, uint64_t mask, std::wstring* err) {
 
 ProcessControlInfo GetProcessControlInfo(const ProcKey& key, std::wstring* err) {
     ProcessControlInfo info;
-    // Read-only op: no protection gate (priority/affinity of csrss is safe to display),
-    // but the identity protocol still applies to the ProcKey.
+    // 只读操作：不过保护闸门（展示 csrss 的优先级/亲和性是安全的），
+    // 但身份协议仍适用于该 ProcKey。
     UniqueHandle h;
     if (OpenVerifiedControl(key, PROCESS_QUERY_LIMITED_INFORMATION, &h, err) !=
         OpenVerdict::Opened) {
@@ -446,7 +446,7 @@ ProcessControlInfo GetProcessControlInfo(const ProcKey& key, std::wstring* err) 
         info.suspended = suspended;
         info.suspendedAvail = suspendedAvail;
     }
-    // else: best-effort stays false/false per the contract ("suspended flag best-effort").
+    // 否则：按契约尽力而为保持 false/false（"suspended 标志尽力而为"）。
     return info;
 }
 

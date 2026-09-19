@@ -1,9 +1,9 @@
 #pragma once
-// UI-side file metadata (description / company / version) read with GetFileVersionInfoW.
-// Covers the fields the ops-layer DetailsProvider does not carry; used by the process
-// table description column and the detail panel. UI thread only, cached per thread.
-// Note: query cost is one small disk read; UNC/network paths are refused so a UI
-// frame can never wait on the network.
+// UI 侧文件元数据（描述/公司/版本），用 GetFileVersionInfoW 读取。
+// 补足 ops 层 DetailsProvider 不携带的字段；供进程表描述列与
+// 详情面板使用。仅限 UI 线程，按线程缓存。
+// 注意：查询开销是一次小的磁盘读；UNC/网络路径一律拒绝，
+// UI 帧绝不等网络。
 #include <windows.h>
 #include <cstdint>
 #include <string>
@@ -21,18 +21,18 @@ struct FileMeta {
     std::wstring version;
 };
 
-// Raw query; all fields empty when unavailable. Never throws, never blocks on network.
+// 原始查询；不可得时全部字段为空。绝不抛异常，绝不在网络上阻塞。
 inline FileMeta QueryFileMeta(const std::wstring& path) {
     FileMeta meta;
     if (path.empty()) return meta;
-    if (path.rfind(L"\\\\", 0) == 0) return meta;  // UNC path: refuse (UI frame budget)
+    if (path.rfind(L"\\\\", 0) == 0) return meta;  // UNC 路径：拒绝（UI 帧预算）
 
     const DWORD size = GetFileVersionInfoSizeW(path.c_str(), nullptr);
     if (size == 0 || size > 4u * 1024u * 1024u) return meta;
     std::string data(static_cast<size_t>(size), '\0');
     if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data())) return meta;
 
-    // Read strings through the file's own translation table (first entry).
+    // 经文件自身的翻译表（首个条目）读取字符串。
     struct LangCodePage { WORD lang; WORD code; };
     LangCodePage* trans = nullptr;
     UINT transLen = 0;
@@ -69,9 +69,9 @@ inline FileMeta QueryFileMeta(const std::wstring& path) {
     return meta;
 }
 
-// Bounded per-thread cache. Entries are node-stable: Find() pointers stay valid
-// across Store() calls (only Prune invalidates, and callers never hold across
-// arbitrary inserts).
+// 有界的每线程缓存。条目节点稳定：Find() 返回的指针在 Store()
+// 之间保持有效（只有 Prune 会失效，而调用方从不在任意插入
+// 之间持有指针）。
 class FileMetaCache {
 public:
     const FileMeta* Find(const std::wstring& path) {
@@ -87,7 +87,7 @@ public:
 private:
     void PruneIfNeeded() {
         if (map_.size() < kMaxEntries) return;
-        map_.clear();  // simple bounded-cache substitute; process images recycle rarely
+        map_.clear();  // 简单的有界缓存替代；进程映像很少复用
     }
     static constexpr size_t kMaxEntries = 2048;
     std::unordered_map<std::wstring, FileMeta> map_;

@@ -1,5 +1,5 @@
-// UI sorting primitive tests. SortKey.h is header-only (no app objects), so these
-// run inside stm_selftest which links core+collect+ops only.
+// UI 排序原语测试。SortKey.h 仅头文件（无应用对象），
+// 因此这些测试在只链接 core+collect+ops 的 stm_selftest 内运行。
 #include "selftest/TestFramework.h"
 #include "app/ui/SortKey.h"
 
@@ -11,7 +11,7 @@ namespace {
 ProcInfo MakeProc(uint32_t pid, const wchar_t* name, double cpu, uint64_t privWs) {
     ProcInfo p;
     p.key.pid = pid;
-    p.key.createTime = 1000 + pid;  // distinguishable identities
+    p.key.createTime = 1000 + pid;  // 可区分的身份
     p.name = name;
     p.cpuPercent = cpu;
     p.privateWorkingSet = privWs;
@@ -19,7 +19,7 @@ ProcInfo MakeProc(uint32_t pid, const wchar_t* name, double cpu, uint64_t privWs
 }
 }  // namespace
 
-// Unavailable CPU (NaN) must sort last in BOTH directions.
+// 不可得 CPU（NaN）在两个方向上都必须排在最后。
 STM_TEST(ui_sort_cpu_unavail_last) {
     const ProcInfo live = MakeProc(10, L"a.exe", 5.0, 100);
     const ProcInfo dead = MakeProc(20, L"b.exe", stm::kUnavail, 100);
@@ -34,7 +34,7 @@ STM_TEST(ui_sort_cpu_unavail_last) {
     return true;
 }
 
-// Case-insensitive name equality falls back to pid ascending (both directions).
+// 大小写不敏感的同名以 pid 升序破平（两个方向）。
 STM_TEST(ui_sort_name_tiebreak_pid) {
     const ProcInfo hi = MakeProc(30, L"NOTEPAD.EXE", 1.0, 100);
     const ProcInfo lo = MakeProc(20, L"notepad.exe", 1.0, 100);
@@ -49,7 +49,7 @@ STM_TEST(ui_sort_name_tiebreak_pid) {
     return true;
 }
 
-// kUnavailU64 private working set sorts last; desc does not rescue it.
+// kUnavailU64 私有工作集排在最后；desc 也救不回来。
 STM_TEST(ui_sort_mem_unavail_last) {
     const ProcInfo small = MakeProc(5, L"a.exe", 0.0, 100);
     const ProcInfo unknownHi = MakeProc(9, L"b.exe", 0.0, stm::kUnavailU64);
@@ -69,7 +69,7 @@ STM_TEST(ui_sort_mem_unavail_last) {
     return true;
 }
 
-// Column ids round-trip through the config/session persistence layer.
+// 列 id 在配置/会话持久化层中往返一致。
 STM_TEST(ui_sort_column_ids_roundtrip) {
     for (int i = 0; i < static_cast<int>(SortColumn::Count); ++i) {
         const SortColumn c = static_cast<SortColumn>(i);

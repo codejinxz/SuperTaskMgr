@@ -1,6 +1,6 @@
-// Wave-2 UI logic tests: sensor-page group visibility config (Sensors page
-// redesign), LHM label classification, per-core label parsing, and the F4
-// module-section decision helpers. All header-only pure logic — no GUI.
+// Wave-2 UI 逻辑测试：传感器页分组可见性配置（传感器页
+// 重设计）、LHM 标签归类、每核标签解析，以及 F4
+// 模块区决策辅助。全部为仅头文件纯逻辑——无 GUI。
 #include "selftest/TestFramework.h"
 #include "app/ui/ModulesUi.h"
 #include "app/ui3/PageHelpers.h"
@@ -13,7 +13,7 @@ using namespace stm;
 using namespace stm::ui;
 using namespace stm::ui3;
 
-// Every sensor group has a distinct cfg key and the documented product defaults
+// 每个传感器组都有独立 cfg 键，且文档化的产品默认值
 // (all visible, 风扇 hidden by default: it can only report 需要驱动支持 honestly).
 STM_TEST(sensor_group_keys_defaults) {
     bool seen[static_cast<int>(SensorGroup::Count)] = {};
@@ -34,7 +34,7 @@ STM_TEST(sensor_group_keys_defaults) {
     for (int i = 0; i < static_cast<int>(SensorGroup::Count); ++i) {
         if (!seen[i]) { *err = L"传感器组枚举未遍历完整"; return false; }
     }
-    // titles must be non-empty as well (rendered as group headers)
+    // 标题也必须非空（渲染为组头）
     for (int i = 0; i < static_cast<int>(SensorGroup::Count); ++i) {
         if (*SensorGroupTitle(static_cast<SensorGroup>(i)) == L'\0') {
             *err = L"存在空的传感器组标题";
@@ -44,14 +44,14 @@ STM_TEST(sensor_group_keys_defaults) {
     return true;
 }
 
-// Group visibility + LHM options roundtrip through the config file (Chinese-safe).
+// 分组可见性 + LHM 选项在配置文件中往返（中文安全）。
 STM_TEST(sensors_group_cfg_roundtrip) {
     wchar_t temp[MAX_PATH]{};
     GetTempPathW(MAX_PATH, temp);
     const std::wstring p = std::wstring(temp) + L"stm_selftest_senscfg.json";
 
     Config c1;
-    // defaults honored when keys are absent
+    // 键缺失时遵循默认
     for (int i = 0; i < static_cast<int>(SensorGroup::Count); ++i) {
         const SensorGroup g = static_cast<SensorGroup>(i);
         if (SensorGroupVisible(c1, g) != SensorGroupDefaultVisible(g)) {
@@ -59,7 +59,7 @@ STM_TEST(sensors_group_cfg_roundtrip) {
             return false;
         }
     }
-    // flip every group + LHM options, save, reload
+    // 翻转所有组 + LHM 选项，保存，重载
     for (int i = 0; i < static_cast<int>(SensorGroup::Count); ++i) {
         const SensorGroup g = static_cast<SensorGroup>(i);
         c1.SetBool(SensorGroupCfgKey(g), !SensorGroupDefaultVisible(g));
@@ -83,9 +83,9 @@ STM_TEST(sensors_group_cfg_roundtrip) {
     return true;
 }
 
-// LHM node-path labels must merge into the right sensor group (keyword scan,
-// unambiguous keywords first). "Other" lands nowhere visible except honest
-// uncategorized rows.
+// LHM 节点路径标签必须并入正确的传感器组（关键字扫描，
+// 无歧义关键字优先）。“Other”只落到诚实的未分类行，
+// 不到任何可见位置。
 STM_TEST(lhm_group_classifier) {
     struct Case {
         const wchar_t* label;
@@ -117,8 +117,8 @@ STM_TEST(lhm_group_classifier) {
     return true;
 }
 
-// Per-core label parsing: index extraction + freq/util classification; aggregate
-// fallback labels must return -1 so they render as plain readings.
+// 每核标签解析：索引提取 + 频率/利用率分类；聚合兜底标签
+// 必须返回 -1，使其按普通读数渲染。
 STM_TEST(sensor_core_index_parse) {
     bool isFreq = false;
     if (SensorCoreIndex(L"CPU 核 0 频率", &isFreq) != 0 || !isFreq) {
@@ -144,9 +144,9 @@ STM_TEST(sensor_core_index_parse) {
     return true;
 }
 
-// F4: the module section state machine — pending while the details job runs,
-// honest gates when the list is unreadable, and the badge mapping for the
-// per-module signature verification results.
+// F4：模块区状态机——详情任务运行期间为 pending、
+// 列表不可读时诚实闸门，以及每模块签名验证结果的
+// 徽标映射。
 STM_TEST(module_section_and_badges) {
     if (DecideModuleSection(false, false, false, 0) != ModuleSectionState::Pending) {
         *err = L"详情未就绪应为 Pending";

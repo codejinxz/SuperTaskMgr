@@ -9,7 +9,7 @@
 #include "app/ui3/GcPages.h"
 #include "app/ui3/AsyncFetch.h"
 #include "app/ui3/CrashUi.h"
-#include "app/ui3/JumpState.h"  // FilterServicesByPid
+#include "app/ui3/JumpState.h"  // FilterServicesByPid（按 pid 过滤服务）
 #include "app/ui3/PageHelpers.h"
 #include "app/ui3/WindowUtil.h"
 #include "app/ui/UiText.h"
@@ -66,8 +66,8 @@ void PushNote(AppContext& ctx, Notification::Kind kind, const std::wstring& text
     ctx.notes.Push(n);
 }
 
-// Note with teardown safety: LiveP3Ctx() may be null while the app exits —
-// skip the note instead of dereferencing null (never fail loudly at teardown).
+// 拆除安全说明：应用退出期间 LiveP3Ctx() 可能为 null——
+// 跳过通知而不是解引用空指针（拆除时绝不大声失败）。
 void PushLiveNote(Notification::Kind kind, const std::wstring& text) {
     if (std::shared_ptr<AppContext> app = LiveP3Ctx()) PushNote(*app, kind, text);
 }

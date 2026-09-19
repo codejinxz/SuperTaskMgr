@@ -18,7 +18,7 @@ std::wstring Utf8ToWide(std::string_view u) {
     if (u.empty()) return {};
     const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                                       u.data(), static_cast<int>(u.size()), nullptr, 0);
-    if (n <= 0) return {};  // invalid utf-8 -> empty, callers treat as missing data
+    if (n <= 0) return {};  // 无效 UTF-8 -> 返回空，调用方视为数据缺失
     std::wstring out(static_cast<size_t>(n), L'\0');
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                         u.data(), static_cast<int>(u.size()), out.data(), n);
@@ -36,7 +36,7 @@ std::wstring FormatBytes(uint64_t bytes) {
 }
 
 std::wstring FormatRate(double bytesPerSec) {
-    if (bytesPerSec != bytesPerSec) return L"—";  // NaN check (no <cmath> noise)
+    if (bytesPerSec != bytesPerSec) return L"—";  // NaN 判断（避免引入 <cmath>）
     return FormatBytes(static_cast<uint64_t>(bytesPerSec)) + L"/s";
 }
 

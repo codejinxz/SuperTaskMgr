@@ -1,5 +1,5 @@
 #pragma once
-// ImGui context + win32/dx11 backends + CJK font loading (arch section 8).
+// ImGui 上下文 + win32/dx11 后端 + 中文字体加载（架构第 8 节）。
 #include <string>
 #include <windows.h>
 
@@ -12,9 +12,9 @@ public:
     bool Init(HWND hwnd, D3DRenderer* renderer, float fontSizePx = 16.0f);
     void Shutdown();
     void NewFrame();
-    void Render();  // DrawData -> dx11 backend
+    void Render();  // DrawData -> dx11 后端
 
-    // nullptr when no Chinese-capable font file was found (UI should still render Latin).
+    // 找不到支持中文的字体文件时为 nullptr（UI 仍应能渲染拉丁文）。
     const std::wstring& FontFileUsed() const { return fontUsed_; }
 
 private:

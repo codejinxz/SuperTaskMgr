@@ -60,7 +60,7 @@ target_compile_options(stm_implot PRIVATE /W0)
 
 # ---------------- app ----------------
 file(GLOB_RECURSE APP_SRC CONFIGURE_DEPENDS src/app/*.cpp)
-add_executable(SuperTaskMgr WIN32 ${APP_SRC} src/app/app.manifest)
+add_executable(SuperTaskMgr WIN32 ${APP_SRC} src/app/app.manifest src/app/app.rc)
 target_include_directories(SuperTaskMgr PRIVATE third_party/stb)
 target_link_libraries(SuperTaskMgr PRIVATE stm_collect stm_ops stm_imgui stm_implot
     d3d11 dxgi d3dcompiler dwmapi comdlg32)

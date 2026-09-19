@@ -1,15 +1,15 @@
-// NetTables.cpp — phase 3.
-// Part A (contract NetTables.h): TCP/UDP endpoint tables with owning PIDs via
-//   GetExtendedTcpTable / GetExtendedUdpTable (TCP_TABLE_OWNER_PID_ALL /
-//   UDP_TABLE_OWNER_PID, v4+v6). Buffer size is grown in a retry loop for
-//   ERROR_INSUFFICIENT_BUFFER; addresses are formatted with InetNtopW
-//   (RFC 5952 for IPv6, loaded dynamically from ws2_32.dll); PID=0 rows are
-//   kernel-bound sockets and are preserved verbatim (never dropped).
-// Part B (internal, CollectDetail.h): EtwNetCollector — real-time ETW session
-//   on Microsoft-Windows-Kernel-Network (R5 #10b), admin only, aggregating
-//   per-pid cumulative recv/send bytes for the CollectService diff.
-#include <winsock2.h>  // must precede windows.h/iphlpapi (LEAN_AND_MEAN hides winsock)
-#include <ws2tcpip.h>  // pulls ws2ipdef.h -> in6_addr needed by the MIB_TCP6/UDP6 rows
+// NetTables.cpp — 第 3 阶段。
+// A 部分（契约 NetTables.h）：经 GetExtendedTcpTable / GetExtendedUdpTable
+//  （TCP_TABLE_OWNER_PID_ALL / UDP_TABLE_OWNER_PID，v4+v6）取得带持有 PID 的
+//   TCP/UDP 端点表。缓冲区在 ERROR_INSUFFICIENT_BUFFER 重试循环中增长；
+//   地址用 InetNtopW 格式化（IPv6 按 RFC 5952，从 ws2_32.dll 动态加载）；
+//   PID=0 的行是内核绑定的套接字，按原样保留（绝不丢弃）。
+//
+// B 部分（内部，CollectDetail.h）：EtwNetCollector——实时 ETW 会话
+//   （Microsoft-Windows-Kernel-Network，R5 #10b），仅管理员可用，为
+//   CollectService 的差分聚合每 pid 累计收发字节。
+#include <winsock2.h>  // 必须在 windows.h/iphlpapi 之前包含（LEAN_AND_MEAN 会隐藏 winsock）
+#include <ws2tcpip.h>  // 引入 ws2ipdef.h -> MIB_TCP6/UDP6 行所需的 in6_addr
 #include "collect/CollectDetail.h"
 #include "collect/NetTables.h"
 #include "core/Log.h"
@@ -21,15 +21,15 @@
 namespace stm {
 
 // ===========================================================================
-// Part A: connection tables (contract NetTables.h)
+// A 部分：连接表（契约 NetTables.h）
 // ===========================================================================
 namespace {
 
 constexpr DWORD kInitialTableBytes = 32 * 1024;
 constexpr int kMaxTableRetries = 8;
 
-// InetNtopW lives in ws2_32.dll; stm_collect does not link ws2_32, so bind it
-// dynamically and keep the module for the process lifetime (like ntdll above).
+// InetNtopW 位于 ws2_32.dll；stm_collect 不链接 ws2_32，因此动态绑定，
+// 并把模块保留到进程结束（同上文的 ntdll 一样）。
 using InetNtopWFn = PCWSTR(WINAPI*)(INT family, const VOID* pAddr, PWSTR pStringBuf,
                                     size_t StringBufSize);
 
@@ -45,15 +45,15 @@ std::wstring FmtAddrV4(const IN_ADDR& a) {
     wchar_t buf[46]{};
     const InetNtopWFn fn = InetNtopWProc();
     if (fn && fn(AF_INET, &a, buf, std::size(buf))) return buf;
-    const auto* b = reinterpret_cast<const uint8_t*>(&a);  // network byte order
+    const auto* b = reinterpret_cast<const uint8_t*>(&a);  // 网络字节序
     return Fmt(L"{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
 }
 
 std::wstring FmtAddrV6(const IN6_ADDR& a) {
     wchar_t buf[46]{};
     const InetNtopWFn fn = InetNtopWProc();
-    if (fn && fn(AF_INET6, &a, buf, std::size(buf))) return buf;  // RFC 5952 style
-    // Fallback: plain lowercase hex groups (only if ws2_32 were unusable).
+    if (fn && fn(AF_INET6, &a, buf, std::size(buf))) return buf;  // RFC 5952 风格
+    // 兜底：小写十六进制分组（仅在 ws2_32 不可用时才会走到）。
     std::wstring s;
     for (int i = 0; i < 8; ++i) {
         if (i) s += L':';
@@ -62,8 +62,8 @@ std::wstring FmtAddrV6(const IN6_ADDR& a) {
     return s;
 }
 
-// Port fields arrive in network byte order in the low 16 bits of a DWORD;
-// swapped by hand (ws2_32 ntohs is not linked).
+// 端口字段以网络字节序存于 DWORD 的低 16 位；
+// 手工交换字节序（未链接 ws2_32 的 ntohs）。
 uint16_t NetPort(uint32_t dwPort) {
     const uint32_t raw = dwPort & 0xFFFFu;
     return static_cast<uint16_t>(((raw & 0xFFu) << 8) | ((raw >> 8) & 0xFFu));
@@ -75,8 +75,8 @@ void NoteErr(std::wstring* errs, const wchar_t* what, DWORD rc) {
     *errs += Fmt(L"{} 失败（Win32 {}）", what, rc);
 }
 
-// Grows the buffer through ERROR_INSUFFICIENT_BUFFER retries (the table can
-// change between the size probe and the call, hence the loop).
+// 通过 ERROR_INSUFFICIENT_BUFFER 重试扩大缓冲区（大小探测与调用之间
+// 表可能变化，因此需要循环）。
 template <typename Api>
 bool FetchTable(Api api, std::vector<BYTE>* buf, std::wstring* errs, const wchar_t* what) {
     DWORD size = static_cast<DWORD>(buf->size());
@@ -113,7 +113,7 @@ void AppendTcp4(std::vector<BYTE>* buf, std::vector<ConnEntry>* out, std::wstrin
         e.remoteAddr = FmtAddrV4(*reinterpret_cast<const IN_ADDR*>(&r.dwRemoteAddr));
         e.remotePort = NetPort(r.dwRemotePort);
         e.state = static_cast<uint32_t>(r.dwState);
-        e.pid = r.dwOwningPid;  // 0 = kernel-bound, preserved per contract
+        e.pid = r.dwOwningPid;  // 0 = 内核绑定，按契约保留
         out->push_back(std::move(e));
     }
 }
@@ -212,27 +212,27 @@ std::wstring TcpStateLabel(uint32_t state) {
         case MIB_TCP_STATE_LAST_ACK: return L"最后确认";
         case MIB_TCP_STATE_TIME_WAIT: return L"时间等待";
         case MIB_TCP_STATE_DELETE_TCB: return L"删除";
-        default: return Fmt(L"0x{:X}", state);  // unknown states stay honest as hex
+        default: return Fmt(L"0x{:X}", state);  // 未知状态诚实地以十六进制展示
     }
 }
 
 // ===========================================================================
-// Part B: EtwNetCollector (internal, CollectDetail.h). We are still inside
-// namespace stm here; the class is declared in stm::cd, so only cd reopens.
+// B 部分：EtwNetCollector（内部，CollectDetail.h）。此处仍处于
+// namespace stm；类声明在 stm::cd，因此只重开 cd。
 // ===========================================================================
 namespace cd {
 
 namespace {
 
-// Microsoft-Windows-Kernel-Network (manifest provider, Win10+; can be enabled
-// on a normal private real-time session — the same thing `netsh trace` does).
+// Microsoft-Windows-Kernel-Network（清单提供程序，Win10+；可在普通私有
+// 实时会话上启用——与 `netsh trace` 做的是同一件事）。
 constexpr GUID kKernelNetworkGuid = {
     0x7dd42a49, 0x5329, 0x4832, {0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88}};
-constexpr USHORT kEvtRecvData = 10;  // kernel:network:recvdata
-constexpr USHORT kEvtSendData = 11;  // kernel:network:senddata
+constexpr USHORT kEvtRecvData = 10;  // kernel:network:recvdata 事件
+constexpr USHORT kEvtSendData = 11;  // kernel:network:senddata 事件
 
-// tdh.dll: decode event payloads BY PROPERTY NAME (no layout guessing across
-// OS builds). Dynamically bound; stm_collect does not link tdh.lib.
+// tdh.dll：按属性名解码事件载荷（不跨 OS 构建猜布局）。
+// 动态绑定；stm_collect 不链接 tdh.lib。
 using TdhGetPropertyFn = ULONG(WINAPI*)(PEVENT_RECORD, ULONG, PTDH_CONTEXT, ULONG,
                                         PPROPERTY_DATA_DESCRIPTOR, ULONG, PBYTE);
 using TdhGetPropertySizeFn = ULONG(WINAPI*)(PEVENT_RECORD, ULONG, PTDH_CONTEXT, ULONG,
@@ -254,7 +254,7 @@ TdhFns Tdh() {
     return fn;
 }
 
-// Reads a uint32 payload property by name. Returns false when absent/undecodable.
+// 按名称读取 uint32 载荷属性。缺失/无法解码时返回 false。
 bool U32Prop(PEVENT_RECORD rec, const wchar_t* name, uint32_t* out) {
     const TdhFns f = Tdh();
     if (!f.get || !f.getSize) return false;
@@ -287,7 +287,7 @@ bool EtwNetCollector::SessionExists(const wchar_t* name) {
     p->Wnode.BufferSize = static_cast<ULONG>(buf.size());
     p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     const ULONG rc = ::ControlTraceW(0, name, p, EVENT_TRACE_CONTROL_QUERY);
-    // ERROR_MORE_DATA also means "exists" (info larger than our buffer).
+    // ERROR_MORE_DATA 也表示"已存在"（信息比我们的缓冲区大）。
     return rc == ERROR_SUCCESS || rc == ERROR_MORE_DATA;
 }
 
@@ -295,8 +295,8 @@ bool EtwNetCollector::Start() {
     std::lock_guard<std::mutex> lock(mu_);
     if (session_ != 0) return true;
 
-    // Unique session name (pid) prevents collisions between instances; a stale
-    // session left behind by a crashed predecessor is stopped first (anti-orphan).
+    // 唯一会话名（带 pid）避免实例间冲突；前一个崩溃遗留的同名
+    // 残留会话先被停止（防孤儿）。
     sessionName_ = Fmt(L"SuperTaskMgr-Net-{}", ::GetCurrentProcessId());
 
     stopProps_.assign(PropsSize(sessionName_), 0);
@@ -305,18 +305,18 @@ bool EtwNetCollector::Start() {
         p->Wnode.BufferSize = static_cast<ULONG>(stopProps_.size());
         p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         ::ControlTraceW(0, sessionName_.c_str(), p, EVENT_TRACE_CONTROL_STOP);
-        // ERROR_WMI_INSTANCE_NOT_FOUND simply means there was no leftover.
+        // ERROR_WMI_INSTANCE_NOT_FOUND 只说明没有残留。
     }
 
-    // Real-time session, 64 x 64KB buffers to start (max 128), 1 s flush so the
-    // per-second rate differential sees fresh events.
+    // 实时会话，起始 64 个 64KB 缓冲（最多 128），1s 刷新一次，让每秒
+    // 速率差分能看到新事件。
     std::vector<BYTE> propsBuf(PropsSize(sessionName_));
     auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propsBuf.data());
     p->Wnode.BufferSize = static_cast<ULONG>(propsBuf.size());
     p->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    p->Wnode.ClientContext = 1;  // QPC timestamps
+    p->Wnode.ClientContext = 1;  // QPC 时间戳
     p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    p->BufferSize = 64;  // KB per buffer
+    p->BufferSize = 64;  // 每缓冲 KB 数
     p->MinimumBuffers = 64;
     p->MaximumBuffers = 128;
     p->FlushTimer = 1;
@@ -331,9 +331,9 @@ bool EtwNetCollector::Start() {
         return false;
     }
 
-    // Keyword 0 = no keyword filtering, but the session enables ONLY the
-    // Kernel-Network provider, so only network-class events can arrive; the
-    // callback additionally keeps recv/send data events only (ids 10/11).
+    // Keyword 0 = 不按关键字过滤，但会话只启用了 Kernel-Network
+    // 提供程序，所以只会有网络类事件到达；回调还进一步
+    // 只保留收/发数据事件（id 10/11）。
     rc = ::EnableTraceEx2(h, &kKernelNetworkGuid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                           TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr);
     if (rc != ERROR_SUCCESS) {
@@ -344,8 +344,8 @@ bool EtwNetCollector::Start() {
         return false;
     }
 
-    // Keep the (kernel-updated) properties buffer for the later ControlTraceW
-    // stop; it must outlive Start, hence the member copy.
+    // 保留（内核更新过的）属性缓冲区，供之后 ControlTraceW 停止会话使用；
+    // 它必须活得比 Start 久，因此复制为成员。
     stopProps_ = propsBuf;
     session_ = h;
     bytes_.clear();
@@ -381,7 +381,7 @@ void EtwNetCollector::Consume() {
         openTrace_ = h;
     }
     TRACEHANDLE hs[1] = {h};
-    ::ProcessTrace(hs, 1, nullptr, nullptr);  // blocks until the session is stopped
+    ::ProcessTrace(hs, 1, nullptr, nullptr);  // 阻塞直到会话被停止
     ::CloseTrace(h);
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -398,15 +398,15 @@ void EtwNetCollector::HandleEvent(PEVENT_RECORD rec) {
     if (!InlineIsEqualGUID(rec->EventHeader.ProviderId, kKernelNetworkGuid)) return;
     const USHORT id = rec->EventHeader.EventDescriptor.Id;
     const USHORT op = rec->EventHeader.EventDescriptor.Opcode;
-    // recvdata=10 / senddata=11 (manifest). Accept the kernel-logger spelling
-    // (type in Opcode, Id==0) as well, so legacy sessions still work.
+    // recvdata=10 / senddata=11（清单）。同时接受 kernel-logger 拼写
+    //（类型放在 Opcode、Id==0），让旧式会话也能工作。
     int dir = 0;
     if (id == kEvtRecvData || (id == 0 && op == kEvtRecvData)) {
         dir = 1;
     } else if (id == kEvtSendData || (id == 0 && op == kEvtSendData)) {
         dir = 2;
     } else {
-        return;  // connect/disconnect/retransmit/... — not byte-bearing events
+        return;  // connect/disconnect/retransmit/... — 非携带字节的事件
     }
     uint32_t size = 0;
     if (!U32Prop(rec, L"size", &size)) {
@@ -416,7 +416,7 @@ void EtwNetCollector::HandleEvent(PEVENT_RECORD rec) {
     }
     uint32_t pid = 0;
     if (!U32Prop(rec, L"pid", &pid) || pid == 0) pid = rec->EventHeader.ProcessId;
-    if (pid == 0) return;  // no identity: never attribute to a fake owner
+    if (pid == 0) return;  // 无身份：绝不归属给伪造的持有者
 
     std::lock_guard<std::mutex> lock(mu_);
     Agg& a = bytes_[pid];
@@ -429,16 +429,16 @@ void EtwNetCollector::HandleEvent(PEVENT_RECORD rec) {
 }
 
 void EtwNetCollector::Stop() {
-    // Copy the session bookkeeping under the lock, then control the session
-    // WITHOUT holding mu_ — the consumer's OnEvent needs mu_ to finish, and
-    // ProcessTrace must return before we can join (otherwise: deadlock).
+    // 在锁内复制会话簿记信息，然后在不持 mu_ 的情况下控制会话——
+    // 消费者的 OnEvent 需要 mu_ 才能结束，且必须等 ProcessTrace
+    // 返回后才能 join（否则死锁）。
     TRACEHANDLE session = 0;
     std::wstring name;
     std::vector<BYTE> props;
     {
         std::lock_guard<std::mutex> lock(mu_);
         session = session_;
-        session_ = 0;  // marked stopped first => Stop/Start idempotent
+        session_ = 0;  // 先标记为已停止 => Stop/Start 幂等
         name = sessionName_;
         props = stopProps_;
         stopProps_.clear();
@@ -449,8 +449,8 @@ void EtwNetCollector::Stop() {
         auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(props.data());
         ::ControlTraceW(session, name.c_str(), p, EVENT_TRACE_CONTROL_STOP);
     }
-    if (consumer_.joinable()) consumer_.join();  // exits once ProcessTrace returns
-    ::CloseTrace(session);                       // close the session handle last
+    if (consumer_.joinable()) consumer_.join();  // ProcessTrace 返回后即退出
+    ::CloseTrace(session);                       // 最后关闭会话句柄
     STM_LOG_INFO("etw", Fmt(L"ETW 会话 {} 已停止", name));
 }
 

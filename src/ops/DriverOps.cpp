@@ -1,10 +1,10 @@
-// Loaded kernel driver enumeration (contract ops/DriverOps.h; R5 row 13).
+// 已加载内核驱动枚举（契约 ops/DriverOps.h；R5 第 13 行）。
 //
-// Windows 11 24H2 hardening (documented on the EnumDeviceDrivers page): without
-// SeDebugPrivilege the call "succeeds" but hands back an array whose addresses are
-// all NULL. We detect that shape explicitly and — when elevated — retry once with
+// Windows 11 24H2 的加固（EnumDeviceDrivers 页面有文档）：没有
+// SeDebugPrivilege 时调用会"成功"但返回的数组地址
+// 全为 NULL。我们显式检测该形态，并且在已提权时带
 // SeDebugPrivilege enabled, otherwise fail honestly with 需要管理员权限 instead of
-// presenting an empty list as data.
+// 而不是把空列表当数据呈现。
 #include "ops/DriverOps.h"
 #include "core/Err.h"
 #include "core/Log.h"
@@ -21,7 +21,7 @@
 namespace stm::ops {
 namespace {
 
-// One grow-retry guarded EnumDeviceDrivers pass. Fills *bases; false on API failure.
+// 一轮带增长重试保护的 EnumDeviceDrivers。填充 *bases；API 失败返回 false。
 bool EnumDriverBases(std::vector<LPVOID>* bases) {
     DWORD needed = 0;
     if (!::EnumDeviceDrivers(nullptr, 0, &needed) && ::GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
@@ -30,7 +30,7 @@ bool EnumDriverBases(std::vector<LPVOID>* bases) {
     bases->clear();
     for (int i = 0; i < 4; ++i) {
         const DWORD count = needed / sizeof(LPVOID);
-        if (count == 0) return true;  // empty array is a "successful" answer
+        if (count == 0) return true;  // 空数组也算"成功"的回答
         bases->assign(count, nullptr);
         DWORD got = needed;
         if (::EnumDeviceDrivers(bases->data(), got, &needed)) return true;
@@ -39,13 +39,13 @@ bool EnumDriverBases(std::vector<LPVOID>* bases) {
     return false;
 }
 
-// "\\SystemRoot\system32\drivers\x.sys" -> "%SystemRoot% expanded"; "\\??\C:\..." ->
-// device-namespace prefix stripped (task contract). Unmappable kernel paths
-// (\Device\...) are returned untouched — honest data beats a fake path.
+// "\\SystemRoot\system32\drivers\x.sys" -> "%SystemRoot% 展开"；"\\??\C:\..." ->
+// 去掉设备命名空间前缀（任务契约）。无法映射的内核路径
+//（\Device\...）原样返回——诚实数据胜过伪造路径。
 std::wstring NormalizeDriverPath(const std::wstring& raw) {
     std::wstring p = raw;
     if (p.rfind(L"\\\\SystemRoot\\", 0) == 0 || p.rfind(L"\\SystemRoot\\", 0) == 0) {
-        const size_t slash = p.find(L'\\', 1);  // second backslash: end of the marker
+        const size_t slash = p.find(L'\\', 1);  // 第二个反斜杠：标记结束处
         if (slash != std::wstring::npos) {
             wchar_t winDir[MAX_PATH]{};
             UINT n = ::GetSystemWindowsDirectoryW(winDir, MAX_PATH);
@@ -54,8 +54,8 @@ std::wstring NormalizeDriverPath(const std::wstring& raw) {
         }
         return p;
     }
-    if (p.rfind(L"\\\\??\\", 0) == 0) return p.substr(5);      // strip leading \??\ marker
-    if (p.rfind(L"\\??\\", 0) == 0) return p.substr(4);        // strip short \??\ marker
+    if (p.rfind(L"\\\\??\\", 0) == 0) return p.substr(5);      // 去掉开头的 \??\ 标记
+    if (p.rfind(L"\\??\\", 0) == 0) return p.substr(4);        // 去掉短 \??\ 标记
     return p;
 }
 
@@ -74,9 +74,9 @@ std::vector<DriverInfo> EnumDrivers(std::wstring* err) {
         return out;
     }
 
-    // 24H2 semantics probe: non-empty array whose every base is NULL means the call was
-    // neutered for our token (R5 row 13, documented on the EnumDeviceDrivers page).
-    // An empty array is treated the same way: a booted Windows always has drivers.
+    // 24H2 语义探测：数组非空且每个基址都是 NULL，说明调用被
+    // 针对我们的令牌废掉了功能（R5 第 13 行，EnumDeviceDrivers 页面有文档）。
+    // 空数组按同样方式处理：启动完成的 Windows 必有驱动。
     const bool allZero = std::all_of(bases.begin(), bases.end(),
                                      [](LPVOID p) { return p == nullptr; });
     if (allZero) {
@@ -110,9 +110,9 @@ std::vector<DriverInfo> EnumDrivers(std::wstring* err) {
         di.imageBase = reinterpret_cast<uint64_t>(base);
 
         wchar_t path[MAX_PATH * 2]{};
-        // Purpose-built psapi API for kernel base addresses; the EnumDeviceDrivers
-        // remarks pattern (GetModuleFileNameEx against the current process) fails on
-        // current builds, so it is only a fallback. Confirmed on Win11 23H2 non-admin.
+        // psapi 专为内核基址提供的 API；EnumDeviceDrivers 备注里
+        // 的模式（对当前进程用 GetModuleFileNameEx）在当前构建上失效，
+        // 因此只作兜底。已在 Win11 23H2 非管理员下确认。
         if (::GetDeviceDriverFileNameW(base, path, MAX_PATH * 2) > 0) {
             di.path = NormalizeDriverPath(path);
             di.name = FileNameOf(di.path);

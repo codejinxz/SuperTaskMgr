@@ -1,7 +1,7 @@
-// sensors_test: F3 sensor-layer extension cases (contract Sensors.h + LhmSource).
-// Honesty focus: every new group obeys the four-state model (Ok/NeedAdmin/
-// NeedDriver/NoHardware) and never shows a fabricated "Ok + 0" value; the LHM
-// bridge is off by default and its mini-JSON parser is validated offline.
+// sensors_test：F3 传感器层扩展用例（契约 Sensors.h + LhmSource）。
+// 诚实性重点：每个新组遵守四态模型（Ok/NeedAdmin/
+// NeedDriver/NoHardware），绝不显示伪造的 "Ok + 0" 值；LHM
+// 桥接默认关闭，其迷你 JSON 解析器离线校验。
 #include "selftest/TestFramework.h"
 #include "collect/LhmSource.h"
 #include "collect/Sensors.h"
@@ -21,15 +21,15 @@ bool IsKnownState(State s) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// sensors_extended_honest: the new F3 groups exist and stay honest. Battery is
-// NoHardware on machines without one; network has >=1 Ok adapter; memory is Ok;
-// disk temperature is Ok/NeedAdmin/NoHardware with NO "Ok + 0" anywhere.
+// sensors_extended_honest：新的 F3 组存在且保持诚实。无电池的机器上
+// 电池为 NoHardware；网络有 >=1 个 Ok 适配器；内存为 Ok；
+// 磁盘温度为 Ok/NeedAdmin/NoHardware，任何地方都无 "Ok + 0"。
 // ---------------------------------------------------------------------------
 STM_TEST(sensors_extended_honest) {
     std::wstring serr;
     const stm::SensorSnapshot snap = stm::ReadSensors(&serr);
 
-    // --- cpuCores: non-empty; Ok freq readings > 0; Ok utilization in [0,100].
+    // --- cpuCores：非空；Ok 频率读数 > 0；Ok 利用率在 [0,100]。
     if (snap.cpuCores.empty()) {
         *err = L"cpuCores 为空（应至少包含每核频率读数）";
         return false;
@@ -58,7 +58,7 @@ STM_TEST(sensors_extended_honest) {
         return false;
     }
 
-    // --- gpus: only known states; Ok °C readings must be plausible-positive.
+    // --- gpus：只有已知状态；Ok 摄氏读数必须合理为正。
     for (const stm::SensorReading& r : snap.gpus) {
         if (!IsKnownState(r.state)) {
             *err = L"gpus 出现未知状态";
@@ -78,7 +78,7 @@ STM_TEST(sensors_extended_honest) {
         }
     }
 
-    // --- network: at least one Ok adapter reading (this machine is online).
+    // --- network：至少一条 Ok 适配器读数（本机在线）。
     bool netOk = false;
     for (const stm::SensorReading& r : snap.network) {
         if (!IsKnownState(r.state)) {
@@ -98,8 +98,8 @@ STM_TEST(sensors_extended_honest) {
         return false;
     }
 
-    // --- battery: known states only; a machine WITHOUT a battery must show the
-    //     NoHardware entry instead of fake percentages.
+    // --- battery：只有已知状态；无电池的机器必须给出
+    //     NoHardware 条目而不是伪造百分比。
     if (snap.battery.empty()) {
         *err = L"battery 为空（有电池应给出 Ok 读数，无电池应给出 NoHardware 条目）";
         return false;
@@ -119,7 +119,7 @@ STM_TEST(sensors_extended_honest) {
         }
     }
 
-    // --- memory: physical usage must exist and be Ok with sane percentage.
+    // --- memory：物理用量必须存在且为 Ok、百分比合理。
     bool memOk = false;
     for (const stm::SensorReading& r : snap.memory) {
         if (!IsKnownState(r.state)) {
@@ -136,8 +136,8 @@ STM_TEST(sensors_extended_honest) {
         return false;
     }
 
-    // --- disks: temperature follows the honest trichotomy and NEVER Ok + 0;
-    //     F3 detail fields only appear after a real NVMe log read.
+    // --- disks：温度遵循诚实三分类且绝不 Ok + 0；
+    //     F3 细节字段只在真实 NVMe 日志读取后出现。
     if (snap.disks.empty()) {
         *err = L"disks 为空（本机至少应枚举出一块物理盘）";
         return false;
@@ -163,7 +163,7 @@ STM_TEST(sensors_extended_honest) {
         }
     }
 
-    // --- uptime: a real monotonic value, never 0/negative.
+    // --- 运行时长：真实单调值，绝不为 0/负。
     if (!(snap.uptimeSec > 0.0)) {
         *err = L"uptimeSec 非法（应 >0）";
         return false;
@@ -172,11 +172,11 @@ STM_TEST(sensors_extended_honest) {
 }
 
 // ---------------------------------------------------------------------------
-// lhm_off_by_default: the bridge ships disabled and never touches the network
-// until the user flips the switch.
+// lhm_off_by_default：桥接出厂禁用，用户打开开关前绝不触网。
+//
 // ---------------------------------------------------------------------------
 STM_TEST(lhm_off_by_default) {
-    // Reset to defaults explicitly so this test is order-independent.
+    // 显式重置为默认，使本测试与顺序无关。
     stm::SetLhmOptions(stm::LhmOptions{});
     const stm::LhmOptions o = stm::GetLhmOptions();
     if (o.enabled || o.port != 8085 || o.host != L"127.0.0.1") {
@@ -201,13 +201,13 @@ STM_TEST(lhm_off_by_default) {
 }
 
 // ---------------------------------------------------------------------------
-// lhm_parse_minijson: the built-in mini JSON parser maps an embedded sample
-// data.json (nesting + escapes + units + null value) into SensorReadings.
+// lhm_parse_minijson：内置迷你 JSON 解析器把内嵌的样例
+// data.json（嵌套 + 转义 + 单位 + null 值）映射为 SensorReading。
 // ---------------------------------------------------------------------------
 STM_TEST(lhm_parse_minijson) {
-    // Mirrors the LibreHardwareMonitor remote-web-server schema: nested
-    // Hardware/Children nodes with "Sensor" arrays; one Value carries a
-    // \uXXXX unit suffix, one Text carries an escape, one Value is null.
+    // 镜像 LibreHardwareMonitor 远程 web 服务器模式：嵌套的
+    // Hardware/Children 节点带 "Sensor" 数组；一个 Value 带
+    // \uXXXX 单位后缀，一个 Text 带转义，一个 Value 为 null。
     static const char kSample[] =
         "{\"id\":0,\"Text\":\"LibreHardwareMonitor\",\"Value\":null,\"Children\":["
         "{\"id\":1,\"Text\":\"DESKTOP-F3\",\"Value\":null,\"Children\":["
@@ -268,7 +268,7 @@ STM_TEST(lhm_parse_minijson) {
         return false;
     }
 
-    // Malformed inputs must fail cleanly with no readings.
+    // 畸形输入必须干净失败且无读数。
     const wchar_t* junkCases[] = {L"not json", L"{\"Children\":", L"[1,2,", L"{}extra"};
     for (const wchar_t* why : junkCases) {
         std::vector<stm::SensorReading> junk;
@@ -286,8 +286,8 @@ STM_TEST(lhm_parse_minijson) {
 }
 
 // ---------------------------------------------------------------------------
-// lhm_localhost_only: the red line — the client refuses non-loopback hosts,
-// then restores defaults so other tests see the pristine state.
+// lhm_localhost_only：红线——客户端拒绝非回环主机，
+// 然后恢复默认，让其他测试见到初始状态。
 // ---------------------------------------------------------------------------
 STM_TEST(lhm_localhost_only) {
     stm::LhmOptions o;

@@ -114,7 +114,7 @@ STM_TEST(ui_prockind_classify) {
 // ---------------------------------------------------------------------------
 STM_TEST(ui_proctree_order) {
     std::vector<ProcInfo> procs(8);
-    // 0: idle-ish root (pid 1)
+    // 0：近似空闲的根（pid 1）
     procs[0].key = ProcKey{1, 100};
     // 1..3: 中间层父子链 2 -> 3 -> 4
     procs[1].key = ProcKey{2, 200};  // 根（无父）
@@ -186,7 +186,7 @@ STM_TEST(ui_proctree_order) {
     // 两行都必须输出且提升为根，绝不丢行、绝不死循环。
     std::vector<ProcInfo> cyc(3);
     cyc[0].key = ProcKey{10, 1000};
-    cyc[0].parentPid = 11;  // A -> B
+    cyc[0].parentPid = 11;  // A -> B（成环）
     cyc[1].key = ProcKey{11, 1000};
     cyc[1].parentPid = 10;  // B -> A（环）
     cyc[2].key = ProcKey{12, 1002};

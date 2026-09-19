@@ -5,8 +5,8 @@ namespace stm {
 namespace ui {
 
 namespace {
-constexpr UINT kCallbackMsg = WM_APP + 1;  // arch: tray callback message
-constexpr UINT kIconId = 1;                // single-icon app
+constexpr UINT kCallbackMsg = WM_APP + 1;  // 架构约定：托盘回调消息
+constexpr UINT kIconId = 1;                // 单图标应用
 constexpr int kMenuShow = 1;
 constexpr int kMenuElevate = 2;
 constexpr int kMenuExit = 3;
@@ -29,9 +29,12 @@ void Tray::AddIcon() {
     nid.uID = kIconId;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = callbackMsg_;
-    // No embedded resource yet; the default application icon is acceptable
-    // (taskbar grouping icon likewise, documented limitation).
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // 应用 Logo 图标（LR_SHARED 共享句柄：进程生命周期内有效，无需 DestroyIcon）。
+    nid.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1),
+                                              IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                              GetSystemMetrics(SM_CYSMICON),
+                                              LR_DEFAULTCOLOR | LR_SHARED));
+    if (!nid.hIcon) nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);  // 资源缺失兜底
     tip_ = L"超级任务管理器";
     wcscpy_s(nid.szTip, tip_.c_str());
     if (Shell_NotifyIconW(NIM_ADD, &nid) != FALSE) added_ = true;
@@ -76,7 +79,7 @@ LRESULT Tray::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, b
     (void)wParam;
     *handled = false;
     if (taskbarCreatedMsg_ != 0 && msg == taskbarCreatedMsg_) {
-        // Explorer restarted and rebuilt the tray; re-register the icon.
+        // Explorer 重启并重建了托盘；重新注册图标。
         added_ = false;
         AddIcon();
         *handled = true;
@@ -84,7 +87,7 @@ LRESULT Tray::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, b
     }
     if (msg != callbackMsg_ || !added_) return 0;
     *handled = true;
-    switch (LOWORD(lParam)) {  // legacy icon version: mouse message in lParam low word
+    switch (LOWORD(lParam)) {  // 旧版图标版本：鼠标消息在 lParam 低位字
         case WM_LBUTTONUP:
             if (onToggleWindow) onToggleWindow();
             break;
@@ -106,11 +109,11 @@ void Tray::ShowMenu(HWND hwnd) {
     if (!elevated_) AppendMenuW(menu, MF_STRING, kMenuElevate, L"以管理员身份重启");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
-    // Tray menus require the window in the foreground or they do not dismiss.
+    // 托盘菜单需要窗口处于前台，否则不会消失。
     SetForegroundWindow(hwnd);
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                                    pt.x, pt.y, 0, hwnd, nullptr);
-    PostMessageW(hwnd, WM_NULL, 0, 0);  // let the menu close reliably
+    PostMessageW(hwnd, WM_NULL, 0, 0);  // 让菜单可靠关闭
     DestroyMenu(menu);
     switch (cmd) {
         case kMenuShow:

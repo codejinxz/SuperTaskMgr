@@ -1,18 +1,18 @@
-// Startup items from four sources + enable/disable with backup-first writes
-// (contract ops/StartupOps.h; arch section 9 reversibility; R5 rows 14a-14d).
+// 四来源启动项 + 先备份后写入的启用/禁用
+//（契约 ops/StartupOps.h；架构第 9 节可逆性；R5 表行 14a-14d）。
 //
-// Sources: registry Run/RunOnce (+WOW6432Node as RegRun32), startup folders (.lnk),
-// logon/boot-triggered scheduled tasks (Task Scheduler COM), UWP StartupTask State
-// values. Disable state lives in the undocumented StartupApproved\{Run,Run32,
-// StartupFolder} binary values (12 bytes, odd low byte = disabled, R5 14a2) — the
+// 来源：注册表 Run/RunOnce（+ WOW6432Node 即 RegRun32）、启动文件夹（.lnk）、
+// 登录/开机触发计划任务（任务计划 COM）、UWP StartupTask State 值。
+// 禁用状态存于未公开的 StartupApproved\{Run,Run32,
+// StartupFolder} 二进制值（12 字节，低位奇字节 = 禁用，R5 14a2）——
 // write-back semantics are community-verified only, hence the 实验性 log marker
-// (R5 table B #1). Every toggle backs the ORIGINAL value up to
-// %LOCALAPPDATA%\SuperTaskMgr\startup_backup\<sanitized-id>.txt BEFORE writing;
-// a backup failure refuses the write.
+//（R5 表 B #1）。每次切换都先把原值备份到
+// %LOCALAPPDATA%\SuperTaskMgr\startup_backup\<净化 id>.txt 之后再写入；
+// 备份失败则拒绝写入。
 //
-// Threading: contract functions run on the ops job thread — COM (shell links, task
-// scheduler) is initialized COINIT_APARTMENTTHREADED per call and paired with
-// CoUninitialize on scope exit (arch section 5 resource charter).
+// 线程：契约函数在 ops 任务线程上运行——COM（shell 链接、任务计划）
+// 按调用初始化 COINIT_APARTMENTTHREADED，并在作用域退出时
+// 配对 CoUninitialize（架构第 5 节资源章程）。
 #include "ops/StartupOps.h"
 #include "core/Err.h"
 #include "core/FsUtil.h"
@@ -46,9 +46,9 @@ constexpr wchar_t kUwpDisplayNameBase[] =
     L"Software\\Classes\\Extensions\\ContractId\\Windows.StartupTask\\PackageId";
 constexpr int kMaxTaskFolderDepth = 8;
 
-// ---------------- RAII helpers (resource charter) ----------------
+// ---------------- RAII 辅助（资源章程）----------------
 
-// HKEY needs RegCloseKey (not CloseHandle) => dedicated typed RAII wrapper.
+// HKEY 需要 RegCloseKey（而非 CloseHandle）=> 专用类型化 RAII 包装。
 class RegKey {
 public:
     RegKey() = default;
@@ -82,8 +82,8 @@ struct CoTaskMemGuard {
     ~CoTaskMemGuard() { ::CoTaskMemFree(p); }
 };
 
-// Pairing guard: S_FALSE (already initialized) still requires the matching
-// CoUninitialize, hence SUCCEEDED() and not S_OK.
+// 配对护栏：S_FALSE（已初始化）仍需要配对的
+// CoUninitialize，因此用 SUCCEEDED() 而非 S_OK。
 class ComStaGuard {
 public:
     ComStaGuard() : hr_(::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)) {}
@@ -112,7 +112,7 @@ private:
     T* p_ = nullptr;
 };
 
-// ---------------- small utilities ----------------
+// ---------------- 小工具 ----------------
 
 std::wstring HivePrefix(HKEY root) { return root == HKEY_LOCAL_MACHINE ? L"HKLM" : L"HKCU"; }
 
@@ -136,7 +136,7 @@ uint64_t Fnv1a(const std::wstring& s) {
     return h;
 }
 
-// File-name-safe backup id; very long ids are tail-truncated with an FNV-1a marker.
+// 文件名安全的备份 id；过长 id 尾部截断并加 FNV-1a 标记。
 std::wstring SanitizeId(const std::wstring& id) {
     std::wstring s;
     s.reserve(id.size());
@@ -198,9 +198,9 @@ std::vector<std::wstring> EnumSubKeys(HKEY root, const std::wstring& path) {
     return out;
 }
 
-// StartupApproved state, tri-state: 1 = disabled (odd low byte, R5 14a2), 0 = enabled,
-// -1 = no value (default enabled). Both hives are consulted (task manager honours the
-// user value even for HKLM entries) — any disabled wins.
+// StartupApproved 状态，三态：1 = 禁用（低位奇字节，R5 14a2），0 = 启用，
+// -1 = 无值（默认启用）。两个配置单元都查（任务管理器对 HKLM 项也
+// 尊重用户值）——任一禁用即禁用。
 int ApprovedStateAny(const wchar_t* leaf, const std::wstring& valueName) {
     const std::wstring sub = std::wstring(kApprovedBase) + L"\\" + leaf;
     const int a = [&] {
@@ -228,8 +228,8 @@ std::wstring FileTitle(const std::wstring& fileName) {
     return dot == std::wstring::npos ? fileName : fileName.substr(0, dot);
 }
 
-// Local-time tag for backup file names (review V9 P1-2): every toggle gets its own
-// file so repeated toggles keep the whole reversibility chain (arch section 9).
+// 备份文件名的本地时间标记（评审 V9 P1-2）：每次切换都有自己的
+// 文件，重复切换保留完整可逆链（架构第 9 节）。
 std::wstring LocalTimestamp() {
     SYSTEMTIME st{};
     ::GetLocalTime(&st);
@@ -247,10 +247,10 @@ bool WriteTextFileUtf8(const std::wstring& path, const std::string& content) {
     return ok && closed;
 }
 
-// Dumps "registry path + value name + original raw bytes (hex) + direction" before any
-// write. Timestamped file name keeps every toggle's backup (review V9 P1-2 — a fixed
-// name would let a second toggle overwrite the original backup and break reversibility).
-// Returns false (=> caller refuses the write) when the backup cannot be persisted.
+// 在任何写入之前导出 "注册表路径 + 值名 + 原始字节（十六进制）+ 方向"。
+// 带时间戳的文件名保留每次切换的备份（评审 V9 P1-2——固定
+// 文件名会让第二次切换覆盖原备份、破坏可逆性）。
+// 备份无法持久化时返回 false（=> 调用方拒绝写入）。
 bool WriteBackup(const std::wstring& id, const std::wstring& fullPath,
                  const std::wstring& valueName, const RegValue& orig, bool enable,
                  std::wstring* backupPath, std::wstring* err) {
@@ -275,9 +275,9 @@ bool WriteBackup(const std::wstring& id, const std::wstring& fullPath,
     return true;
 }
 
-// Review V9 P1-1: the TASK_UPDATE re-register fallback is destructive (fires
-// registration triggers, may reset custom ACLs), so the task's XML definition is
-// exported first under the same directory/naming rules; failure refuses the write.
+// 评审 V9 P1-1：TASK_UPDATE 重注册兜底是破坏性的（触发注册
+// 触发器、可能重置自定义 ACL），因此先把任务的 XML 定义按相同
+// 目录/命名规则导出；失败则拒绝写入。
 bool WriteTaskXmlBackup(const std::wstring& id, const std::wstring& xml, bool enable,
                         std::wstring* backupPath, std::wstring* err) {
     const std::wstring dir = stm::LocalAppDataRoot() + L"\\startup_backup";
@@ -300,7 +300,7 @@ bool WriteTaskXmlBackup(const std::wstring& id, const std::wstring& xml, bool en
     return true;
 }
 
-// ---------------- source A: registry Run / RunOnce (+WOW6432Node) ----------------
+// ---------------- 来源 A：注册表 Run / RunOnce（+ WOW6432Node）----------------
 
 void EnumRunKey(HKEY root, const wchar_t* subkey, StartupSource src, const wchar_t* approvedLeaf,
                 bool canToggle, std::vector<StartupItem>* out) {
@@ -346,7 +346,7 @@ void EnumRunKey(HKEY root, const wchar_t* subkey, StartupSource src, const wchar
     }
 }
 
-// ---------------- source B: startup folders (.lnk) ----------------
+// ---------------- 来源 B：启动文件夹（.lnk）----------------
 
 std::wstring ResolveLnkTarget(const std::wstring& lnkPath) {
     ComPtr<IShellLinkW> link;
@@ -372,7 +372,7 @@ void EnumStartupFolder(bool common, bool canToggle, std::vector<StartupItem>* ou
     WIN32_FIND_DATAW fd{};
     UniqueFind find(::FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd,
                                        FindExSearchNameMatch, nullptr, 0));
-    if (!find) return;  // missing/empty folder is normal, not an error
+    if (!find) return;  // 文件夹缺失/为空是常态，不是错误
     do {
         if (fd.cFileName[0] == L'.') continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -384,7 +384,7 @@ void EnumStartupFolder(bool common, bool canToggle, std::vector<StartupItem>* ou
         it.source = StartupSource::StartupFolder;
         it.id = dir + L"\\" + fileName;
         it.name = FileTitle(fileName);
-        it.command = ResolveLnkTarget(it.id);  // best-effort; empty when unresolvable
+        it.command = ResolveLnkTarget(it.id);  // 尽力而为；解析不了为空
         it.location = dir;
         it.enabled = ApprovedStateAny(L"StartupFolder", fileName) != 1;
         it.canToggle = canToggle;
@@ -392,15 +392,15 @@ void EnumStartupFolder(bool common, bool canToggle, std::vector<StartupItem>* ou
     } while (::FindNextFileW(find.get(), &fd));
 }
 
-// ---------------- source C: scheduled tasks (logon/boot triggers) ----------------
+// ---------------- 来源 C：计划任务（登录/开机触发）----------------
 
-// Extracts the EXEC action's program path; empty when absent or non-EXEC.
+// 提取 EXEC 动作的程序路径；缺失或非 EXEC 时为空。
 std::wstring TaskExecCommand(ITaskDefinition* def) {
     ComPtr<IActionCollection> actions;
     if (FAILED(def->get_Actions(actions.Put()))) return {};
     LONG count = 0;
     if (FAILED(actions->get_Count(&count))) return {};
-    for (LONG i = 1; i <= count; ++i) {  // taskschd collections are 1-based
+    for (LONG i = 1; i <= count; ++i) {  // taskschd 集合从 1 开始
         ComPtr<IAction> action;
         if (FAILED(actions->get_Item(i, action.Put()))) continue;
         TASK_ACTION_TYPE type{};
@@ -447,7 +447,7 @@ void AddTaskIfLogonBoot(IRegisteredTask* task, bool canToggleAll, std::vector<St
     it.location = slash == std::wstring::npos ? L"\\" : taskPath.substr(0, slash);
     it.command = TaskExecCommand(def.get());
     it.enabled = enabled != VARIANT_FALSE;
-    // System-folder (\Microsoft\...) task definitions typically need admin to change.
+    // 系统文件夹（\Microsoft\...）的任务定义通常需要管理员才能改。
     it.canToggle = canToggleAll ||
                    _wcsnicmp(taskPath.c_str(), L"\\Microsoft\\", 12) != 0;
     out->push_back(std::move(it));
@@ -460,7 +460,7 @@ void WalkTaskFolder(ITaskFolder* folder, int depth, bool canToggleAll,
     if (SUCCEEDED(folder->GetTasks(TASK_ENUM_HIDDEN, tasks.Put()))) {
         LONG count = 0;
         if (SUCCEEDED(tasks->get_Count(&count))) {
-            for (LONG i = 1; i <= count; ++i) {  // 1-based VARIANT index
+            for (LONG i = 1; i <= count; ++i) {  // VARIANT 索引从 1 开始
                 VARIANT vi;
                 ::VariantInit(&vi);
                 vi.vt = VT_I4;
@@ -476,7 +476,7 @@ void WalkTaskFolder(ITaskFolder* folder, int depth, bool canToggleAll,
     if (SUCCEEDED(folder->GetFolders(0, subs.Put()))) {
         LONG count = 0;
         if (SUCCEEDED(subs->get_Count(&count))) {
-            for (LONG i = 1; i <= count; ++i) {  // 1-based VARIANT index
+            for (LONG i = 1; i <= count; ++i) {  // VARIANT 索引从 1 开始
                 VARIANT vi;
                 ::VariantInit(&vi);
                 vi.vt = VT_I4;
@@ -516,13 +516,13 @@ bool EnumScheduledTasks(bool elevated, std::vector<StartupItem>* out, std::wstri
     return true;
 }
 
-// ---------------- source D: UWP StartupTask State values ----------------
+// ---------------- 来源 D：UWP StartupTask State 值 ----------------
 
-// Best-effort display name: the registered StartupTask contract extension carries a
-// DisplayName for some packages; fall back to the PFN's package-name segment.
+// 尽力而为的显示名：已注册 StartupTask 契约扩展对部分包带有
+// DisplayName；否则回退 PFN 的包名段。
 std::wstring UwpDisplayName(const std::wstring& pfn) {
     const std::wstring base = std::wstring(kUwpDisplayNameBase) + L"\\" + pfn;
-    // Value "DisplayName" directly under the PFN key first...
+    // 先找 PFN 键直下的 "DisplayName" 值……
     const RegValue direct = ReadRegBytes(HKEY_CURRENT_USER, base, L"DisplayName");
     if (direct.exists && direct.data.size() >= sizeof(wchar_t) &&
         direct.data.size() % sizeof(wchar_t) == 0) {
@@ -549,7 +549,7 @@ void EnumUwpStartup(std::vector<StartupItem>* out) {
         const std::wstring pfnPath = std::wstring(kUwpBase) + L"\\" + pfn;
         for (const std::wstring& taskId : EnumSubKeys(HKEY_CURRENT_USER, pfnPath)) {
             const RegValue state = ReadRegBytes(HKEY_CURRENT_USER, pfnPath + L"\\" + taskId, L"State");
-            if (!state.exists || state.data.size() < sizeof(DWORD)) continue;  // not a startup task
+            if (!state.exists || state.data.size() < sizeof(DWORD)) continue;  // 不是启动任务
             const DWORD stateVal = *reinterpret_cast<const DWORD*>(state.data.data());
             StartupItem it;
             it.source = StartupSource::UwpStartupTask;
@@ -557,15 +557,15 @@ void EnumUwpStartup(std::vector<StartupItem>* out) {
             it.name = UwpDisplayName(pfn);
             it.command = pfn + L"\\" + taskId;
             it.location = pfn;
-            // StartupTaskState mapping (R5 14d): 2 = enabled; 0/1/3/4 = disabled semantics.
+            // StartupTaskState 映射（R5 14d）：2 = 启用；0/1/3/4 = 禁用语义。
             it.enabled = stateVal == 2;
-            it.canToggle = true;  // HKCU write, normal user rights
+            it.canToggle = true;  // HKCU 写入，普通用户权限
             out->push_back(std::move(it));
         }
     }
 }
 
-// ---------------- SetStartupEnabled: per-source writers ----------------
+// ---------------- SetStartupEnabled：按来源写入器 ----------------
 
 bool ParseRegId(const std::wstring& id, HKEY* root, std::wstring* body) {
     if (id.rfind(L"HKCU\\", 0) == 0) {
@@ -581,8 +581,8 @@ bool ParseRegId(const std::wstring& id, HKEY* root, std::wstring* body) {
     return false;
 }
 
-// The id embeds "<keypath>\<valueName>"; value names may legally contain '\', so the
-// split point is resolved by re-querying candidates right-to-left against the live key.
+// id 内嵌 "<键路径>\<值名>"；值名合法时可包含 '\'，因此
+// 通过对候选切分点从右向左对真实键复查来定位。
 bool ResolveValueSplit(HKEY root, const std::wstring& body, std::wstring* keyPath,
                        std::wstring* valueName) {
     size_t cut = body.rfind(L'\\');
@@ -596,17 +596,17 @@ bool ResolveValueSplit(HKEY root, const std::wstring& body, std::wstring* keyPat
         }
         cut = cut == 0 ? std::wstring::npos : body.rfind(L'\\', cut - 1);
     }
-    cut = body.rfind(L'\\');  // fall back to the plain last-segment split
+    cut = body.rfind(L'\\');  // 回退到普通的最后一段切分
     if (cut == std::wstring::npos) return false;
     *keyPath = body.substr(0, cut);
     *valueName = body.substr(cut + 1);
     return true;
 }
 
-// Shared approved-value writer: backs the ORIGINAL bytes up, then writes the 12-byte
-// state (0x03 + now-FILETIME = disabled; 0x02 + zero timestamp = enabled).
-// Experimental marker: Explorer recognition of written values is community-verified
-// only (R5 table B #1) — logged, never hidden.
+// 共享的 approved 值写入器：先备份原始字节，再写 12 字节状态
+//（0x03 + 当前 FILETIME = 禁用；0x02 + 零时间戳 = 启用）。
+// 实验性标记：Explorer 对写入值的识别仅有社区验证
+//（R5 表 B #1）——记日志，绝不隐瞒。
 bool WriteApprovedValue(HKEY root, const wchar_t* leaf, const std::wstring& valueName,
                         const std::wstring& idForBackup, bool enable, const wchar_t* kindLabel,
                         std::wstring* err) {
@@ -741,23 +741,23 @@ bool ToggleScheduledTask(const StartupItem& item, bool enable, std::wstring* err
         if (err) err->clear();
         return true;
     }
-    // Fallback (R5 14c / table B #5): put_Enabled may be unavailable in C++ — rewrite
-    // the definition's settings and re-register with TASK_UPDATE.
-    // Review V9 P1-1 hardening, applied in order:
-    //  1. unsupported principal logon types are REFUSED before anything happens —
-    //     re-registering PASSWORD/S4U/GROUP tasks with empty user/password variants
-    //     succeeds but silently produces a task that never runs (documented);
-    //  2. the original task XML is exported to startup_backup (same naming rules);
-    //     a backup failure refuses the modification;
-    //  3. the original Principal.LogonType is passed through untouched (never a
-    //     hardcoded value), so SYSTEM/service-account/interactive tasks keep their
-    //     identity; TASK_UPDATE may fire registration triggers — hence step 2.
+    // 兜底（R5 14c / 表 B #5）：put_Enabled 在 C++ 中可能不可用——改写
+    // 定义的设置并以 TASK_UPDATE 重注册。
+    // 评审 V9 P1-1 加固，按序执行：
+    //  1. 不支持的主体验证类型在任何动作发生前即被拒绝——
+    //     用空用户/口令变体重注册 PASSWORD/S4U/GROUP 任务
+    //     会"成功"但静默产出一个永不运行的任务（有文档）；
+    //  2. 原任务 XML 导出至 startup_backup（相同命名规则）；
+    //     备份失败则拒绝修改；
+    //  3. 原 Principal.LogonType 原样透传（绝不用硬编码值），
+    //     使 SYSTEM/服务账户/交互任务保有其身份；
+    //     TASK_UPDATE 可能触发注册触发器——因此有第 2 步。
     ComPtr<ITaskDefinition> def;
     if (FAILED(task->get_Definition(def.Put()))) {
         if (err) *err = L"修改计划任务失败：读取任务定义失败：" + item.id;
         return false;
     }
-    ComPtr<IPrincipal> principal;  // taskschd.h names the C++ interface IPrincipal
+    ComPtr<IPrincipal> principal;  // taskschd.h 中 C++ 接口名为 IPrincipal
     TASK_LOGON_TYPE logon = TASK_LOGON_NONE;
     if (FAILED(def->get_Principal(principal.Put())) ||
         FAILED(principal->get_LogonType(&logon))) {
@@ -765,14 +765,14 @@ bool ToggleScheduledTask(const StartupItem& item, bool enable, std::wstring* err
         return false;
     }
     bool logonRoundTrips = false;
-    switch (logon) {  // only types that survive an empty user/password re-register
+    switch (logon) {  // 只有经得起空用户/口令重注册的类型
         case TASK_LOGON_NONE:
         case TASK_LOGON_INTERACTIVE_TOKEN:
         case TASK_LOGON_SERVICE_ACCOUNT:
         case TASK_LOGON_INTERACTIVE_TOKEN_OR_PASSWORD:
             logonRoundTrips = true;
             break;
-        default:  // PASSWORD(1) / S4U(2) / GROUP(4) / future values
+        default:  // PASSWORD(1) / S4U(2) / GROUP(4) / 未来取值
             break;
     }
     if (!logonRoundTrips) {
@@ -807,7 +807,7 @@ bool ToggleScheduledTask(const StartupItem& item, bool enable, std::wstring* err
                                                       empty, empty, logon, sddl,
                                                       reReg.Put());
     if (FAILED(hr)) {
-        if (hr == static_cast<HRESULT>(0x80070005u)) {  // E_ACCESSDENIED as HRESULT
+        if (hr == static_cast<HRESULT>(0x80070005u)) {  // 以 HRESULT 表示的 E_ACCESSDENIED
             if (err) {
                 *err = L"修改计划任务失败：需要管理员权限（0x" +
                        stm::Fmt(L"{:08X}", static_cast<uint32_t>(hr)) + L"）";
@@ -836,7 +836,7 @@ bool ToggleUwpState(const StartupItem& item, bool enable, std::wstring* err) {
         if (err) *err = L"无法识别的 UWP 启动项标识：" + item.id;
         return false;
     }
-    const std::wstring keyPath = body.substr(0, body.size() - 6);  // drop "\State"
+    const std::wstring keyPath = body.substr(0, body.size() - 6);  // 去掉 "\State" 后缀
     const std::wstring valueName = L"State";
 
     const RegValue orig = ReadRegBytes(root, keyPath, valueName);
@@ -850,7 +850,7 @@ bool ToggleUwpState(const StartupItem& item, bool enable, std::wstring* err) {
     if (!WriteBackup(item.id, item.id, valueName, orig, enable, &backupPath, err)) {
         return false;
     }
-    const DWORD next = enable ? 2 : 0;  // StartupTaskState: Enabled=2 / Disabled=0
+    const DWORD next = enable ? 2 : 0;  // StartupTaskState：Enabled=2 / Disabled=0
     if (::RegSetValueExW(key.get(), valueName.c_str(), 0, REG_DWORD,
                          reinterpret_cast<const BYTE*>(&next), sizeof(next)) != ERROR_SUCCESS) {
         if (err) *err = stm::ErrContext(L"写入 UWP 启动项状态失败", stm::LastHr());
@@ -869,8 +869,8 @@ std::vector<StartupItem> EnumStartupItems(std::wstring* err) {
     std::wstring sourceErrs;
     const bool elevated = stm::IsProcessElevated();
 
-    // COM is needed for shell-link resolution and the Task Scheduler; pair init/uninit
-    // per call on the calling (job) thread.
+    // shell 链接解析与任务计划需要 COM；在调用（任务）线程上
+    // 按调用配对初始化/反初始化。
     ComStaGuard com;
     if (!com.Ok()) sourceErrs += L"COM 初始化失败，启动文件夹与计划任务源不可用；";
 

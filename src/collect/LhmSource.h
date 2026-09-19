@@ -1,14 +1,14 @@
 #pragma once
-// F3 contract addition (2026-09-18, registered with the architect): OPTIONAL
-// LibreHardwareMonitor (LHM) bridge, OFF by default. LHM ships its own kernel
-// driver stack; we never distribute or load one (red line). When the USER runs
-// LHM and enables its remote web server (default http://127.0.0.1:8085/data.json),
-// this module polls it as a localhost-only HTTP CLIENT:
-//   - WinHTTP is bound dynamically (no new link dependency);
-//   - loopback addresses only, 1 s timeouts, synchronous one-shot calls;
-//   - NO persistent thread is ever spawned (poll happens on caller demand);
-//   - every mapped reading is tagged ［LHM］ and reuses the Sensors.h
-//     four-state honesty model (unparseable value => NoHardware, never 0).
+// F3 契约新增（2026-09-18，已向架构登记）：可选的
+// LibreHardwareMonitor（LHM）桥接，默认关闭。LHM 自带内核驱动栈；
+// 我们绝不分发或加载任何驱动（红线）。当用户自行运行 LHM
+// 并启用其远程 web 服务器（默认 http://127.0.0.1:8085/data.json）时，
+// 本模块以仅限本机的 HTTP 客户端身份轮询它：
+//   - WinHTTP 动态绑定（不新增链接依赖）；
+//   - 仅回环地址，1s 超时，同步一次性调用；
+//   - 绝不创建常驻线程（轮询按调用方需求进行）；
+//   - 每条映射读数都带 ［LHM］ 标记，并复用 Sensors.h 的
+//     四态诚实模型（无法解析的值 => NoHardware，绝不给 0）。
 // Connection failure => false + *err (UI shows "未检测到 LibreHardwareMonitor
 // 数据源"); options are process-global and thread-safe.
 #include <cstdint>
@@ -20,24 +20,24 @@
 namespace stm {
 
 struct LhmOptions {
-    bool enabled = false;              // default OFF: no network traffic unless the user opts in
-    uint16_t port = 8085;              // LHM remote web server default port
-    std::wstring host = L"127.0.0.1";  // loopback only; enforced again inside PollLhm
+    bool enabled = false;              // 默认关：用户不选择就不产生网络流量
+    uint16_t port = 8085;              // LHM 远程 web 服务器默认端口
+    std::wstring host = L"127.0.0.1";  // 仅回环；PollLhm 内部会再次强制
 };
 
-void SetLhmOptions(const LhmOptions& options);  // thread-safe
-LhmOptions GetLhmOptions();                     // thread-safe
+void SetLhmOptions(const LhmOptions& options);  // 线程安全
+LhmOptions GetLhmOptions();                     // 线程安全
 
-// One synchronous poll of <host>:<port>/data.json. Never spawns threads and
-// never blocks longer than the ~1 s HTTP timeouts. On success fills *out with
-// SensorReading items (label = LHM node path, value/unit parsed from the Value
-// text, every label suffixed with ［LHM］). On failure returns false, fills
-// *err and leaves *out empty.
+// 对 <host>:<port>/data.json 的一次同步轮询。绝不创建线程，
+// 阻塞不超过约 1s 的 HTTP 超时。成功时用 SensorReading 条目填充 *out
+//（label = LHM 节点路径，value/unit 解析自 Value 文本，
+// 每个 label 都带 ［LHM］ 后缀）。失败时返回 false，
+// 设置 *err 并保持 *out 为空。
 bool PollLhm(std::vector<SensorReading>* out, std::wstring* err);
 
-// Parser only (no network): minimal recursive JSON for LHM data.json trees
-// (nested Text/Value/Sensor/Hardware nodes; strings with escapes, numbers,
-// booleans, null). Exposed for the selftest; returns false on malformed input.
+// 仅解析（无网络）：面向 LHM data.json 树的最小递归 JSON 解析
+//（嵌套 Text/Value/Sensor/Hardware 节点；字符串含转义、数字、
+// 布尔、null）。为 selftest 导出；输入畸形时返回 false。
 bool ParseLhmJson(const std::string& utf8, std::vector<SensorReading>* out);
 
 }  // namespace stm

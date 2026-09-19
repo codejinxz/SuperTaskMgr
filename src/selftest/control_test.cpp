@@ -1,9 +1,9 @@
-// Phase-6 control ops + crash log smoke tests (contracts ops/ProcessControl.h /
-// ops/CrashLog.h). Everything here is designed to pass WITHOUT elevation: all
-// process-control ops act on our own child process only, and the crash-log query
-// reads the classic Application/System channels which are open to non-admin.
-// Environment-restricted paths are skipped with an [info] note, never asserted
-// (arch section 7 permission matrix, same policy as ops_test/ops3_test).
+// 第 6 阶段控制操作 + 崩溃日志冒烟测试（契约 ops/ProcessControl.h /
+// ops/CrashLog.h）。这里一切都被设计为无需提权即可通过：所有
+// 进程控制操作只作用于我们自己的子进程，崩溃日志查询
+// 读取对非管理员开放的经典 Application/System 通道。
+// 受环境限制的路径以 [info] 说明跳过，绝不断言
+//（架构第 7 节权限矩阵，与 ops_test/ops3_test 同一策略）。
 #include "selftest/TestFramework.h"
 #include "core/Err.h"
 #include "core/HandleGuard.h"
@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
-// export for tests (defined in ops/CrashLog.cpp, deliberately absent from the frozen
-// contract header): pure XML -> CrashEvent re-parse of a captured EvtRender blob.
-// selftest links stm_ops, so this free function resolves there.
+// 供测试导出（定义于 ops/CrashLog.cpp，刻意不在冻结契约头中）：
+// 对捕获的 EvtRender 文本块做纯 XML -> CrashEvent 再解析。
+// selftest 链接 stm_ops，该自由函数在那里解析。
 namespace stm {
 namespace ops {
 void ParseEventXml(const std::wstring& xml, CrashEvent* out);
@@ -30,10 +30,10 @@ namespace {
 
 constexpr uint64_t kFileTime1Sec = 10'000'000ull;
 
-// --- real-machine fixtures (EvtRender XML, captured by the architect; trimmed to the
-// fields under test but faithful: single-quoted attributes, &#xA; entities) --------
+// --- 真机样例（EvtRender XML，架构师捕获；裁剪到被测字段
+// 但保持真实：单引号属性、&#xA; 实体）--------
 
-// Form A: WER "Application Error", named Data fields.
+// 形态 A：WER "Application Error"，具名 Data 字段。
 const wchar_t* kWerNamed1000Xml =
     L"<Event><System>"
     L"<Provider Name='Application Error'/>"
@@ -47,8 +47,8 @@ const wchar_t* kWerNamed1000Xml =
     L"<Data Name='FaultingModulePath'>C:\\Windows\\System32\\ntdll.dll</Data>"
     L"</EventData></Event>";
 
-// Form B: ".NET Runtime", one unnamed free-text Data blob with &#xA; line breaks
-// and no milliseconds in SystemTime (both tolerated by design).
+// 形态 B：".NET Runtime"，一条无名自由文本 Data 块，带 &#xA; 换行，
+// 且 SystemTime 无毫秒（两者设计上都容忍）。
 const wchar_t* kDotNetBlobXml =
     L"<Event><System>"
     L"<Provider Name='.NET Runtime'/>"
@@ -63,7 +63,7 @@ const wchar_t* kDotNetBlobXml =
     L"System.DivideByZeroException</Data>"
     L"</EventData></Event>";
 
-// EventID 1002 "Application Hang", named fields (real machine sample).
+// EventID 1002 "Application Hang"，具名字段（真机样本）。
 const wchar_t* kHang1002Xml =
     L"<Event><System>"
     L"<Provider Name='Application Hang'/>"
@@ -104,9 +104,9 @@ uint32_t FindPidByName(const wchar_t* name) {
     return 0;
 }
 
-// Child process shared by the control tests: cmd.exe parked on a ~20 s ping so the
-// suspend/resume/priority/affinity ops always act on a live, self-owned target.
-// On success *proc/*thread are RAII-guarded; KillChild reaps it deterministically.
+// 控制测试共享的子进程：cmd.exe 停在约 20s 的 ping 上，
+// 使挂起/恢复/优先级/亲和性操作始终作用于存活且归我们所有的目标。
+// 成功时 *proc/*thread 由 RAII 保护；KillChild 确定性地回收它。
 bool LaunchChild(PROCESS_INFORMATION* pi, std::wstring* err) {
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -134,9 +134,9 @@ bool ChildAlive(HANDLE proc) { return WaitForSingleObject(proc, 0) == WAIT_TIMEO
 
 }  // namespace
 
-// Suspend -> still alive -> resume -> still alive -> cleanup. The suspended flag is
-// cross-checked via GetProcessControlInfo when the NtQSI check is available (info only:
-// thread exit races make a hard assertion flaky for a multi-threaded cmd.exe).
+// 挂起 -> 仍存活 -> 恢复 -> 仍存活 -> 清理。suspended 标志在
+// NtQSI 检查可用时经 GetProcessControlInfo 交叉核对（仅作信息：
+// 线程退出竞争会让对多线程 cmd.exe 的硬断言不稳定）。
 STM_TEST(ctrl_suspend_resume_roundtrip) {
     PROCESS_INFORMATION pi{};
     std::wstring e;
@@ -147,7 +147,7 @@ STM_TEST(ctrl_suspend_resume_roundtrip) {
     const stm::ProcKey key = KeyOf(pi);
 
     bool ok = false;
-    for (;;) {  // single-shot loop: break = cleanup point
+    for (;;) {  // 单次循环：break = 清理点
         if (!stm::ops::SuspendProcess(key, &e)) { e = L"SuspendProcess 失败：" + e; break; }
         if (!ChildAlive(pi.hProcess)) { e = L"挂起后子进程不应退出"; break; }
 
@@ -175,7 +175,7 @@ STM_TEST(ctrl_suspend_resume_roundtrip) {
     return true;
 }
 
-// SetPriorityClass(BelowNormal) must be reflected by GetPriorityClass, then restored.
+// SetPriorityClass(BelowNormal) 必须被 GetPriorityClass 反映，随后恢复。
 STM_TEST(ctrl_priority_readback) {
     PROCESS_INFORMATION pi{};
     std::wstring e;
@@ -198,7 +198,7 @@ STM_TEST(ctrl_priority_readback) {
                          static_cast<uint32_t>(BELOW_NORMAL_PRIORITY_CLASS));
             break;
         }
-        // restore before judging the restore result itself
+        // 在评判恢复结果本身之前先恢复
         if (!stm::ops::SetProcPriority(key, stm::ops::ProcPriority::Normal, &e)) {
             e = L"恢复 Normal 优先级失败：" + e;
             break;
@@ -221,8 +221,8 @@ STM_TEST(ctrl_priority_readback) {
     return true;
 }
 
-// Affinity round-trip on the child: read system mask, clear one core (keeping at least
-// one), set, read back, restore.
+// 子进程亲和性往返：读系统掩码，清掉一个核（至少保留一个），
+// 设置、读回、恢复。
 STM_TEST(ctrl_affinity_roundtrip) {
     PROCESS_INFORMATION pi{};
     std::wstring e;
@@ -244,9 +244,9 @@ STM_TEST(ctrl_affinity_roundtrip) {
         for (unsigned b = 0; b < 64; ++b) {
             if (sys & (1ull << b)) { clearBit = b; break; }
         }
-        target = sys & ~(1ull << clearBit);  // drop the LOWEST set core: rest stays
+        target = sys & ~(1ull << clearBit);  // 去掉最低的置位核：其余保持
         if (target == 0) {
-            // single-core machine: nothing safe to remove => env skip with cleanup
+            // 单核机器：没有可安全移除的 => 环境跳过并清理
             printf("  [info] 单核环境（systemAffinity=0x%llX），跳过亲和性往返\n",
                    static_cast<unsigned long long>(sys));
             ok = true;
@@ -285,11 +285,11 @@ STM_TEST(ctrl_affinity_roundtrip) {
     return true;
 }
 
-// Protection gate covers suspend too: csrss.exe must be refused by name before any
-// handle is opened. Refusal path only — nothing is ever suspended here.
+// 保护闸门同样覆盖挂起：csrss.exe 必须在任何句柄打开前
+// 按名称被拒绝。只走拒绝路径——这里绝不真的挂起任何东西。
 STM_TEST(ctrl_protected_suspend_refusal) {
     const uint32_t pid = FindPidByName(L"csrss.exe");
-    if (pid == 0) return true;  // exotic environment without csrss: skip silently
+    if (pid == 0) return true;  // 无 csrss 的特殊环境：静默跳过
     const stm::ProcKey key{pid, CreateTimeOf(pid)};
     std::wstring e;
     if (stm::ops::SuspendProcess(key, &e)) {
@@ -303,8 +303,8 @@ STM_TEST(ctrl_protected_suspend_refusal) {
     return true;
 }
 
-// Dead identity: a ProcKey that never existed must be refused by every mutating op
-// with the protocol message (never act on a pid alone).
+// 死身份：从未存在的 ProcKey 必须被每个变更操作以协议消息拒绝
+//（绝不只凭 pid 行动）。
 STM_TEST(ctrl_identity_dead_pid) {
     const stm::ProcKey dead{0xFFFFFFu, 1};
     std::wstring e;
@@ -352,8 +352,8 @@ STM_TEST(ctrl_identity_dead_pid) {
     return true;
 }
 
-// Form A (WER, named Data): app/module map by field name; provider decides the
-// headline; ISO-8601 with fraction + Z parses to exact unix seconds.
+// 形态 A（WER，具名 Data）：app/module 按字段名映射；标题由
+// 提供程序决定；带小数 + Z 的 ISO-8601 解析出精确 Unix 秒。
 STM_TEST(crashlog_parse_wer_named) {
     stm::ops::CrashEvent ev;
     stm::ops::ParseEventXml(kWerNamed1000Xml, &ev);
@@ -369,7 +369,7 @@ STM_TEST(crashlog_parse_wer_named) {
         *err = stm::Fmt(L"level={}，期望 2", ev.level);
         return false;
     }
-    if (ev.unixTime != 1789648496) {  // 2026-09-17T12:34:56Z
+    if (ev.unixTime != 1789648496) {  // 2026-09-17T12:34:56Z（预期时刻）
         *err = stm::Fmt(L"unixTime={}，期望 1789648496", ev.unixTime);
         return false;
     }
@@ -388,9 +388,9 @@ STM_TEST(crashlog_parse_wer_named) {
     return true;
 }
 
-// Form B (.NET Runtime, unnamed blob): summary takes the first non-empty line, and
-// app/module come from the text heuristics (first *.exe; *.dll after "faulting
-// module", case-insensitive).
+// 形态 B（.NET Runtime，无名文本块）：summary 取第一条非空行，
+// app/module 来自文本启发式（首个 *.exe；"faulting
+// module" 之后的 *.dll，大小写不敏感）。
 STM_TEST(crashlog_parse_blob_unnamed) {
     stm::ops::CrashEvent ev;
     stm::ops::ParseEventXml(kDotNetBlobXml, &ev);
@@ -421,8 +421,8 @@ STM_TEST(crashlog_parse_blob_unnamed) {
     return true;
 }
 
-// EventID 1002 (Application Hang): AppName maps to app, ExeFileName is not confused
-// with module, and the headline is the hang wording (not the crash one).
+// EventID 1002（Application Hang）：AppName 映射到 app，ExeFileName
+// 不与 module 混淆，标题是挂起措辞（而非崩溃措辞）。
 STM_TEST(crashlog_parse_hang_1002) {
     stm::ops::CrashEvent ev;
     stm::ops::ParseEventXml(kHang1002Xml, &ev);
@@ -457,8 +457,8 @@ STM_TEST(crashlog_parse_hang_1002) {
     return true;
 }
 
-// No usable Data at all (named fields that map to nothing, no blob): the entry must
-// degrade to the Execution ProcessID — never a "未知" placeholder.
+// 完全没有可用 Data（具名字段映射不出东西、也无文本块）：条目必须
+// 退化为 Execution ProcessID——绝不用“未知”占位。
 STM_TEST(crashlog_parse_unnamed_falls_back_to_pid) {
     const std::wstring xml =
         L"<Event><System>"
@@ -486,8 +486,8 @@ STM_TEST(crashlog_parse_unnamed_falls_back_to_pid) {
     return true;
 }
 
-// Crash-log query must not crash, stay within contract IDs and newest-first order.
-// A non-empty err is only a channel limitation (honest degradation), never a failure.
+// 崩溃日志查询不得崩溃、保持在契约 ID 内且最新在前。
+// err 非空只是通道限制（诚实降级），绝非失败。
 STM_TEST(crashlog_query_ok) {
     std::wstring e;
     const std::vector<stm::ops::CrashEvent> evs = stm::ops::QueryCrashEvents(50, &e);

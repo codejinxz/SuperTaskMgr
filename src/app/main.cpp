@@ -1,4 +1,4 @@
-// Application entry: single-instance, session handoff, service wiring, message loop.
+// 应用入口：单实例、会话交接、服务装配、消息循环。
 #include "app/AboutInfo.h"        // H-A: 窗口标题带版本（发布信息单一来源）
 #include "app/AppContext.h"
 #include "app/AutotestDialog.h"
@@ -6,6 +6,7 @@
 #include "app/ImGuiLayer.h"
 #include "app/Theme.h"
 #include "app/Win32Window.h"
+#include "app/ui/AboutUi.h"
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/Pages.h"
 #include "app/ui/Tray.h"
@@ -43,10 +44,10 @@ int ParseSmokeFrames() {
     return smoke;
 }
 
-// --autotest kill|tree|startup (bug F1 verification aid): after the UI is up, the
-// frame loop executes the SAME ui::ExecuteConfirmedAction() call a confirm button
-// makes, writes a PASS/FAIL log next to the app log, and exits. For quick manual
-// re-verification on a machine without a selftest binary.
+// --autotest kill|tree|startup（bug F1 验证辅助）：UI 起来之后，帧循环
+// 执行与确认按钮相同的 ui::ExecuteConfirmedAction() 调用，在应用日志旁
+// 写一条 PASS/FAIL 日志并退出。用于在没有 selftest 二进制的机器上
+// 快速人工复核。
 std::wstring ParseAutotestMode() {
     int nArgs = 0;
     LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &nArgs);
@@ -80,7 +81,7 @@ void ToggleMainWindowVisible(HWND hwnd) {
     }
 }
 
-// ---------------- autotest helpers (mirrors src/selftest/ui_fix_test.cpp) ----
+// ---------------- autotest 辅助（镜像 src/selftest/ui_fix_test.cpp）----
 
 uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
@@ -149,9 +150,9 @@ void DrainNotesInto(std::wstring* text, AppContext& ctx) {
 void WriteAutotestLine(const std::wstring& mode, const std::wstring& result,
                        const std::wstring& detail);
 
-// Runs the requested autotest and writes a human-readable log line. Returns 0 on PASS.
-// Takes the shared context by value: the ops job lambdas capture it like every other
-// submit path (V7-P1-3).
+// 运行请求的 autotest 并写一条人读日志行。PASS 返回 0。
+// 按值取共享上下文：ops 任务 lambda 与其他提交路径一样按值捕获
+//（V7-P1-3）。
 int RunAutotest(std::shared_ptr<AppContext> ctx, const std::wstring& mode) {
     std::wstring result = L"FAIL";
     std::wstring detail;
@@ -185,7 +186,7 @@ int RunAutotest(std::shared_ptr<AppContext> ctx, const std::wstring& mode) {
                 if (!rootOk) detail = L"8 秒内根进程未退出";
                 if (!treeOk) detail += rootOk ? L"8 秒内 ping 子进程未退出" : L"，ping 子进程未退出";
             }
-            TerminateProcess(p.proc.get(), 1);  // best-effort cleanup on failure
+            TerminateProcess(p.proc.get(), 1);  // 失败时尽力清理
         }
     } else if (mode == L"startup") {
         constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -218,7 +219,7 @@ int RunAutotest(std::shared_ptr<AppContext> ctx, const std::wstring& mode) {
                 BYTE low = 0xFF;
                 const bool disabled = PollUntil([&] {
                     HKEY k = nullptr;
-                    BYTE buf[16]{};  // 12-byte REG_BINARY: buffer must not be smaller
+                    BYTE buf[16]{};  // 12 字节 REG_BINARY：缓冲不能更小
                     DWORD size = sizeof(buf);
                     const bool got =
                         RegOpenKeyExW(HKEY_CURRENT_USER, kApproved, 0, KEY_QUERY_VALUE, &k) ==
@@ -232,7 +233,7 @@ int RunAutotest(std::shared_ptr<AppContext> ctx, const std::wstring& mode) {
                 result = disabled ? L"PASS" : L"FAIL";
                 if (!disabled) detail = L"确认禁用后 StartupApproved 值未变为禁用编码";
             }
-            // cleanup both values regardless of outcome
+            // 无论结果如何都清理两个值
             if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &raw) == ERROR_SUCCESS) {
                 RegDeleteValueW(raw, kValue);
                 RegCloseKey(raw);
@@ -243,16 +244,16 @@ int RunAutotest(std::shared_ptr<AppContext> ctx, const std::wstring& mode) {
             }
         }
     } else {
-        detail = L"未知 --autotest 模式（支持 kill|tree|startup）";
+        detail = L"未知 --autotest 模式（支持 kill|tree|startup|dialogclick|about|wallpaper）";
     }
 
-    DrainNotesInto(&detail, *ctx);  // log the exact toast text the UI would show
+    DrainNotesInto(&detail, *ctx);  // 记录 UI 本会显示的确切 toast 文本
     WriteAutotestLine(mode, result, detail);
     return result == L"PASS" ? 0 : 1;
 }
 
-// Appends one flushed line to %LOCALAPPDATA%\SuperTaskMgr\logs\autotest_result.log
-// and mirrors it into stm.log. Shared by all --autotest modes.
+// 追加一行（带 flush）到 %LOCALAPPDATA%\SuperTaskMgr\logs\autotest_result.log，
+// 并镜像到 stm.log。所有 --autotest 模式共用。
 void WriteAutotestLine(const std::wstring& mode, const std::wstring& result,
                        const std::wstring& detail) {
     const std::wstring line =
@@ -283,10 +284,10 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
                  autotestMode.empty() ? L"-" : autotestMode);
 
     ops::SingleInstance si;
-    // 3s wait: elevation relaunch hands the mutex over while the old instance tears
-    // down; a slow teardown must not make the new instance bail (final review V11-P2-6).
+    // 3s 等待：提权重启在旧实例拆除期间交接互斥体；
+    // 缓慢的拆除不应让新实例放弃（终审 V11-P2-6）。
     if (!si.TryAcquire(3000)) {
-        if (headless) return 1;  // CI: never block on a MessageBox (V11-P2-7)
+        if (headless) return 1;  // CI：绝不被 MessageBox 阻塞（V11-P2-7）
         MessageBoxW(nullptr, L"超级任务管理器已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -294,13 +295,13 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     ops::SessionState session;
     const bool hasSession = ops::LoadSession(&session);
 
-    // V7-P1-3: AppContext lives in a shared_ptr. Ops job lambdas capture this handle
-    // by value (registered via BindAppContext), so a job still running after
-    // JobQueue::Shutdown's wait timeout (worker detached) keeps notes/jobs/details
-    // alive until it finishes — the queues' lifetime is extended with the context
-    // instead of being freed under a detached worker. If the last reference drops
-    // on the detached worker thread itself, ~JobQueue is still safe: after detach
-    // the thread object is non-joinable and Shutdown(0) returns without joining.
+    // V7-P1-3：AppContext 存于 shared_ptr。ops 任务 lambda 按值捕获该句柄
+    //（经 BindAppContext 注册），因此 JobQueue::Shutdown 等待超时后
+    // 仍在运行的任务（工作线程已脱离）会让 notes/jobs/details
+    // 保持存活直到完成——队列的生命周期随上下文延长，
+    // 而不是在脱离的工作线程下方被释放。如果最后一个引用恰好在
+    // 脱离的工作线程上释放，~JobQueue 仍然安全：detach 之后
+    // 线程对象不可 join，Shutdown(0) 不做 join 直接返回。
     const std::shared_ptr<AppContext> ctx = std::make_shared<AppContext>();
     ctx->elevated = ops::IsElevated();
     ctx->details = std::make_unique<ops::DetailsProvider>(ctx->jobs, ctx->notes);
@@ -311,7 +312,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     RegisterPages(*ctx);
     if (hasSession) ApplySession(*ctx, session);
     BindAppContext(ctx);
-    ui3::BindPhase3Context(ctx);  // phase-3 pages use the same lifetime pattern
+    ui3::BindPhase3Context(ctx);  // 第 3 阶段页面使用同样的生命周期模式
     if (!ctx->collect.Start(hasSession ? ClampInterval(session.intervalMs)
                                        : ClampInterval(ctx->cfg.GetInt(L"intervalMs", 1000)))) {
         MessageBoxW(nullptr, L"采集服务启动失败。", L"错误", MB_OK | MB_ICONERROR);
@@ -331,7 +332,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     cbs.onResize = [](void* ud, int w, int h) { static_cast<D3DRenderer*>(ud)->Resize(w, h); };
     ui::Tray tray;
     bool uiThemeReady = false;  // H-A: ImGui 上下文就绪前不响应主题系统广播
-    // Tray messages ride the window-proc hook (Win32Window exposes no other way in).
+    // 托盘消息走窗口过程钩子（Win32Window 没有暴露其他入口）。
     // F4#10: WM_HOTKEY（全局热键 Ctrl+Alt+M）也在此处理，复用托盘三分支显隐逻辑。
     cbs.onMessage = [&tray, &win, &ctx, &uiThemeReady](HWND h, UINT msg, WPARAM wParam,
                                                        LPARAM lParam,
@@ -346,9 +347,9 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
             const int action =
                 ui::NormalizeCloseAction(ctx->cfg.GetInt(ui::kCloseActionCfgKey, 0));
             if (action == 1) {
-                // Pass through (not handled): DefWindowProc destroys the window =>
-                // WM_DESTROY => quit. Keeps external graceful close (taskkill without
-                // /F) working when the user chose "always exit" (V18-P2-2).
+                // 透传（不处理）：DefWindowProc 销毁窗口 =>
+                // WM_DESTROY => 退出。让外部优雅关闭（不带 /F 的 taskkill）
+                // 在用户选择"总是退出"时仍然有效（V18-P2-2）。
             } else if (action == 2) {
                 ShowWindow(h, SW_HIDE);
                 *handled = true;
@@ -374,6 +375,12 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
             *handled = true;
             return 0;
         }
+        // 系统关机/注销（V20-P2-4）：立即持久化会话与配置，避免末段设置静默丢失。
+        if (msg == WM_ENDSESSION && wParam != 0) {
+            SaveSessionFromCtx(*ctx, win.Hwnd());
+            ctx->cfg.Save(ConfigPath());
+            // 不置 handled：默认处理继续结束会话。
+        }
         return tray.HandleMessage(h, msg, wParam, lParam, handled);
     };
     cbs.ud = &renderer;
@@ -384,12 +391,31 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
     // P3 任务三：主窗句柄交给 AppContext，「最小化到托盘」的模态按钮据此 SW_HIDE。
     ctx->mainHwnd = win.Hwnd();
+    // 应用 Logo（Logo 任务）：标题栏大/小图标（LR_SHARED 共享句柄，无需 DestroyIcon；
+    // 注意变量名不可用 small——rpcndr.h 将其定义为 char 宏）。
+    if (smokeFrames == 0) {
+        const HICON iconBig = static_cast<HICON>(LoadImageW(
+            GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR | LR_SHARED));
+        const HICON iconSmall = static_cast<HICON>(LoadImageW(
+            GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR | LR_SHARED));
+        if (iconBig) {
+            SendMessageW(win.Hwnd(), WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(iconBig));
+        }
+        if (iconSmall) {
+            SendMessageW(win.Hwnd(), WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(iconSmall));
+        }
+    }
     if (!renderer.Init(win.Hwnd(), win.Width(), win.Height())) {
         MessageBoxW(nullptr, L"D3D11 初始化失败（含 WARP 兜底）。", L"错误", MB_OK | MB_ICONERROR);
         return 1;
     }
     ImGuiLayer ui;
     if (!ui.Init(win.Hwnd(), &renderer)) return 1;
+    ui::SetAboutGraphics(renderer.Device(), renderer.Context());
     // H-A: 启动即应用 cfg 持久的主题模式（themeMode，默认 0=Dark；System 在
     // Apply 内解析注册表）。随后的系统深浅色广播由 onMessage 钩子处理。
     Theme::Apply(ThemeModeFromInt(ctx->cfg.GetInt(L"themeMode", 0)));
@@ -399,34 +425,34 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     RegisterWallpaperBackend(renderer.Device(), renderer.Context());
     ui::WallpaperAutoRestore(renderer.Device(), renderer.Context());
 
-    // Tray icon: skipped under --smoke / --autotest (CI renders headless-ish, no
-    // shell icon churn).
+    // 托盘图标：--smoke / --autotest 下跳过（CI 近乎无头渲染，
+    // 避免外壳图标折腾）。
     if (!headless && tray.Create(win.Hwnd(), ctx->elevated)) {
         const HWND hwnd = win.Hwnd();
         tray.onToggleWindow = [hwnd]() {
-            // P1-2 (F2 review): a minimized window still reports IsWindowVisible()==TRUE,
-            // so the old two-branch check hid the taskbar button on left click. Three
-            // branches: minimized => restore+foreground; visible => hide; else show.
+            // P1-2（F2 评审）：最小化窗口仍报告 IsWindowVisible()==TRUE，
+            // 因此旧的两分支检查在左键点击时会把任务栏按钮藏掉。三个
+            // 分支：最小化 => 恢复+前置；可见 => 隐藏；否则显示。
             ToggleMainWindowVisible(hwnd);
         };
         tray.onShowWindow = [hwnd]() {
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
         };
-        // Capture the shared_ptr by value so these callbacks stay lifetime-safe
-        // regardless of teardown ordering.
+        // 按值捕获 shared_ptr，使这些回调无论拆除顺序如何
+        // 都保持生命周期安全。
         tray.onRestartElevated = [ctx, &win]() {
             SaveSessionFromCtx(*ctx, win.Hwnd());
             if (ops::RelaunchAsAdmin(L"--relaunched")) ctx->wantExit = true;
         };
         tray.onExit = [ctx]() { ctx->wantExit = true; };
-        // Phase-3 alerts fire tray balloons through the same icon (additive).
+        // 第 3 阶段告警经同一图标发托盘气泡（增量式）。
         ui3::SetBalloonSink([&tray](const std::wstring& title, const std::wstring& text) {
             tray.ShowBalloon(title, text);
         });
     }
-    // Under --smoke every page's Draw is exercised in an offscreen window so
-    // the new tabs' empty/error states are covered by the CI smoke run.
+    // --smoke 下每个页面的 Draw 都在屏外窗口中执行一遍，
+    // 让新标签页的空态/错误态被 CI 冒烟覆盖。
     ui3::SetSmokeDrawAll(smokeFrames > 0);
     // H-A: --smoke 同时把「外观→自定义壁纸」控件组画进离屏窗口（渲染路径覆盖）。
     SetAppearanceSmokePreview(smokeFrames > 0);
@@ -446,8 +472,8 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         MoveWindow(win.Hwnd(), session.winX, session.winY, session.winW, session.winH, FALSE);
     }
 
-    // Frame loop: vsync-paced; collection happens on its own thread.
-    // Minimized => relax the collection cadence to 2 s (phase-4 budget item).
+    // 帧循环：按垂直同步节拍；采集在独立线程进行。
+    // 最小化 => 把采集节奏放宽到 2s（第 4 阶段预算项）。
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     int frames = 0;
@@ -457,6 +483,12 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     bool dialogClickStarted = false;
     bool dialogClickLogged = false;
     DialogClickDriver dialogClick;
+    bool aboutClickStarted = false;
+    bool aboutClickLogged = false;
+    AboutClickDriver aboutClick;
+    bool wallpaperTestStarted = false;
+    bool wallpaperTestLogged = false;
+    WallpaperTestDriver wallpaperTest;
     bool wasIconic = IsIconic(win.Hwnd()) != FALSE;
     while (!ctx->wantExit) {
         MSG msg;
@@ -468,8 +500,8 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
 
         const bool iconic = IsIconic(win.Hwnd()) != FALSE;
         if (iconic != wasIconic) {
-            // Restore reads cfg live so toolbar interval changes made while running
-            // survive a minimize/restore cycle (final review V11-P1-2).
+            // 恢复时实时读取 cfg，使运行期间在工具栏改的间隔
+            // 在最小化/恢复循环中得以保留（终审 V11-P1-2）。
             ctx->collect.SetInterval(iconic ? 2000 : ClampInterval(ctx->cfg.GetInt(L"intervalMs", 1000)));
             wasIconic = iconic;
         }
@@ -482,26 +514,26 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         // NewFrame 之前调用永不渲染。背景列表天然位于所有普通窗口之下。
         ui::WallpaperDrawBackground(
             ui::ClampMask(static_cast<float>(ctx->cfg.GetDouble(L"wallpaperMask", 0.45))));
-        DrawShell(*ctx);  // drains notifications into toasts; one snapshot read per frame
+        DrawShell(*ctx);  // 把通知取空变成 toast；每帧一次快照读取
         ui.Render();
         renderer.Present();
         QueryPerformanceCounter(&t1);
         ctx->frameMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
 
         if (smokeFrames > 0 && ++frames >= smokeFrames) break;
-        // --autotest: let a few frames run (shell + toasts live), then execute the
-        // confirmed action / drive the dialog click, log, and exit.
-        // Gate on the first completed collect ticks: quitting while the very first
-        // tick is still in flight would block teardown's collect.Stop() join on a
-        // tick that can take a long time on slow/VM GPUs — and the action itself
-        // wants a real snapshot to exist anyway.
+        // --autotest：先跑几帧（外壳 + toast 存活），然后执行确认动作 /
+        // 驱动对话框点击，写日志并退出。
+        // 以首批完成的采集 tick 为门控：若第一个 tick 仍在途就退出，
+        // 拆除时的 collect.Stop() join 会卡在一个在慢速/虚拟 GPU 上
+        // 可能很久的 tick 上——而且动作本身
+        // 也需要一份真实快照存在。
         if (!autotestMode.empty()) {
             if (!autotestGateOpen && ++autotestFrame >= 8 && ctx->collect.TickCount() >= 2) {
                 autotestGateOpen = true;
             }
             if (autotestMode == L"dialogclick") {
-                // V14 P1: drive the REAL rendered confirm dialog with synthetic
-                // mouse events (events queued here are consumed by next NewFrame).
+                // V14 P1：用合成鼠标事件驱动真实渲染的确认对话框
+                //（这里排队的事件由下一次 NewFrame 消费）。
                 if (autotestGateOpen && !dialogClickStarted) {
                     dialogClick.Start(ctx);
                     dialogClickStarted = true;
@@ -512,6 +544,35 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
                     WriteAutotestLine(L"dialogclick", dialogClick.result, dialogClick.detail);
                     dialogClickLogged = true;
                 }
+            } else if (autotestMode == L"about") {
+                // R-Fix Bug3：对工具栏「?」关于按钮使用相同注入方法
+                //（点击 -> 模态框打开并保持 -> Esc 关闭）。
+                if (autotestGateOpen && !aboutClickStarted) {
+                    aboutClick.Start(ctx);
+                    aboutClickStarted = true;
+                }
+                aboutClick.Tick();
+                if (aboutClick.Done() && !aboutClickLogged) {
+                    autotestResult = aboutClick.pass ? 0 : 1;
+                    WriteAutotestLine(L"about", aboutClick.result, aboutClick.detail);
+                    aboutClickLogged = true;
+                }
+            } else if (autotestMode == L"wallpaper") {
+                // R-Fix Bug2：把生成的 4x4 测试图像经真实 WallpaperLoad
+                // 路径加载，然后断言该帧 DrawData 携带绑定壁纸的几何
+                //（顶点数 > 0 + 非图集纹理的绘制命令），
+                // 之后以 0 退出。
+                if (autotestGateOpen && !wallpaperTestStarted) {
+                    wallpaperTest.Start(ctx, renderer.Device(), renderer.Context());
+                    wallpaperTestStarted = true;
+                }
+                wallpaperTest.Tick();
+                if (wallpaperTest.Done() && !wallpaperTestLogged) {
+                    autotestResult = wallpaperTest.pass ? 0 : 1;
+                    WriteAutotestLine(L"wallpaper", wallpaperTest.result,
+                                      wallpaperTest.detail);
+                    wallpaperTestLogged = true;
+                }
             } else if (autotestGateOpen) {
                 autotestResult = RunAutotest(ctx, autotestMode);
                 ctx->wantExit = true;
@@ -520,7 +581,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
 
     if (smokeFrames == 0 && autotestMode.empty()) {
-        SaveSessionFromCtx(*ctx, win.Hwnd());  // window rect / page / selection handoff
+        SaveSessionFromCtx(*ctx, win.Hwnd());  // 窗口矩形/页面/选择的交接
         ctx->cfg.Save(ConfigPath());
         // H-A: 「恢复默认列宽」把 colW_* 软删除为 ""，Save 会把空值写回 —— 这里
         // 按值过滤剔除，保证重启后配置文件不再残留这些键（重新调过的真实宽度保留）。
@@ -528,12 +589,16 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
     tray.Remove();
     ui3::GcHotkeyUnbindWindow();   // F4#10: 退出反注册热键
-    ui3::SetBalloonSink(nullptr);  // P2-7: sink captured &tray; drop before teardown
-    // Stops collection and gives in-flight ops jobs up to 2 s; anything still
-    // running afterwards survives on ctx's shared_ptr (see comment above).
+    ui3::SetBalloonSink(nullptr);  // P2-7：sink 捕获了 &tray；拆除前先摘除
+    // 停止采集，给在途 ops 任务至多 2s；之后仍在运行的
+    // 一切都靠 ctx 的 shared_ptr 存活（见上文注释）。
     ctx->collect.Stop();
     ctx->jobs.Shutdown(2000);
-    ui::WallpaperClear();  // V18-P2-6: release texture + stored copy explicitly
+    // R-Fix Bug2: 退出只释放 GPU 纹理，保留 %LOCALAPPDATA% 持久化副本 ——
+    // 旧的 WallpaperClear 在退出时删除副本，使「下次启动自动恢复」成为死代码
+    // （选图后重启即回到纯色，属于用户报告的「壁纸不生效」的一半根因）。
+    ui::WallpaperShutdown();
+    ui::ShutdownAboutUi();  // V20-P2-3：先于设备销毁释放关于页徽标纹理
     ui.Shutdown();
     renderer.Shutdown();
     win.Destroy();

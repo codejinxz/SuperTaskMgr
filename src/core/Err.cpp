@@ -7,7 +7,7 @@ namespace stm {
 uint32_t LastHr() { return HRESULT_FROM_WIN32(GetLastError()); }
 
 std::wstring HrMessage(uint32_t hr) {
-    // Etparameter-format: system messages; strip trailing newline noise.
+    // 按参数格式取系统消息文本；去掉结尾多余的换行。（待复核）
     LPWSTR buf = nullptr;
     const DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS |
                                        FORMAT_MESSAGE_ALLOCATE_BUFFER,

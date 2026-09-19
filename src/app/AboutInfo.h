@@ -15,9 +15,9 @@
 namespace stm {
 
 inline constexpr const wchar_t* kAppName     = L"SuperTaskMgr 超级任务管理器";
-inline constexpr const wchar_t* kAppVersion  = L"0.6.0-dev";   // <-- EDIT
-inline constexpr const wchar_t* kBuildDate   = L"";             // <-- EDIT (e.g. L"2026-09-18")
-inline constexpr const wchar_t* kRepoUrl     = L"";             // <-- EDIT (e.g. L"https://github.com/yourname/SuperTaskMgr")
+inline constexpr const wchar_t* kAppVersion  = L"0.6.0-dev";   // <-- 在此编辑
+inline constexpr const wchar_t* kBuildDate   = L"";             // <-- 在此编辑（如 L"2026-09-18"）
+inline constexpr const wchar_t* kRepoUrl     = L"";             // <-- 在此编辑（如 L"https://github.com/yourname/SuperTaskMgr"）
 
 inline constexpr const wchar_t* kLicenseLine = L"本项目基于 MIT 许可证发布（见 LICENSE）。第三方组件：Dear ImGui / ImPlot (MIT)、stb_image (公有领域)。";
 

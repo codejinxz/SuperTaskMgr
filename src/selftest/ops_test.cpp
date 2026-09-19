@@ -1,6 +1,6 @@
-// Ops-layer smoke tests (arch section 6/8): identity re-verify, protection gate,
-// working-set trim, tree plan/terminate, signature verify, details provider.
-// All cases are designed to pass without elevation; nothing here needs admin.
+// ops 层冒烟测试（架构第 6/8 节）：身份复核、保护闸门、工作集清理、
+// 树规划/终止、签名验证、详情提供者。
+// 所有用例都设计为无需提权即可通过；这里没有任何东西需要管理员。
 #include "selftest/TestFramework.h"
 #include "core/Err.h"
 #include "core/HandleGuard.h"
@@ -76,7 +76,7 @@ std::wstring SelfExePath() {
 
 }  // namespace
 
-// Dead identity: pid never exists + createTime=1 => refuse with the protocol message.
+// 死身份：pid 不存在 + createTime=1 => 以协议消息拒绝。
 STM_TEST(ops_identity_reverify_dead_pid) {
     const stm::ProcKey dead{0xFFFFFFu, 1};
     std::wstring e;
@@ -91,11 +91,11 @@ STM_TEST(ops_identity_reverify_dead_pid) {
     return true;
 }
 
-// Protection gate: csrss.exe must be refused by name before any handle is opened.
-// Refusal path only — nothing is ever terminated here.
+// 保护闸门：csrss.exe 必须在任何句柄打开前按名称被拒。
+// 只走拒绝路径——这里绝不真的终止任何东西。
 STM_TEST(ops_protected_refusal) {
     const uint32_t pid = FindPidByName(L"csrss.exe");
-    if (pid == 0) return true;  // exotic environment without csrss: skip silently
+    if (pid == 0) return true;  // 无 csrss 的特殊环境：静默跳过
     const stm::ProcKey key{pid, CreateTimeOf(pid)};
     std::wstring e;
     if (stm::ops::TerminateProcessById(key, &e)) {
@@ -109,7 +109,7 @@ STM_TEST(ops_protected_refusal) {
     return true;
 }
 
-// TrimWorkingSet on self: must succeed; working set may drop but must not crash.
+// 对自身 TrimWorkingSet：必须成功；工作集可下降但不得崩溃。
 STM_TEST(ops_trim_self) {
     const stm::ProcKey self{GetCurrentProcessId(), CreateTimeOf(GetCurrentProcessId())};
     PROCESS_MEMORY_COUNTERS before{};
@@ -121,18 +121,18 @@ STM_TEST(ops_trim_self) {
         return false;
     }
     GetProcessMemoryInfo(GetCurrentProcess(), &after, sizeof(after));
-    // No hard assertion on the numbers (WS is allowed to drop or fluctuate); just report.
+    // 对数字不做硬断言（工作集允许下降或波动）；仅报告。
     printf("  [info] 工作集 trim 前=%llu B 后=%llu B\n",
            static_cast<unsigned long long>(before.WorkingSetSize),
            static_cast<unsigned long long>(after.WorkingSetSize));
     return true;
 }
 
-// Protection gate applies to TrimWorkingSet too (V8-P1-1): dwm.exe is on the list and
-// non-PPL, so without the gate it would actually be trimmed.
+// 保护闸门同样适用于 TrimWorkingSet（V8-P1-1）：dwm.exe 在名单上且
+// 非 PPL，因此没有闸门它就会被真的清理。
 STM_TEST(ops_trim_protected_refusal) {
     const uint32_t pid = FindPidByName(L"dwm.exe");
-    if (pid == 0) return true;  // exotic environment: skip silently
+    if (pid == 0) return true;  // 特殊环境：静默跳过
     const stm::ProcKey key{pid, CreateTimeOf(pid)};
     std::wstring e;
     if (stm::ops::TrimWorkingSet(key, &e)) {
@@ -146,13 +146,13 @@ STM_TEST(ops_trim_protected_refusal) {
     return true;
 }
 
-// V8-P2 anti-spoof: a process that merely shares a protected image name but lives
-// outside %SystemRoot% is NOT protected — its working set may be trimmed.
+// V8-P2 反伪装：仅与受保护映像同名的进程若位于
+// %SystemRoot% 之外则不受保护——其工作集可以被清理。
 STM_TEST(ops_trim_same_name_allowed) {
     wchar_t temp[MAX_PATH]{};
-    if (GetTempPathW(MAX_PATH, temp) == 0) return true;  // env skip
+    if (GetTempPathW(MAX_PATH, temp) == 0) return true;  // 环境跳过
     const std::wstring fakePath = std::wstring(temp) + L"dwm.exe";
-    if (_wcsnicmp(fakePath.c_str(), L"C:\\Windows\\", 11) == 0) return true;  // env guard
+    if (_wcsnicmp(fakePath.c_str(), L"C:\\Windows\\", 11) == 0) return true;  // 环境防护
     if (!CopyFileW(L"C:\\Windows\\System32\\cmd.exe", fakePath.c_str(), FALSE)) return true;
 
     STARTUPINFOW si{};
@@ -162,7 +162,7 @@ STM_TEST(ops_trim_same_name_allowed) {
     if (!CreateProcessW(fakePath.c_str(), cmdLine, nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
                         nullptr, nullptr, &si, &pi)) {
         DeleteFileW(fakePath.c_str());
-        return true;  // AV/policy may refuse to run a dwm.exe-named binary: env skip
+        return true;  // 杀软/策略可能拒绝运行名为 dwm.exe 的二进制：环境跳过
     }
     stm::UniqueHandle procGuard(pi.hProcess);
     stm::UniqueHandle threadGuard(pi.hThread);
@@ -180,7 +180,7 @@ STM_TEST(ops_trim_same_name_allowed) {
     return true;
 }
 
-// Spawn cmd.exe -> ping.exe (two levels), plan the tree, then terminate it leaf-first.
+// 启动 cmd.exe -> ping.exe（两级），规划树，然后先叶子后根终止。
 STM_TEST(ops_tree_plan) {
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -196,7 +196,7 @@ STM_TEST(ops_tree_plan) {
     const stm::ProcKey cmdKey{pi.dwProcessId, CreateTimeOf(pi.dwProcessId)};
 
     uint32_t pingPid = 0;
-    for (int i = 0; i < 30 && pingPid == 0; ++i) {  // up to 3s for cmd to spawn ping
+    for (int i = 0; i < 30 && pingPid == 0; ++i) {  // 给 cmd 至多 3s 去启动 ping
         Sleep(100);
         pingPid = FindChildPid(cmdKey.pid, L"ping.exe");
     }
@@ -227,7 +227,7 @@ STM_TEST(ops_tree_plan) {
     stm::ops::TreeResult res;
     std::wstring e2;
     const bool ok = stm::ops::TerminateTree(cmdKey, &res, &e2);
-    WaitForSingleObject(procGuard.get(), 5000);  // reap cmd regardless of outcome
+    WaitForSingleObject(procGuard.get(), 5000);  // 无论结果如何都回收 cmd
     if (!ok || res.terminated < 2 || res.failed != 0 || res.planned < 2) {
         *err = stm::Fmt(L"树杀结果不符：planned={} terminated={} failed={} skipped={} err={}",
                         res.planned, res.terminated, res.failed, res.skippedProtected, e2);
@@ -236,7 +236,7 @@ STM_TEST(ops_tree_plan) {
     return true;
 }
 
-// Self exe is unsigned in dev builds (never Valid); notepad.exe is catalog-signed.
+// 开发构建中自身 exe 无签名（绝不 Valid）；notepad.exe 是目录签名。
 STM_TEST(ops_signature_self) {
     const std::wstring selfPath = SelfExePath();
     const stm::ops::SigState selfState = stm::ops::VerifyFileSignature(selfPath);
@@ -245,7 +245,7 @@ STM_TEST(ops_signature_self) {
         return false;
     }
     const wchar_t* notepad = L"C:\\Windows\\System32\\notepad.exe";
-    if (GetFileAttributesW(notepad) == INVALID_FILE_ATTRIBUTES) return true;  // env skip
+    if (GetFileAttributesW(notepad) == INVALID_FILE_ATTRIBUTES) return true;  // 环境跳过
     if (stm::ops::VerifyFileSignature(notepad) != stm::ops::SigState::Valid) {
         *err = L"系统文件 notepad.exe 的 catalog 签名校验应为 Valid";
         return false;
@@ -253,7 +253,7 @@ STM_TEST(ops_signature_self) {
     return true;
 }
 
-// DetailsProvider on self: signature + user name + GUI objects resolve within 5s.
+// 对自身的 DetailsProvider：签名 + 用户名 + GUI 对象 5s 内解析。
 STM_TEST(ops_details_request) {
     stm::JobQueue jobs;
     stm::NotificationQueue notes;
@@ -269,7 +269,7 @@ STM_TEST(ops_details_request) {
     dp.Request(self, SelfExePath(), kinds);
 
     const stm::ops::ProcessDetails* d = nullptr;
-    for (int i = 0; i < 100; ++i) {  // poll up to 5s
+    for (int i = 0; i < 100; ++i) {  // 至多轮询 5s
         Sleep(50);
         d = dp.Peek(self);
         if (d && d->guiResolved && d->userNameResolved) break;

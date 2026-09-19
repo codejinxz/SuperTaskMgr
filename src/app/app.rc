@@ -1,0 +1,4 @@
+// SuperTaskMgr 资源脚本：应用图标（资源管理器/任务栏/标题栏/托盘）与关于页徽标。
+// 相对路径以本文件（src/app/）为基准。
+1 ICON "../../assets/app.ico"
+200 RCDATA "../../assets/logo_256.png"

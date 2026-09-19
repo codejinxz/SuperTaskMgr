@@ -1,11 +1,11 @@
-// System services (SCM) operations: enumeration + start/stop (contract ops/ServiceOps.h).
+// 系统服务（SCM）操作：枚举 + 启动/停止（契约 ops/ServiceOps.h）。
 //
-// Read paths (enumerate + config) use SERVICE_QUERY_* access only and work without
-// admin (R5 row 12). Start/stop need admin for most system services; failures carry
+// 读取路径（枚举 + 配置）只用 SERVICE_QUERY_* 访问权，无需管理员即可工作
+//（R5 第 12 行）。启动/停止对多数系统服务需要管理员；失败信息附带
 // the Win32 HRESULT so the UI can show an honest "需要管理员" hint.
-// Stop semantics: active dependents are stopped leaf-first (EnumDependentServices),
-// each name re-checked against core::ProtectedList — a protected/critical service is
-// refused, never force-killed (arch section 6).
+// 停止语义：活动依赖者先叶子后根地停止（EnumDependentServices），
+// 每个名称都对照 core::ProtectedList 复查——受保护/关键的服务
+// 一律拒绝，绝不强杀（架构第 6 节）。
 #include "ops/ServiceOps.h"
 #include "core/Err.h"
 #include "core/Log.h"
@@ -25,10 +25,10 @@ namespace {
 constexpr DWORD kStopTimeoutMs = 30'000;
 constexpr DWORD kStartTimeoutMs = 15'000;
 constexpr DWORD kPollIntervalMs = 200;
-constexpr int kMaxDependencyDepth = 16;  // guards against cyclic dependency reports
+constexpr int kMaxDependencyDepth = 16;  // 防御循环依赖上报
 
-// SC_HANDLE needs CloseServiceHandle (not CloseHandle) => dedicated RAII wrapper
-// (resource charter, arch section 5).
+// SC_HANDLE 需要 CloseServiceHandle（而非 CloseHandle）=> 专用 RAII 包装
+//（资源章程，架构第 5 节）。
 class ScHandle {
 public:
     ScHandle() = default;
@@ -47,15 +47,15 @@ private:
     SC_HANDLE h_ = nullptr;
 };
 
-// Services.exe hosts nothing a process list would call by name, but the protection
-// gate is name-based: a pseudo-pid (never 0/4) + "<name>.exe" lets core::ProtectedReason
-// refuse e.g. a service literally named "services"/"csrss".
+// Services.exe 不承载进程列表会按名称调用的东西，但保护闸门
+// 是按名称的：伪 pid（绝不 0/4）+ "<名称>.exe" 让 core::ProtectedReason
+// 能拒绝例如字面名为 "services"/"csrss" 的服务。
 std::wstring ServiceProtectedReason(const std::wstring& name) {
     return stm::ProtectedReason(1u, name + L".exe", L"");
 }
 
-// Grow-loop wrapper: read one SERVICE_CONFIG_* blob. Returns null on failure (caller
-// logs and degrades — the enum row stays usable without the detail).
+// 增长循环包装：读取一段 SERVICE_CONFIG_* 数据。失败返回 null（调用方
+// 记日志并降级——枚举行在缺该细节时仍可用）。
 template <typename T>
 std::unique_ptr<T> QueryConfigBlob(SC_HANDLE svc, DWORD infoClass) {
     DWORD needed = 0;
@@ -85,8 +85,8 @@ std::unique_ptr<QUERY_SERVICE_CONFIGW> QueryConfig(SC_HANDLE svc) {
         reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.release()));
 }
 
-// Poll QueryServiceStatusEx until dwCurrentState == target or timeout. Returns true
-// only when the target state was observed.
+// 轮询 QueryServiceStatusEx 直到 dwCurrentState == 目标或超时。仅当
+// 观察到目标状态时返回 true。
 bool WaitForState(SC_HANDLE svc, DWORD target, DWORD timeoutMs, std::wstring* err) {
     for (DWORD waited = 0;; waited += kPollIntervalMs) {
         SERVICE_STATUS_PROCESS ssp{};
@@ -108,7 +108,7 @@ bool WaitForState(SC_HANDLE svc, DWORD target, DWORD timeoutMs, std::wstring* er
     }
 }
 
-// Names of currently ACTIVE dependent services (empty on query failure — callers log).
+// 当前处于活动状态的依赖服务名称（查询失败时为空——调用方记日志）。
 std::vector<std::wstring> ActiveDependentsOf(SC_HANDLE svc) {
     std::vector<std::wstring> out;
     DWORD needed = 0, returned = 0;
@@ -129,14 +129,14 @@ std::vector<std::wstring> ActiveDependentsOf(SC_HANDLE svc) {
     return out;
 }
 
-// Recursive leaf-first stop. `scm` is owned by the caller; depth guards cycles.
+// 递归的先叶子停止。`scm` 由调用方持有；深度防御循环。
 bool StopOne(SC_HANDLE scm, const std::wstring& name, bool stopDependents, int depth,
              std::wstring* err) {
     if (depth > kMaxDependencyDepth) {
         if (err) *err = L"服务依赖链过深或存在循环依赖，已中止：" + name;
         return false;
     }
-    // Protection gate BEFORE any handle open (same order as ProcessOps).
+    // 在任何句柄打开之前过保护闸门（与 ProcessOps 同序）。
     if (const std::wstring reason = ServiceProtectedReason(name); !reason.empty()) {
         if (err) *err = L"已拒绝停止服务：" + reason + L"（保护名单强制拦截）";
         STM_LOG_INFO("services", L"停止请求被保护名单拦截：{}", name);
@@ -151,8 +151,8 @@ bool StopOne(SC_HANDLE scm, const std::wstring& name, bool stopDependents, int d
     }
 
     if (stopDependents) {
-        // Leaf-first: every active dependent (and its own dependents) must be down
-        // before the parent accepts SERVICE_CONTROL_STOP.
+        // 先叶子：每个活动依赖者（及其依赖者）必须先停止，
+        // 父服务才接受 SERVICE_CONTROL_STOP。
         for (const std::wstring& dep : ActiveDependentsOf(svc.get())) {
             std::wstring depErr;
             if (!StopOne(scm, dep, true, depth + 1, &depErr)) {
@@ -167,13 +167,13 @@ bool StopOne(SC_HANDLE scm, const std::wstring& name, bool stopDependents, int d
     if (::QueryServiceStatusEx(svc.get(), SC_STATUS_PROCESS_INFO,
                                reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed) &&
         ssp.dwCurrentState == SERVICE_STOPPED) {
-        return true;  // already stopped: idempotent success
+        return true;  // 已停止：幂等成功
     }
     SERVICE_STATUS status{};
     if (!::ControlService(svc.get(), SERVICE_CONTROL_STOP, &status)) {
         const uint32_t hr = stm::LastHr();
         if (hr == static_cast<uint32_t>(HRESULT_FROM_WIN32(ERROR_SERVICE_NOT_ACTIVE))) {
-            return true;  // raced to stopped: still success
+            return true;  // 竞争中已停止：仍算成功
         }
         if (hr == static_cast<uint32_t>(HRESULT_FROM_WIN32(ERROR_DEPENDENT_SERVICES_RUNNING))) {
             if (err) *err = L"服务 " + name + L" 存在运行中的依赖服务（未允许停止依赖），无法停止";
@@ -200,7 +200,7 @@ std::vector<ServiceInfo> EnumServices(std::wstring* err) {
         return out;
     }
 
-    // Batch 1: name/state/pid for every SERVICE_WIN32 service in one call.
+    // 第 1 批：一次调用取全部 SERVICE_WIN32 服务的名称/状态/pid。
     std::vector<BYTE> buf(64 * 1024);
     DWORD needed = 0, returned = 0, resume = 0;
     for (;;) {
@@ -225,9 +225,9 @@ std::vector<ServiceInfo> EnumServices(std::wstring* err) {
         si.name = arr[i].lpServiceName ? arr[i].lpServiceName : L"";
         si.displayName = arr[i].lpDisplayName ? arr[i].lpDisplayName : si.name;
         si.state = ssp.dwCurrentState;
-        // dwProcessId is documented-valid only for the running/paused states (R5 7b);
-        // pending/stopped rows report stale or zero values — normalize to 0 so
-        // "pid != 0 => process alive" stays a usable invariant for the UI.
+        // dwProcessId 仅在运行/暂停状态有文档保证（R5 7b）；
+        // 挂起/停止行报告陈旧或零值——归一化为 0，使
+        // "pid != 0 => 进程存活" 仍是 UI 可用的不变式。
         const bool pidValid = ssp.dwCurrentState == SERVICE_RUNNING ||
                               ssp.dwCurrentState == SERVICE_PAUSED ||
                               ssp.dwCurrentState == SERVICE_PAUSE_PENDING ||
@@ -236,8 +236,8 @@ std::vector<ServiceInfo> EnumServices(std::wstring* err) {
         out.push_back(std::move(si));
     }
 
-    // sharedProcess: one host pid serving several services (svchost-style). A service
-    // owning its own process (or not running => pid 0) is not shared.
+    // sharedProcess：一个宿主 pid 服务多个服务（svchost 式）。独占
+    // 进程的服务（或未运行 => pid 0）不算共享。
     std::unordered_map<uint32_t, int> pidUsers;
     for (const ServiceInfo& si : out) {
         if (si.pid != 0) ++pidUsers[si.pid];
@@ -246,9 +246,9 @@ std::vector<ServiceInfo> EnumServices(std::wstring* err) {
         si.sharedProcess = si.pid != 0 && pidUsers[si.pid] > 1;
     }
 
-    // Batch 2 (per service, skip-on-failure): start type, account, description from
-    // QUERY_SERVICE_CONFIG / SERVICE_CONFIG_DESCRIPTION; canStop from the live
-    // SERVICE_STATUS_PROCESS.dwControlsAccepted (QUERY_SERVICE_CONFIG has no such field).
+    // 第 2 批（每服务，失败即跳过）：启动类型、账户、描述来自
+    // QUERY_SERVICE_CONFIG / SERVICE_CONFIG_DESCRIPTION；canStop 来自实时的
+    // SERVICE_STATUS_PROCESS.dwControlsAccepted（QUERY_SERVICE_CONFIG 无此字段）。
     int enriched = 0;
     for (ServiceInfo& si : out) {
         ScHandle svc(::OpenServiceW(scm.get(), si.name.c_str(),
@@ -273,9 +273,9 @@ std::vector<ServiceInfo> EnumServices(std::wstring* err) {
                 QueryConfigBlob<SERVICE_DESCRIPTIONW>(svc.get(), SERVICE_CONFIG_DESCRIPTION)) {
             si.description = desc->lpDescription ? desc->lpDescription : L"";
         }
-        // SERVICE_CONFIG_FAILURE_ACTIONS is deliberately not fetched: the frozen
-        // ServiceInfo contract carries no field for it and it doubles the per-service
-        // query cost for nothing the UI can show.
+        // 刻意不取 SERVICE_CONFIG_FAILURE_ACTIONS：冻结的 ServiceInfo
+        // 契约没有对应字段，且它会使每服务查询开销翻倍，
+        // 而 UI 无处可展示。
         ++enriched;
     }
     STM_LOG_INFO("services", L"服务枚举完成：{} 项，其中 {} 项取到配置细节", out.size(), enriched);

@@ -5,7 +5,7 @@
 namespace stm {
 
 namespace {
-// Case-insensitive image-name list. pid 0/4 covered separately in ProtectedReason.
+// 大小写不敏感的映像名名单。pid 0/4 在 ProtectedReason 中单独处理。
 const wchar_t* const kProtectedNames[] = {
     L"smss.exe", L"csrss.exe", L"wininit.exe", L"winlogon.exe", L"services.exe",
     L"lsass.exe", L"lsaiso.exe", L"registry.exe", L"memory compression", L"dwm.exe",
@@ -13,7 +13,7 @@ const wchar_t* const kProtectedNames[] = {
 }  // namespace
 
 std::wstring ProtectedReason(uint32_t pid, const std::wstring& name, const std::wstring& path) {
-    (void)path;  // path kept in signature for future parent-chain / signature hardening
+    (void)path;  // 保留 path 参数，便于将来做父进程链/签名加固
     if (pid == 0) return L"System Idle Process 是系统保留进程";
     if (pid == 4) return L"System 进程是内核进程";
     for (const wchar_t* n : kProtectedNames) {

@@ -1,19 +1,19 @@
 #pragma once
-// Confirm-dialog execution layer (bug F1 fix, 2026-09): the action performed when
-// the user presses the confirm button of any destructive-op dialog, extracted from
-// the ImGui translation units into this header-only, ImGui-free function so
-// stm_selftest can exercise the whole "confirm -> jobs.Submit -> ops -> notes/toast"
-// chain without a GUI.
+// 确认对话框执行层（bug F1 修复，2026-09）：用户按下任何破坏性操作
+// 对话框的确认按钮时所执行的动作，从 ImGui 编译单元中抽取为
+// 这个仅头文件、不依赖 ImGui 的函数，使 stm_selftest 能在无 GUI
+// 的情况下走通 "确认 -> jobs.Submit -> ops -> notes/toast" 整条链。
 //
-// Contract:
-//  - ONLY the UI confirm button calls ExecuteConfirmedAction(); it never runs ops
-//    inline — everything goes through ctx->jobs (serial ops worker, arch section 5).
-//  - EVERY path produces a user-visible notification: the job posts success/failure
-//    via ctx->notes (drained into toasts by the shell), and a submission failure
-//    (queue not running / context gone) posts a JobFailed note immediately instead
+//
+// 契约：
+//  - 只有 UI 确认按钮调用 ExecuteConfirmedAction()；它绝不内联执行 ops
+//    ——一切经 ctx->jobs（串行 ops 工作线程，架构第 5 节）。
+//  - 每条路径都产生用户可见的通知：任务把成败经 ctx->notes 投递
+//   （由外壳取空变成 toast）；提交失败（队列未运行 / 上下文已失）
+//    则立即投递 JobFailed 通知，
 //    of failing silently (the "没有任何反应" class of bug).
-//  - Depends only on core/ + ops/ (+ the AppContext aggregate), never on ImGui,
-//    so stm_selftest (core+collect+ops link) can include it.
+//  - 只依赖 core/ + ops/（+ AppContext 聚合体），绝不依赖 ImGui，
+//    使 stm_selftest（链接 core+collect+ops）可以包含它。
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -32,8 +32,8 @@
 namespace stm {
 namespace ui {
 
-// Kind of the pending confirm dialog (shared by the process-page dialogs and the
-// phase-3 startup dialog).
+// 待决确认对话框的类别（进程页对话框与第 3 阶段启动对话框共用）。
+//
 struct ConfirmKind {
     enum E {
         None = 0,
@@ -53,8 +53,8 @@ struct ConfirmKind {
     };
 };
 
-// Pending confirmation request. Identity fields (ProcKey/name/path/startup item)
-// are locked when the dialog opens; ops re-verifies identity at execution time.
+// 待决确认请求。身份字段（ProcKey/name/path/启动项）在对话框
+// 打开时锁定；ops 在执行时复核身份。
 struct ConfirmRequest {
     ConfirmKind::E kind = ConfirmKind::None;
     ProcKey key;
@@ -62,13 +62,13 @@ struct ConfirmRequest {
     std::wstring name;
     std::wstring path;
     bool serviceHost = false;
-    // Tree planning: filled by an ops job, polled by the UI until ready.
-    // -1 pending, -2 planning failed, >= 0 planned count.
+    // 树规划：由 ops 任务填充，UI 轮询直到就绪。
+    // -1 处理中，-2 规划失败，>= 0 计划数量。
     std::shared_ptr<std::atomic<int>> planCount;
-    // StartupToggle only.
+    // 仅 StartupToggle 使用。
     bool startupEnable = false;
     ops::StartupItem startupItem;
-    // F4#2: SetPriority -> priority; SetAffinity -> affinityMask (nonzero).
+    // F4#2：SetPriority -> priority；SetAffinity -> affinityMask（非零）。
     ops::ProcPriority priority = ops::ProcPriority::Normal;
     uint64_t affinityMask = 0;
     // P3 任务三 CloseAsk only: 「记住我的选择」复选框（勾选时才写 cfg closeAction）。
@@ -88,8 +88,8 @@ struct ConfirmRequest {
 inline constexpr wchar_t kCloseActionCfgKey[] = L"closeAction";
 inline int NormalizeCloseAction(int64_t v) { return v == 1 ? 1 : v == 2 ? 2 : 0; }
 
-// Non-empty suffix appended to failure notes when not elevated (H5 requirement:
-// the user must see why an op may have failed and what to try next).
+// 未提权时附加在失败通知后的非空后缀（H5 要求：
+// 用户必须看到操作可能失败的原因以及下一步可尝试什么）。
 inline std::wstring AdminHintSuffix(bool elevated) {
     return elevated ? std::wstring() : std::wstring(L"（可能需要管理员权限，可尝试提权重启）");
 }
@@ -101,9 +101,9 @@ inline void PostConfirmNote(AppContext& app, Notification::Kind kind, const std:
     app.notes.Push(std::move(n));
 }
 
-// Every job lambda captures the shared AppContext BY VALUE (same lifetime pattern
-// as the rest of the app: an in-flight op must keep notes/jobs alive past teardown,
-// V7-P1-3) and reports its outcome through app->notes -> shell toasts.
+// 每个任务 lambda 按值捕获共享 AppContext（与应用其他地方相同的
+// 生命周期模式：在途操作必须让 notes/jobs 活过拆除，
+// V7-P1-3），并经 app->notes -> 外壳 toast 上报结果。
 
 inline std::function<void()> MakeKillJob(std::shared_ptr<AppContext> app, const ConfirmRequest& req) {
     const bool elevated = app->elevated;
@@ -121,8 +121,8 @@ inline std::function<void()> MakeKillJob(std::shared_ptr<AppContext> app, const 
     };
 }
 
-// The dialog's plan (planCount) is only a preview; execution re-plans under the
-// ops worker at act-time like the ProcessOps contract requires.
+// 对话框里的计划（planCount）只是预览；执行时按 ProcessOps 契约
+// 在 ops 工作线程上重新规划。
 inline std::function<void()> MakeKillTreeJob(std::shared_ptr<AppContext> app,
                                              const ConfirmRequest& req) {
     const bool elevated = app->elevated;
@@ -197,8 +197,8 @@ inline std::function<void()> MakeStartupToggleJob(std::shared_ptr<AppContext> ap
 }
 
 // ---------------------------------------------------------------------------
-// F4#2: process control jobs (suspend/resume/priority/affinity). Same protocol:
-// ops re-verifies (pid, createTime) identity and refuses protected processes.
+// F4#2：进程控制任务（挂起/恢复/优先级/亲和性）。同一协议：
+// ops 复核 (pid, createTime) 身份并拒绝受保护进程。
 // ---------------------------------------------------------------------------
 
 inline std::wstring ControlTargetLabel(const ConfirmRequest& req) {
@@ -320,11 +320,11 @@ inline std::function<void()> MakeMemCleanupJob(std::shared_ptr<AppContext> app,
     };
 }
 
-// Execute the confirmed action: the ONLY entry point a confirm-dialog confirm
-// button should call. Returns true when the op job was queued; a false return is
-// always accompanied by an immediately-posted JobFailed notification (never silent).
+// 执行已确认的动作：确认对话框的确认按钮唯一应调用的入口。
+// 操作任务入队成功返回 true；返回 false 时必然伴随一条
+// 立即投递的 JobFailed 通知（绝不静默）。
 inline bool ExecuteConfirmedAction(std::shared_ptr<AppContext> ctx, const ConfirmRequest& req) {
-    if (!ctx) return false;  // app already torn down; no notes queue left to inform
+    if (!ctx) return false;  // 应用已拆除；没有 notes 队列可通知
     std::function<void()> job;
     switch (req.kind) {
         case ConfirmKind::Kill: job = MakeKillJob(ctx, req); break;
@@ -347,7 +347,7 @@ inline bool ExecuteConfirmedAction(std::shared_ptr<AppContext> ctx, const Confir
         case ConfirmKind::None:
         default: return false;
     }
-    // Submit returns 0 when the queue is not running (teardown): never silent.
+    // 队列未运行（拆除中）时 Submit 返回 0：绝不静默。
     if (ctx->jobs.Submit(std::move(job)) == 0) {
         PostConfirmNote(*ctx, Notification::Kind::JobFailed,
                         L"操作队列未运行，指令未能提交（应用可能正在退出）");

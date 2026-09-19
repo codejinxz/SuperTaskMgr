@@ -1,6 +1,6 @@
-// collect: selftest cases for the collection layer (arch section 11).
-// Each case runs the real CollectService for a few ticks and validates the
-// snapshot contract. System-level net/disk fields are allowed to be kUnavail.
+// collect：采集层的自测用例（架构第 11 节）。
+// 每个用例让真实 CollectService 跑几个 tick 并校验快照契约。
+// 系统级网络/磁盘字段允许为 kUnavail。
 #include "selftest/TestFramework.h"
 #include "collect/CollectService.h"
 #include "core/ProcData.h"
@@ -20,13 +20,13 @@ using stm::kUnavailU64;
 using stm::ProcInfo;
 using stm::Snapshot;
 
-// Stops the service on scope exit even when an assertion fails early.
+// 即使断言提前失败也在作用域退出时停止服务。
 struct ServiceGuard {
     CollectService& svc;
     ~ServiceGuard() { svc.Stop(); }
 };
 
-// Polls the store until tickId >= n. Returns the latest snapshot.
+// 轮询仓库直到 tickId >= n。返回最新快照。
 std::shared_ptr<const Snapshot> WaitForTicks(CollectService& svc, uint64_t n, int timeoutMs,
                                              bool* reached) {
     for (int waited = 0; waited < timeoutMs; waited += 50) {
@@ -53,7 +53,7 @@ uint64_t FtU64(const FILETIME& f) {
 
 }  // namespace
 
-// --- snapshot integrity: procs non-empty, ascending pid, self present --------
+// --- 快照完整性：procs 非空、pid 升序、自身存在 --------
 STM_TEST(collect_snapshot_integrity) {
     CollectService svc;
     ServiceGuard guard{svc};
@@ -77,7 +77,7 @@ STM_TEST(collect_snapshot_integrity) {
             return false;
         }
     }
-    // Self process: present with a sane name and create time.
+    // 自身进程：存在且名称与创建时间正常。
     const uint32_t selfPid = ::GetCurrentProcessId();
     const ProcInfo* self = nullptr;
     for (const ProcInfo& p : s->procs) {
@@ -102,7 +102,7 @@ STM_TEST(collect_snapshot_integrity) {
     }
     const int64_t diff = static_cast<int64_t>(self->key.createTime) -
                          static_cast<int64_t>(FtU64(ct));
-    constexpr int64_t k2s = 20'000'000LL;  // 100ns units
+    constexpr int64_t k2s = 20'000'000LL;  // 100ns 单位
     if (diff > k2s || diff < -k2s) {
         *err = L"自身 createTime 与 GetProcessTimes 偏差超过 2 秒";
         return false;
@@ -110,7 +110,7 @@ STM_TEST(collect_snapshot_integrity) {
     return true;
 }
 
-// --- self-check gate outcome: fast path or honest degradation, never crash ---
+// --- 自检门限结果：快路径或诚实降级，绝不崩溃 ---
 STM_TEST(collect_selfcheck_gate) {
     CollectService svc;
     ServiceGuard guard{svc};
@@ -124,7 +124,7 @@ STM_TEST(collect_selfcheck_gate) {
         *err = L"8 秒内未产出 2 个快照";
         return false;
     }
-    // Either outcome is valid on a healthy machine; a degraded snapshot must
+    // 健康机器上两种结果都有效；降级快照必须
     // always carry a non-empty reason (UI shows it as 兼容模式).
     if (s->degraded && s->degradeReason.empty()) {
         *err = L"降级快照缺少降级原因";
@@ -133,11 +133,11 @@ STM_TEST(collect_selfcheck_gate) {
     return true;
 }
 
-// --- tick latency: warm-tick p50 < 15ms, lastTickMs < 100 --------------------
-// p50 is measured over warm ticks only (sample 0 is the cold start). If the
-// first round exceeds the budget this box is usually busy with unrelated work
-// (concurrent builds), so one re-sample round follows a short cooldown; the
-// test fails only when BOTH rounds exceed the budget.
+// --- tick 延迟：热 tick p50 < 15ms，lastTickMs < 100 --------------------
+// p50 只按热 tick 测量（样本 0 是冷启动）。若首轮超预算，多半是本机
+// 正忙于无关工作（并发构建），因此短暂冷却后补测一轮；
+// 只有两轮都超预算才判失败。
+//
 STM_TEST(collect_tick_latency) {
     CollectService svc;
     ServiceGuard guard{svc};
@@ -172,13 +172,13 @@ STM_TEST(collect_tick_latency) {
             return true;
         }
         worstP50 = p50;
-        ::Sleep(2000);  // cooldown: let unrelated machine load subside
+        ::Sleep(2000);  // 冷却：等无关机器负载平息
     }
     *err = stm::Fmt(L"tick p50 ≥ 15ms（两轮 p50≈{:.1f}ms）", worstP50);
     return false;
 }
 
-// --- private working set: NtQSI primary source, gate-validated ---------------
+// --- 私有工作集：NtQSI 主来源，门限校验 ---------------
 STM_TEST(collect_privatews_gate) {
     CollectService svc;
     ServiceGuard guard{svc};
@@ -205,8 +205,8 @@ STM_TEST(collect_privatews_gate) {
         return false;
     }
     if (s->degraded) {
-        // Gate failed (or NtQSI unavailable): the field degrades honestly to
-        // kUnavailU64 like every other slow-path gap; a real value is fine too.
+        // 门限失败（或 NtQSI 不可用）：该字段诚实降级为
+        // kUnavailU64，与其他慢路径空缺一致；有真实值也行。
         if (self->privateWorkingSet != kUnavailU64 && self->privateWorkingSet == 0) {
             *err = L"降级模式下私有工作集为 0（应为 kUnavailU64 或真实值）";
             return false;
@@ -228,7 +228,7 @@ STM_TEST(collect_privatews_gate) {
     return true;
 }
 
-// --- system PDH rates: values appear or degrade honestly to kUnavail ---------
+// --- 系统 PDH 速率：出值或诚实降级为 kUnavail ---------
 STM_TEST(collect_pdh_english_counters) {
     CollectService svc;
     ServiceGuard guard{svc};
@@ -242,8 +242,8 @@ STM_TEST(collect_pdh_english_counters) {
         *err = L"15 秒内未产出 6 个 tick";
         return false;
     }
-    // Every rate field must be either kUnavail (honest degrade, e.g. counter
-    // absent on this perflib) or a sane non-negative measurement.
+    // 每个速率字段要么为 kUnavail（诚实降级，如本 perflib
+    // 缺该计数器），要么为合理的非负测量值。
     const double rates[] = {s->sys.diskReadBps,   s->sys.diskWriteBps,
                             s->sys.netRecvBps,    s->sys.netSendBps,
                             s->sys.hardFaultsPerSec};
@@ -256,7 +256,7 @@ STM_TEST(collect_pdh_english_counters) {
     return true;
 }
 
-// --- GPU adapters: virtual display adapters (IddCx) must be filtered ---------
+// --- GPU 适配器：必须过滤虚拟显示适配器（IddCx）---------
 STM_TEST(collect_gpu_adapters_filtered) {
     CollectService svc;
     ServiceGuard guard{svc};

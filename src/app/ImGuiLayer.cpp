@@ -10,8 +10,8 @@
 namespace stm {
 
 namespace {
-// msyh.ttc ships with Win10/11 (zh-capable); fall back to other CJK system fonts.
-// System fonts are NOT redistributable; we only load from disk at runtime.
+// msyh.ttc 随 Win10/11 提供（支持中文）；必要时回退到其他 CJK 系统字体。
+// 系统字体不可再分发；我们只在运行时从磁盘加载。
 const wchar_t* const kFontCandidates[] = {
     L"C:\\Windows\\Fonts\\msyh.ttc",
     L"C:\\Windows\\Fonts\\msyhl.ttc",
@@ -24,19 +24,19 @@ bool ImGuiLayer::Init(HWND hwnd, D3DRenderer* renderer, float fontSizePx) {
     hwnd_ = hwnd;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImPlot::CreateContext();  // performance page charts
+    ImPlot::CreateContext();  // 性能页图表用
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.IniFilename = nullptr;  // we persist layout in our own config
+    io.IniFilename = nullptr;  // 布局持久化保存在我们自己的配置里
 
-    // Font: dynamic atlas in 1.92 loads glyphs on demand; FontNo=0 selects the first face
-    // of msyh.ttc ("Microsoft YaHei UI"). Sizes are DIP-ish; DPI rescaling is per-viewport.
+    // 字体：1.92 的动态图集按需加载字形；FontNo=0 选择 msyh.ttc 的
+    // 第一个字面（"Microsoft YaHei UI"）。尺寸接近 DIP；DPI 缩放按视口进行。
     ImFontConfig cfg;
     cfg.FontNo = 0;
     bool fontOk = false;
     for (const wchar_t* path : kFontCandidates) {
         if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-            // ImGui expects narrow (UTF-8) paths.
+            // ImGui 期望窄字符（UTF-8）路径。
             const std::string pathU8 = WideToUtf8(path);
             if (io.Fonts->AddFontFromFileTTF(pathU8.c_str(), fontSizePx, &cfg)) {
                 fontUsed_ = path;
@@ -51,8 +51,8 @@ bool ImGuiLayer::Init(HWND hwnd, D3DRenderer* renderer, float fontSizePx) {
     }
 
     if (!ImGui_ImplWin32_Init(hwnd)) {
-        // V7-P1-4: roll back what Init already created (ImPlot + ImGui contexts,
-        // font atlas) instead of leaking them on backend failure.
+        // V7-P1-4：回滚 Init 已创建的资源（ImPlot + ImGui 上下文、
+        // 字体图集），而不是在后端失败时泄漏它们。
         ImPlot::DestroyContext();
         ImGui::DestroyContext();
         return false;

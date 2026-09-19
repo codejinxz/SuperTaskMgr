@@ -19,10 +19,10 @@ bool D3DRenderer::Init(HWND hwnd, int w, int h) {
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     sd.Flags = 0;
 
-    // No D3D11_CREATE_DEVICE_DEBUG: the debug layer is an optional OS feature and its
-    // absence would silently push us onto WARP. We are not using the debug layer.
+    // 不用 D3D11_CREATE_DEVICE_DEBUG：调试层是可选的 OS 功能，缺失时
+    // 会静默把我们推到 WARP 上。我们并不使用调试层。
     const UINT flags = 0;
-    // FL 10.0 baseline (arch: WARP fallback guaranteed by DX11 requirement set).
+    // FL 10.0 基线（架构：DX11 需求集保证 WARP 兜底）。
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL got{};
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -30,7 +30,7 @@ bool D3DRenderer::Init(HWND hwnd, int w, int h) {
                                                &sd, swapChain_.GetAddressOf(),
                                                device_.GetAddressOf(), &got, context_.GetAddressOf());
     if (FAILED(hr)) {
-        // Hardware path failed (RDP / broken driver): WARP software fallback.
+        // 硬件路径失败（RDP / 驱动损坏）：WARP 软件兜底。
         hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
                                            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                                            &sd, swapChain_.GetAddressOf(),
@@ -60,7 +60,7 @@ void D3DRenderer::Resize(int w, int h) {
 
 void D3DRenderer::BeginFrame() {
     if (!mainTarget_) return;
-    const float clear[4] = {0.086f, 0.090f, 0.106f, 1.0f};  // matches dark theme bg
+    const float clear[4] = {0.086f, 0.090f, 0.106f, 1.0f};  // 与深色主题背景一致
     context_->OMSetRenderTargets(1, mainTarget_.GetAddressOf(), nullptr);
     context_->ClearRenderTargetView(mainTarget_.Get(), clear);
 }

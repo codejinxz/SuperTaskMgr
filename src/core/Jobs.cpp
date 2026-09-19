@@ -48,7 +48,7 @@ void JobQueue::Shutdown(uint32_t waitMs) {
     cv_.notify_all();
 
     if (waitMs > 0) {
-        // Give the in-flight job up to waitMs to finish.
+        // 给执行中的任务至多 waitMs 的时间去完成。
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
         while (std::chrono::steady_clock::now() < deadline) {
             {
@@ -62,7 +62,7 @@ void JobQueue::Shutdown(uint32_t waitMs) {
         std::lock_guard<std::mutex> lock(mu_);
         if (busy_ && !worker_.joinable()) return;
         if (busy_) {
-            // In-flight job refused to finish in time; detach (process teardown will follow).
+            // 执行中的任务未在期限内结束；放弃等待（随后进程将进入退出清理）。
             STM_LOG_WARN("jobs", L"在途任务超时未完成，worker 分离退出");
             worker_.detach();
             return;
@@ -88,7 +88,7 @@ void JobQueue::Run() {
             busy_ = true;
         }
         try {
-            job();  // producer exceptions must not kill the worker (phase-3 review V10-P2)
+            job();  // 生产者抛出的异常不得杀死工作线程（第 3 阶段评审 V10-P2）
         } catch (const std::exception& e) {
             STM_LOG_ERROR("jobs", L"任务 seq={} 抛出异常: {}", seq, Utf8ToWide(e.what()));
         } catch (...) {

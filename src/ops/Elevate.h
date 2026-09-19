@@ -1,16 +1,16 @@
 #pragma once
-// Elevation helpers (arch section 7). Contract header — architect-owned.
+// 提权辅助（架构第 7 节）。契约头——归架构所有。
 #include <string>
 
 namespace stm {
 namespace ops {
 
-bool IsElevated();        // forwards to core::IsProcessElevated
-bool CanElevate();        // UAC-capable system and current token may request elevation
+bool IsElevated();        // 转发到 core::IsProcessElevated
+bool CanElevate();        // 系统支持 UAC 且当前令牌可请求提权
 
-// Relaunch self with lpVerb=L"runas". ERROR_CANCELLED is swallowed (user declined => false, no exit).
-// Returns TRUE only when a new process was launched — caller must exit immediately.
-// Session handoff (SaveSession before calling) is the caller's duty, per arch section 7.
+// 以 lpVerb=L"runas" 重启自身。ERROR_CANCELLED 被吞掉（用户拒绝 => false，不退出）。
+// 仅当新进程已启动时返回 TRUE——调用方必须立即退出。
+// 会话交接（调用前 SaveSession）是调用方的职责，见架构第 7 节。
 bool RelaunchAsAdmin(const std::wstring& args);
 
 }  // namespace ops

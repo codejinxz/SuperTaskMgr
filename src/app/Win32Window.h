@@ -1,5 +1,5 @@
 #pragma once
-// Win32 top-level window hosting the D3D11 swap chain (thin shell; no business logic).
+// 承载 D3D11 交换链的 Win32 顶层窗口（薄壳；无业务逻辑）。
 #include <windows.h>
 #include <atomic>
 #include <functional>
@@ -7,11 +7,11 @@
 namespace stm {
 
 struct WindowCallbacks {
-    std::atomic<bool>* quit = nullptr;                   // set on WM_DESTROY (cross-thread)
-    void (*onResize)(void* ud, int w, int h) = nullptr;  // WM_SIZE (w/h may be 0 while minimizing)
+    std::atomic<bool>* quit = nullptr;                   // WM_DESTROY 时置位（跨线程）
+    void (*onResize)(void* ud, int w, int h) = nullptr;  // WM_SIZE（最小化时 w/h 可能为 0）
     void* ud = nullptr;
-    // Optional custom-message hook (tray icon etc.). Runs before the built-in switch;
-    // set *handled=true (and return the result) to skip the default handling.
+    // 可选的自定义消息钩子（托盘图标等）。在内建 switch 之前运行；
+    // 置 *handled=true（并返回结果）可跳过默认处理。
     std::function<LRESULT(HWND, UINT, WPARAM, LPARAM, bool* handled)> onMessage;
 };
 
@@ -25,7 +25,7 @@ public:
     int Width() const { return width_; }
     int Height() const { return height_; }
 
-    // Per-Monitor-V2 awareness; call once before creating any window.
+    // Per-Monitor-V2 感知；在创建任何窗口前调用一次。
     static void EnableDpiAwareness();
 
 private:

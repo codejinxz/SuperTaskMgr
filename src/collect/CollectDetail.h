@@ -1,10 +1,10 @@
 #pragma once
-// INTERNAL header for the stm_collect implementation — NOT a contract header.
-// Only src/collect/CollectService.h is architect-owned and frozen; everything
-// declared here is private to the collection library and may change freely.
+// stm_collect 实现的内部头文件——不是契约头。
+// 只有 src/collect/CollectService.h 由架构所有并冻结；这里声明的
+// 一切都属采集库私有，可自由变更。
 #include <windows.h>
-#include <evntcons.h>  // EVENT_RECORD (ETW consumer callback payload)
-#include <evntrace.h>  // TRACEHANDLE / session APIs
+#include <evntcons.h>  // EVENT_RECORD（ETW 消费回调的载荷）
+#include <evntrace.h>  // TRACEHANDLE / 会话 API
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <chrono>
@@ -21,129 +21,129 @@ namespace stm {
 namespace cd {
 
 // ---------------------------------------------------------------------------
-// NtQuerySystemInformation (ntdll loaded dynamically; structure layout per the
-// NtDoc / Geoff Chappell x64 layout, static-asserted and *verified at runtime*
-// by the SelfCheckGate before the fast path is ever trusted).
+// NtQuerySystemInformation（ntdll 动态加载；结构布局采用
+// NtDoc / Geoff Chappell 的 x64 布局，静态断言，并在信任快路径前
+// 由 SelfCheckGate 在运行时*实际校验*）。
 // ---------------------------------------------------------------------------
 struct NtProcRow {
     uint32_t pid = 0, parentPid = 0, sessionId = 0;
     uint32_t handles = 0, threads = 0;
-    uint64_t createTime = 0, kernelTime = 0, userTime = 0;  // cumulative, 100ns
-    uint64_t workingSet = 0;                                // bytes
-    int64_t privateWs = 0;  // WorkingSetPrivateSize (bytes; may be negative on some builds)
-    uint64_t privateCommit = 0;                             // PrivatePageCount (= PrivateUsage)
-    uint64_t pageFaults = 0;                                // cumulative count
-    uint64_t ioReadBytes = 0, ioWriteBytes = 0, ioOtherBytes = 0;  // transfer counts
-    uint64_t ctxSwitches = 0;                               // thread ContextSwitches sum
-    bool allThreadsSuspended = false;                       // every thread Waiting+Suspended
+    uint64_t createTime = 0, kernelTime = 0, userTime = 0;  // 累计值，100ns
+    uint64_t workingSet = 0;                                // 字节
+    int64_t privateWs = 0;  // WorkingSetPrivateSize（字节；某些构建上可能为负）
+    uint64_t privateCommit = 0;                             // PrivatePageCount（= PrivateUsage）
+    uint64_t pageFaults = 0;                                // 累计次数
+    uint64_t ioReadBytes = 0, ioWriteBytes = 0, ioOtherBytes = 0;  // 传输字节数
+    uint64_t ctxSwitches = 0;                               // 线程 ContextSwitches 之和
+    bool allThreadsSuspended = false;                       // 所有线程均为 Waiting+Suspended
     std::wstring name;
 };
-// One full-system snapshot. Returns false when ntdll/NtQSI is unavailable.
+// 一次全系统快照。ntdll/NtQSI 不可用时返回 false。
 bool NtqsiQueryProcesses(std::vector<NtProcRow>* out);
 
-struct CoreTimes { uint64_t idle = 0, kernel = 0, user = 0; };  // 100ns; kernel includes idle
-// NtQSI(SystemProcessorPerformanceInformation) — one entry per logical core.
+struct CoreTimes { uint64_t idle = 0, kernel = 0, user = 0; };  // 100ns；kernel 含空闲时间
+// NtQSI(SystemProcessorPerformanceInformation)——每个逻辑核心一条。
 bool NtqsiQueryPerCoreTimes(std::vector<CoreTimes>* out);
 
-// Commit / kernel memory counters from NtQSI(SystemPerformanceInformation) —
-// replaces the ~10ms GetPerformanceInfo call in the tick path (values in PAGES;
-// multiply by page size). Cross-checked against GetPerformanceInfo on this
-// machine (commit/limit/paged/nonpaged all match).
+// 来自 NtQSI(SystemPerformanceInformation) 的提交/内核内存计数器——
+// 取代 tick 路径上约 10ms 的 GetPerformanceInfo 调用（值以 PAGES 计；
+// 需乘以页大小）。已在本机与 GetPerformanceInfo 交叉核对
+//（commit/limit/paged/nonpaged 全部一致）。
 struct SysMemCounters {
     uint64_t commitPages = 0, commitLimitPages = 0, pagedPoolPages = 0, nonPagedPoolPages = 0;
 };
 bool NtqsiQueryMemoryCounters(SysMemCounters* out);
 
 // ---------------------------------------------------------------------------
-// PDH helpers. Wildcard-array pattern (R5 #9b + MSDN "Enumerating Object
-// Instances"): PdhAddEnglishCounterW resolves the language-neutral name and
-// PdhGetCounterInfo yields the LOCALIZED wildcard template, which is added to
-// the live query ONCE. After each PdhCollectQueryData, PdhGetFormattedCounterArrayW
-// returns one value per live instance with the full "#N"-suffixed instance
-// name — the instance set is tracked by PDH itself, so no rebuild is needed.
+// PDH 辅助。通配符数组模式（R5 #9b + MSDN "Enumerating Object
+// Instances"）：PdhAddEnglishCounterW 解析语言无关名称，
+// PdhGetCounterInfo 取得本地化的通配符模板，只把它添加到活动查询
+// 一次。每次 PdhCollectQueryData 之后，PdhGetFormattedCounterArrayW
+// 为每个活动实例返回一个值，实例名带完整的 "#N" 后缀——
+// 实例集合由 PDH 自己维护，无需重建。
 // ---------------------------------------------------------------------------
 struct PdhArrayItem {
-    std::wstring name;   // instance name, e.g. "svchost#76" / "pid_1_luid_0x.._phys_0"
+    std::wstring name;   // 实例名，如 "svchost#76" / "pid_1_luid_0x.._phys_0"
     double value = 0.0;
-    bool valid = false;  // false when PDH has no valid sample yet (rate warm-up)
+    bool valid = false;  // PDH 尚无有效样本时为 false（速率预热）
 };
-// Resolve a language-neutral English path to the localized template (once per
-// counter, at collector init). False = counter set unavailable (hard failure).
+// 把语言无关的英文路径解析为本地化模板（每个计数器一次，
+// 在采集器初始化时）。false = 计数器集不可用（硬失败）。
 bool PdhLocalizeEnglishPath(const wchar_t* englishPath, std::wstring* localizedTemplate);
-// Add the localized wildcard template as a counter of `query`.
+// 把本地化通配符模板作为 `query` 的计数器加入。
 bool PdhAddWildcardCounter(PDH_HQUERY query, const std::wstring& localizedTemplate,
                            PDH_HCOUNTER* out);
 inline void PdhCloseQuerySafe(PDH_HQUERY* q) {
     if (q && *q) { PdhCloseQuery(*q); *q = nullptr; }
 }
 bool PdhCollect(PDH_HQUERY q);
-// All instance values of a wildcard counter. Items with valid=false had no
-// usable sample yet (rate counters need two collects; fresh instances).
+// 通配符计数器的全部实例值。valid=false 的条目表示尚无
+// 可用样本（速率计数器需要两次采集；新出现的实例）。
 bool PdhFmtArrayDouble(PDH_HCOUNTER h, std::vector<PdhArrayItem>* out);
-// Single (non-wildcard) counter value; false when no valid sample yet.
+// 单个（非通配）计数器值；尚无有效样本时为 false。
 bool PdhFmtDouble(PDH_HCOUNTER h, double* out);
 
 // ---------------------------------------------------------------------------
-// Toolhelp fallback used by the degraded (compatibility) path.
+// 降级（兼容）路径使用的 Toolhelp 兜底。
 // ---------------------------------------------------------------------------
 struct ToolhelpRow {
     uint32_t pid = 0, parentPid = 0, threads = 0;
     std::wstring name;
 };
 bool ToolhelpEnumerate(std::vector<ToolhelpRow>* out);
-// Thread count for one pid (own snapshot; used sparingly — self-check gate).
+// 单个 pid 的线程数（自建快照；克制使用——受自检门限约束）。
 uint32_t ToolhelpThreadCountOf(uint32_t pid);
 
 // ---------------------------------------------------------------------------
-// Collectors. State lives in these objects; methods are defined in the
-// matching .cpp translation units (ProcessCollector.cpp etc).
+// 各采集器。状态保存在这些对象里；方法定义在对应的
+// .cpp 编译单元中（ProcessCollector.cpp 等）。
 // ---------------------------------------------------------------------------
 class ProcessCollector {
 public:
     struct Totals { uint32_t procCount = 0, handleTotal = 0, threadTotal = 0; };
     struct TickOut {
-        std::vector<ProcInfo> procs;                 // ascending by pid
-        Totals totals;                               // NtQSI aggregation (valid when ntsiOk)
-        double elapsedSec = 0;                       // since previous Collect (0 on first)
-        bool ntsiOk = false;                         // true = NtQSI fast path produced this data
-        // pid -> createTime of THIS tick's processes; used by GpuCollector to map
-        // GPU counter pids onto (pid, createTime) identities. Unmatched pids drop.
+        std::vector<ProcInfo> procs;                 // 按 pid 升序
+        Totals totals;                               // NtQSI 聚合（ntsiOk 时有效）
+        double elapsedSec = 0;                       // 距上次 Collect（首次为 0）
+        bool ntsiOk = false;                         // true = 本数据来自 NtQSI 快路径
+        // 本 tick 进程的 pid -> createTime；供 GpuCollector 把 GPU 计数器
+        // 的 pid 映射到 (pid, createTime) 身份。匹配不上的 pid 丢弃。
         std::unordered_map<uint32_t, uint64_t> createTimeByPid;
     };
-    // tickId drives the 1/5-sliced supplementary refresh; degraded switches to
-    // the Toolhelp+PSAPI slow path. Never throws.
+    // tickId 驱动每 tick 轮转刷新 1/5 进程的补充信息；degraded 时切换到
+    // Toolhelp+PSAPI 慢路径。绝不抛异常。
     void Collect(uint64_t tickId, bool degraded, TickOut* out);
 
-    struct Supp {  // cached supplementary info, refreshed 1/5 of procs per tick
+    struct Supp {  // 缓存的补充信息，每 tick 轮转刷新 1/5 进程
         std::wstring path, title;
         uint32_t flags = 0;
     };
 
 private:
-    struct Prev {  // previous-tick cumulatives for delta fields (pid keyed)
+    struct Prev {  // 上一 tick 的累计值，供差值字段使用（按 pid 键）
         uint64_t createTime = 0, execTime = 0, ioBytes = 0, pageFaults = 0, ctx = 0;
         bool execKnown = false, ioKnown = false, pfKnown = false, ctxKnown = false;
     };
     std::unordered_map<uint32_t, Prev> prev_;
-    std::set<ProcKey> denied_;   // sticky PF_AccessDenied, keyed by (pid, createTime)
+    std::set<ProcKey> denied_;   // 粘滞的 PF_AccessDenied，按 (pid, createTime) 键
     std::unordered_map<ProcKey, Supp> supp_;
-    std::unordered_map<uint32_t, uint32_t> servicesByPid_;  // pid -> running svc count
+    std::unordered_map<uint32_t, uint32_t> servicesByPid_;  // pid -> 运行中服务数
     std::unordered_map<uint32_t, std::wstring> titlesByPid_;
     std::chrono::steady_clock::time_point lastCollect_{};
     bool haveLast_ = false;
-    // privateWorkingSet comes straight from NtQSI WorkingSetPrivateSize on the
-    // fast path (validated once by SelfCheckGate item 6 against a one-shot PDH
-    // read); no per-tick PDH process query exists. The slow path leaves it
-    // kUnavailU64.
+    // 快路径上 privateWorkingSet 直接取自 NtQSI WorkingSetPrivateSize
+    //（由 SelfCheckGate 第 6 项对照一次性 PDH 读取校验一次）；
+    // 不存在每 tick 的 PDH 进程查询。慢路径将其留为
+    // kUnavailU64。
 };
 
 class SystemCollector {
 public:
     SystemCollector() = default;
-    ~SystemCollector();  // closes the PDH query (review V7-P1-1)
+    ~SystemCollector();  // 关闭 PDH 查询（评审 V7-P1-1）
     SystemCollector(const SystemCollector&) = delete;
     SystemCollector& operator=(const SystemCollector&) = delete;
-    // pt supplies the NtQSI aggregate totals + elapsed seconds for rates.
+    // pt 提供 NtQSI 聚合总量 + 用于计算速率的经过秒数。
     void Collect(const ProcessCollector::TickOut& pt, SystemInfo* out);
 
 private:
@@ -153,10 +153,10 @@ private:
     bool haveCpuPrev_ = false;
     std::vector<CoreTimes> prevCore_;
     bool haveCorePrev_ = false;
-    uint64_t prevRecv_ = 0, prevSend_ = 0;  // GetIfTable2 octet counters
+    uint64_t prevRecv_ = 0, prevSend_ = 0;  // GetIfTable2 字节计数器
     bool haveNetPrev_ = false;
-    // PDH: disk rates (wildcard; PDH tracks the instance set itself) +
-    // system-wide hard faults (plain counter).
+    // PDH：磁盘速率（通配；实例集合由 PDH 自身维护）+
+    // 全系统硬缺页（普通计数器）。
     PDH_HQUERY pdhQuery_ = nullptr;
     PDH_HCOUNTER diskRead_ = nullptr, diskWrite_ = nullptr, hardFaults_ = nullptr;
     bool pdhFailed_ = false, pdhLogged_ = false;
@@ -165,12 +165,12 @@ private:
 class GpuCollector {
 public:
     GpuCollector() = default;
-    ~GpuCollector();  // closes the PDH query (review V7-P1-1)
+    ~GpuCollector();  // 关闭 PDH 查询（评审 V7-P1-1）
     GpuCollector(const GpuCollector&) = delete;
     GpuCollector& operator=(const GpuCollector&) = delete;
-    // Gathers DXGI adapters + PDH GPU Engine / GPU Process Memory counters.
-    // createTimeByPid: this tick's process identities for pid matching (R5 #11:
-    // GPU counter instances carry pid only; pids absent from the snapshot drop).
+    // 汇集 DXGI 适配器 + PDH GPU Engine / GPU Process Memory 计数器。
+    // createTimeByPid：本 tick 的进程身份，用于 pid 匹配（R5 #11：
+    // GPU 计数器实例只带 pid；快照中不存在的 pid 丢弃）。
     void Collect(const std::unordered_map<uint32_t, uint64_t>& createTimeByPid,
                  std::vector<GpuProcUsage>* procsOut,
                  std::vector<GpuAdapterInfo>* adaptersOut,
@@ -187,15 +187,15 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// EtwNetCollector (phase 3, R5 #10b): a private real-time ETW session on the
-// manifest provider Microsoft-Windows-Kernel-Network, aggregating cumulative
-// per-pid recv/send bytes from the recvdata(10)/senddata(11) events. Admin
-// only — Start() fails with a logged error otherwise (feature stays disabled,
-// default OFF). Resource charter (arch §5): session name carries our pid to
-// avoid orphans, a stale same-name session is stopped before start, and the
-// destructor always stops the session and joins the consumer thread.
-// Payload fields are decoded BY NAME via tdh.dll (dynamically bound), never by
-// guessed structure offsets.
+// EtwNetCollector（第 3 阶段，R5 #10b）：在清单提供程序
+// Microsoft-Windows-Kernel-Network 上开私有实时 ETW 会话，从
+// recvdata(10)/senddata(11) 事件聚合每 pid 累计收发字节。仅管理员可用——
+// 否则 Start() 失败并记日志（功能保持禁用，
+// 默认关闭）。资源章程（架构 §5）：会话名带本进程 pid 以避免孤儿会话；
+// 启动前先停掉残留的同名会话；
+// 析构时总是停止会话并 join 消费线程。
+// 载荷字段通过 tdh.dll（动态绑定）按名称解码，绝不按
+// 猜测的结构偏移解码。
 // ---------------------------------------------------------------------------
 class EtwNetCollector {
 public:
@@ -204,40 +204,40 @@ public:
     EtwNetCollector(const EtwNetCollector&) = delete;
     EtwNetCollector& operator=(const EtwNetCollector&) = delete;
 
-    bool Start();   // idempotent; false + err log on failure (non-admin etc.)
-    void Stop();    // idempotent; stops the session and joins the consumer
-    bool Running(); // true while the ETW session is alive
-    // pid -> cumulative recv+send bytes since Start (thread-safe copy).
+    bool Start();   // 幂等；失败返回 false 并记错误日志（非管理员等）
+    void Stop();    // 幂等；停止会话并 join 消费线程
+    bool Running(); // ETW 会话存活期间为 true
+    // pid -> 自 Start 起的累计收发字节（线程安全拷贝）。
     void CopyCumulative(std::unordered_map<uint32_t, uint64_t>* out) const;
-    uint64_t TotalEvents() const;  // recv/send events parsed since Start
-    // True when an ETW session with this name exists (selftest cleanup check).
+    uint64_t TotalEvents() const;  // 自 Start 起解析的收发事件数
+    // 存在同名 ETW 会话时为 true（selftest 清理检查用）。
     static bool SessionExists(const wchar_t* name);
 
 private:
     struct Agg { uint64_t recv = 0, send = 0; };
-    static void WINAPI OnEvent(PEVENT_RECORD rec);  // trampoline via .Context
+    static void WINAPI OnEvent(PEVENT_RECORD rec);  // 经 .Context 蹦床转发
     void HandleEvent(PEVENT_RECORD rec);
-    void Consume();  // consumer thread: OpenTrace -> ProcessTrace -> CloseTrace
+    void Consume();  // 消费线程：OpenTrace -> ProcessTrace -> CloseTrace
 
-    TRACEHANDLE session_ = 0;       // from StartTraceW
-    TRACEHANDLE openTrace_ = 0;     // from OpenTraceW (closed by the consumer)
+    TRACEHANDLE session_ = 0;       // 来自 StartTraceW
+    TRACEHANDLE openTrace_ = 0;     // 来自 OpenTraceW（由消费线程关闭）
     std::wstring sessionName_;      // L"SuperTaskMgr-Net-<pid>"
-    std::vector<BYTE> stopProps_;   // ControlTraceW buffer (guarded by mu_)
+    std::vector<BYTE> stopProps_;   // ControlTraceW 缓冲（由 mu_ 保护）
     std::thread consumer_;
-    mutable std::mutex mu_;  // guards everything below (callback + owner)
+    mutable std::mutex mu_;  // 保护下方所有成员（回调 + 所属线程）
     std::unordered_map<uint32_t, Agg> bytes_;
     uint64_t totalEvents_ = 0;
     uint64_t parseFails_ = 0;
 };
 
 // ---------------------------------------------------------------------------
-// SelfCheckGate: at startup, cross-validate the NtQSI fast-path readings of up
-// to 3 live processes against GetProcessTimes / GetProcessMemoryInfo /
-// GetProcessIoCounters / GetProcessHandleCount / Toolhelp thread count, plus
-// WorkingSetPrivateSize vs a one-shot PDH "Working Set - Private" read
-// (arch section 4 + architect ruling). Any tolerance violation (time ±1s,
-// bytes ±25%, counters ±10%) degrades the whole service to the Toolhelp+PSAPI
-// slow path instead of emitting wrong data.
+// SelfCheckGate：启动时把 NtQSI 快路径对最多 3 个存活进程的读数，
+// 与 GetProcessTimes / GetProcessMemoryInfo / GetProcessIoCounters /
+// GetProcessHandleCount / Toolhelp 线程数，以及 WorkingSetPrivateSize
+// 与一次性 PDH "Working Set - Private" 读取的对照
+//（架构第 4 节 + 架构裁定）全部交叉校验。任何超容差（时间 ±1s、
+// 字节 ±25%、计数器 ±10%）都把整个服务降级到 Toolhelp+PSAPI
+// 慢路径，绝不输出错误数据。
 // ---------------------------------------------------------------------------
 struct GateResult { bool degraded = false; std::wstring reason; };
 GateResult RunSelfCheckGate();

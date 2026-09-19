@@ -1,14 +1,14 @@
 #pragma once
-// Reusable async data fetch for the phase-3 pages: page-side cache + ops job
-// submission with a per-page minimum refresh interval (2 s net / 5 s services
-// and drivers / 10 s sensors), so no page ever blocks the UI thread and no
-// page hammers the serial ops queue every frame.
+// 第 3 阶段页面可复用的异步数据抓取：页面侧缓存 + ops 任务提交，
+// 带每页最小刷新间隔（网络 2s / 服务与驱动 5s /
+// 传感器 10s），因此任何页面都不阻塞 UI 线程，
+// 也不会每帧轰炸串行 ops 队列。
 //
-// Lifetime model mirrors Pages.cpp ops jobs: the producer lambda is executed
-// on the JobQueue worker while capturing the shared AppContext, and results
-// land in a shared reference-counted State cell. A job that outlives the app
-// (Shutdown timeout) only writes into the cell it already holds — never into
-// a page object.
+// 生命周期模型与 Pages.cpp 的 ops 任务一致：生产者 lambda 在
+// JobQueue 工作线程上执行并捕获共享 AppContext，结果落入
+// 共享的引用计数 State 单元。活得比应用久的任务（Shutdown
+// 超时）只写它已持有的单元——绝不写页面对象。
+//
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -27,19 +27,19 @@ class AsyncFetch {
 public:
     using ProduceFn = std::function<T(std::wstring*)>;
     struct Result {
-        bool ok = false;        // true when err came back empty
-        T data{};               // partial data is allowed even with err set
-        std::wstring err;       // user-facing Chinese; empty on success
+        bool ok = false;        // err 返回为空时为 true
+        T data{};               // 即使 err 已设置也允许部分数据
+        std::wstring err;       // 面向用户的中文；成功时为空
     };
 
     explicit AsyncFetch(double minIntervalSec)
         : st_(std::make_shared<State>()), minIntervalSec_(minIntervalSec) {}
 
-    // UI thread. Submits a produce job when `force` is set (manual refresh:
-    // bypasses the min interval — wording of refresh-button tooltips must match
-    // this), or when the first fetch has not happened yet, or when the min
-    // interval elapsed since the last attempt. Returns true when a job was
-    // queued. While a job is in flight every call is a no-op.
+    // UI 线程。`force` 置位（手动刷新：绕过最小间隔——刷新按钮
+    // 提示文案须与此一致）、首次抓取尚未发生、或距上次尝试
+    // 已过最小间隔时提交生产任务。任务入队成功返回 true。
+    // 任务在途期间每次调用都是空操作。
+    //
     bool MaybeFetch(const ProduceFn& fn, bool force) {
         std::shared_ptr<AppContext> app = LiveP3Ctx();
         if (!app) return false;
@@ -57,7 +57,7 @@ public:
             }
         }
         if (!submit) return false;
-        // Submit returns 0 when the queue is not running (teardown): undo.
+        // 队列未运行（拆除中）时 Submit 返回 0：撤销。
         if (app->jobs.Submit([app, st, fn] {
                 std::wstring err;
                 T data = fn(&err);
@@ -73,7 +73,7 @@ public:
         return true;
     }
 
-    // Latest completed result; nullptr until the first job finished.
+    // 最近完成的结果；首个任务完成前为 nullptr。
     std::shared_ptr<const Result> Peek() const {
         std::lock_guard<std::mutex> lock(st_->mu);
         return st_->result;

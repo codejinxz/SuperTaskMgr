@@ -1,13 +1,13 @@
-// Phase-3 UI helper tests. PageHelpers.h is header-only and depends only on
-// core/collect/ops headers, so these run inside stm_selftest which links
-// core+collect+ops (no app objects / no ImGui).
+// 第 3 阶段 UI 辅助测试。PageHelpers.h 仅头文件且只依赖
+// core/collect/ops 头，因此这些测试在 stm_selftest 内运行
+//（链接 core+collect+ops，无应用对象/无 ImGui）。
 #include "selftest/TestFramework.h"
 #include "app/ui3/PageHelpers.h"
 
 using stm::ops::StartupItem;
 using stm::ops::StartupSource;
 
-// SERVICE_STATE (1..7) maps to the documented Chinese labels; unknown stays honest.
+// SERVICE_STATE（1..7）映射到有文档的中文标签；未知保持诚实。
 STM_TEST(ui3_service_state_labels) {
     if (stm::ui3::ServiceStateLabel(1) != L"已停止") {
         *err = L"SERVICE_STOPPED 应映射为 已停止";
@@ -29,7 +29,7 @@ STM_TEST(ui3_service_state_labels) {
     return true;
 }
 
-// Start type (SERVICE_*_START) mapping used by the services page column.
+// 服务页列使用的启动类型（SERVICE_*_START）映射。
 STM_TEST(ui3_service_starttype_labels) {
     if (stm::ui3::ServiceStartTypeLabel(2) != L"自动" ||
         stm::ui3::ServiceStartTypeLabel(3) != L"手动") {
@@ -64,10 +64,10 @@ STM_TEST(ui3_startup_source_labels) {
     return true;
 }
 
-// The TcpStateLabel wrapper must delegate to the contract function verbatim
-// (contract: unknown states -> hex, so state 0 is NOT empty) and must never
-// return an empty string for a known value. UDP rows render "—" in the page
-// itself without consulting the wrapper.
+// TcpStateLabel 包装必须原样委托给契约函数
+//（契约：未知状态 -> 十六进制，因此状态 0 不是空），
+// 且对已知值绝不返回空字符串。UDP 行在页面里渲染 "—"
+// 而不经由该包装。
 STM_TEST(ui3_tcp_state_wrapper) {
     if (stm::ui3::UiTcpStateLabel(2) != stm::TcpStateLabel(2) ||
         stm::ui3::UiTcpStateLabel(2).empty()) {
@@ -87,7 +87,7 @@ STM_TEST(ui3_tcp_state_wrapper) {
     return true;
 }
 
-// Non-elevated users may only toggle items the enumerator marked canToggle.
+// 未提权用户只能切换枚举器标记 canToggle 的条目。
 STM_TEST(ui3_startup_elevation_gate) {
     StartupItem item;
     item.canToggle = false;
@@ -107,8 +107,8 @@ STM_TEST(ui3_startup_elevation_gate) {
     return true;
 }
 
-// Driver page degrade trigger: only the documented contract error unlocks the
-// full-page elevate notice.
+// 驱动页降级触发：只有有文档的契约错误才解锁整页
+// 提权提示。
 STM_TEST(ui3_driver_err_needs_admin) {
     if (!stm::ui3::DriverErrNeedsAdmin(L"需要管理员权限")) {
         *err = L"契约错误串应触发降级页";

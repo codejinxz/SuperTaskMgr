@@ -1,5 +1,5 @@
 #pragma once
-// RAII ownership for Win32 HANDLEs (resource charter, arch section 5).
+// Win32 HANDLE 的 RAII 所有权管理（资源章程，架构第 5 节）。
 #include <memory>
 #include <windows.h>
 

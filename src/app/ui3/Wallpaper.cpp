@@ -1,19 +1,19 @@
-// ui3/Wallpaper.cpp — Phase-6 custom wallpaper background (owner: H-B).
-// This is the ONLY translation unit in the project that compiles stb_image
-// (STB_IMAGE_IMPLEMENTATION lives here; do not define it anywhere else).
+// ui3/Wallpaper.cpp — 第 6 阶段自定义壁纸背景（负责人：H-B）。
+// 本项目只有本编译单元编译 stb_image
+//（STB_IMAGE_IMPLEMENTATION 在此定义；切勿在其他地方再定义）。
 //
-// Load pipeline (kept failure-safe for the previously active wallpaper):
-//   ext check -> read whole file -> stbi_info size gate (4096x4096) -> decode RGBA8
-//   -> create D3D11 texture+SRV -> write stored copy under
-//   %LOCALAPPDATA%\SuperTaskMgr\wallpaper\wallpaper.<ext> -> commit (swap SRV+state).
-// The stored copy is written only AFTER decode/texture succeeded, so a broken pick
-// can never clobber the copy used for auto-restore at next launch.
+// 加载管线（对先前生效的壁纸保持失败安全）：
+//   扩展名检查 -> 读取整个文件 -> stbi_info 尺寸闸门（4096x4096）-> 解码 RGBA8
+//   -> 创建 D3D11 纹理+SRV -> 在
+//   %LOCALAPPDATA%\SuperTaskMgr\wallpaper\wallpaper.<ext> 写存档副本 -> 提交（交换 SRV+状态）。
+// 存档副本只在解码/纹理成功之后写入，因此坏选择绝不可能
+// 破坏下次启动自动恢复所用的副本。
 //
-// Headless note: STM_WALLPAPER_HEADLESS is defined ONLY by
-// src/selftest/wallpaper_test.cpp, which includes this TU to unit-test the pure
-// helpers without linking ImGui. It only removes the imgui.h dependency; the D3D
-// code still compiles (interface vtable calls only, no d3d11.lib import) but is
-// never executed headless.
+// 无头说明：STM_WALLPAPER_HEADLESS 只由
+// src/selftest/wallpaper_test.cpp 定义，它包含本编译单元以在
+// 不链接 ImGui 的情况下单元测试纯辅助函数。它只移除 imgui.h 依赖；D3D
+// 代码仍然编译（仅接口虚表调用，不导入 d3d11.lib）但
+// 无头模式下从不执行。
 #include "app/ui3/Wallpaper.h"
 
 #include <d3d11.h>
@@ -32,11 +32,11 @@
 #include "imgui.h"
 #endif
 
-// Vendored third-party stb_image (public domain). Reached relatively so this TU also
-// compiles inside stm_selftest, which has no third_party include path. Warning level
-// 0 around the vendored header: it is not /W4-clean and CMake gives it no /W0 target.
+// 内嵌第三方 stb_image（公共领域）。以相对路径引用，使本编译单元也能
+// 在没有 third_party 包含路径的 stm_selftest 中编译。内嵌头周围
+// 警告等级设 0：它不是 /W4 干净的，CMake 也没有给它 /W0 目标。
 #pragma warning(push, 0)
-#define STBI_NO_STDIO  // we decode from memory only
+#define STBI_NO_STDIO  // 只从内存解码
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_BMP
@@ -51,18 +51,18 @@ namespace {
 
 constexpr int kMaxDim = 4096;
 constexpr long long kMaxPixels = static_cast<long long>(kMaxDim) * kMaxDim;
-constexpr unsigned long long kMaxFileBytes = 512ull << 20;  // 512 MiB sanity gate
+constexpr unsigned long long kMaxFileBytes = 512ull << 20;  // 512 MiB 合理性闸门
 constexpr float kMaxMask = 0.85f;
 const wchar_t* const kSupportedExts[] = {L"png", L"jpg", L"jpeg", L"bmp", L"tga"};
 
-// UI-thread-only module state (all entry points are called from the frame loop).
+// 仅限 UI 线程的模块状态（所有入口都由帧循环调用）。
 WallpaperState g_state;
-ID3D11ShaderResourceView* g_srv = nullptr;  // owned; released in WallpaperClear
+ID3D11ShaderResourceView* g_srv = nullptr;  // 持有；在 WallpaperClear 中释放
 
 std::wstring StoredDir() { return stm::EnsureDir(stm::LocalAppDataRoot() + L"\\wallpaper"); }
 
-// Lowercased final extension ("D:\dir.v2\PIC.PNG" -> "png"); empty when the last dot
-// belongs to a directory name or the name has no extension.
+// 小写的最终扩展名（"D:\dir.v2\PIC.PNG" -> "png"）；当最后一个点
+// 属于目录名或名称没有扩展名时为空。
 std::wstring LowerExt(const std::wstring& path) {
     const size_t slash = path.find_last_of(L"/\\");
     const size_t dot = path.find_last_of(L'.');
@@ -105,8 +105,8 @@ bool WriteFileBytes(const std::wstring& path, const std::vector<uint8_t>& data) 
     return written == data.size();
 }
 
-// Remove stored copies with the other extensions so exactly one wallpaper.* survives
-// (result ignored: a stale extra copy only wastes a few MB).
+// 删除其他扩展名的存档副本，确保只存活一份 wallpaper.*
+//（忽略结果：过期的多余副本只浪费几 MB）。
 void DeleteOtherStoredCopies(const std::wstring& keepExt) {
     const std::wstring dir = stm::LocalAppDataRoot() + L"\\wallpaper";
     for (const wchar_t* e : kSupportedExts) {
@@ -115,10 +115,10 @@ void DeleteOtherStoredCopies(const std::wstring& keepExt) {
     }
 }
 
-// Upload an RGBA8 buffer as a DEFAULT-usage texture initialized from SUBRESOURCE_DATA
-// and hand back a shader resource view (1 ref on the caller). Same shape as
-// D3DRenderer::CreateTextureFromMemory, but takes the raw device because Wallpaper
-// only receives void* (kept self-contained so the headless selftest build links).
+// 把 RGBA8 缓冲上传为由 SUBRESOURCE_DATA 初始化的 DEFAULT 用法纹理，
+// 并交还着色器资源视图（调用方持 1 引用）。形状与
+// D3DRenderer::CreateTextureFromMemory 相同，但接收原始设备，因为 Wallpaper
+// 只收到 void*（保持自包含，无头 selftest 构建才能链接）。
 ID3D11ShaderResourceView* CreateRgbaTextureSrv(ID3D11Device* device, int w, int h,
                                                const uint8_t* rgba) {
     D3D11_TEXTURE2D_DESC desc{};
@@ -145,7 +145,7 @@ ID3D11ShaderResourceView* CreateRgbaTextureSrv(ID3D11Device* device, int w, int 
 }  // namespace
 
 float ClampMask(float mask) {
-    if (!(mask > 0.0f)) return 0.0f;  // also folds NaN to 0
+    if (!(mask > 0.0f)) return 0.0f;  // 同时把 NaN 归为 0
     if (mask > kMaxMask) return kMaxMask;
     return mask;
 }
@@ -161,7 +161,7 @@ bool IsSupportedImageExt(const std::wstring& path) {
 
 bool WallpaperLoad(void* d3dDevice, void* d3dContext, const std::wstring& imagePath,
                    WallpaperState* out) {
-    (void)d3dContext;  // DEFAULT-usage init via SUBRESOURCE_DATA needs no context
+    (void)d3dContext;  // 经 SUBRESOURCE_DATA 的 DEFAULT 用法初始化不需要上下文
     if (out == nullptr) return false;
     out->error.clear();
     const auto fail = [out](const wchar_t* msg, const std::wstring& detail) {
@@ -203,7 +203,7 @@ bool WallpaperLoad(void* d3dDevice, void* d3dContext, const std::wstring& imageP
     ID3D11ShaderResourceView* srv = CreateRgbaTextureSrv(device, cw, ch, rgba);
     if (srv == nullptr) return fail(L"创建显卡纹理失败（显存不足或设备已丢失）", imagePath);
 
-    // Persist the validated bytes; the previous stored copy stays intact until here.
+    // 持久化已校验的字节；此前旧存档副本一直完好至此。
     const std::wstring dir = StoredDir();
     std::wstring stored;
     if (!dir.empty()) {
@@ -217,7 +217,7 @@ bool WallpaperLoad(void* d3dDevice, void* d3dContext, const std::wstring& imageP
     }
     DeleteOtherStoredCopies(ext);
 
-    // Commit point: swap in the new SRV + state (old wallpaper untouched on failure).
+    // 提交点：换入新 SRV + 状态（失败时旧壁纸分毫不动）。
     if (g_srv != nullptr) g_srv->Release();
     g_srv = srv;
     g_state = WallpaperState{};
@@ -227,7 +227,15 @@ bool WallpaperLoad(void* d3dDevice, void* d3dContext, const std::wstring& imageP
     g_state.width = cw;
     g_state.height = ch;
     *out = g_state;
+    // R-Fix Bug2 诊断日志：SRV 指针 + 绑定方式。本仓库 vendored 的
+    // imgui 1.92.9 DX11 后端（third_party/imgui/backends/imgui_impl_dx11.cpp
+    // 渲染循环 `pcmd->GetTexID()` -> PSSetShaderResources）没有托管纹理注册表
+    // （无 ImGui_ImplDX11_RegisterTexture，ImTextureRef 无 TexTag），裸 SRV
+    // 指针构造 ImTextureRef 即为最终绑定句柄 —— 无需也不存在注册步骤。
     STM_LOG_INFO("wallpaper", Fmt(L"已加载壁纸 {}x{}，副本：{}", cw, ch, stored));
+    STM_LOG_INFO("wallpaper",
+                 Fmt(L"SRV=0x{:X}（裸指针直绑 DX11 后端，无需注册）",
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(srv))));
     return true;
 }
 
@@ -244,9 +252,26 @@ void WallpaperClear() {
     STM_LOG_INFO("wallpaper", L"壁纸已清除");
 }
 
+void WallpaperShutdown() {
+    // R-Fix Bug2：退出路径只释放 GPU 纹理；持久化副本保留，
+    // 供 WallpaperAutoRestore 下次启动重载（WallpaperClear，
+    // the「关闭壁纸」action, is the one that deletes).
+    if (g_srv != nullptr) {
+        g_srv->Release();
+        g_srv = nullptr;
+    }
+    g_state = WallpaperState{};
+    STM_LOG_INFO("wallpaper", L"退出释放壁纸纹理（保留持久化副本供下次启动恢复）");
+}
+
 void WallpaperDrawBackground(float maskAlpha) {
 #ifndef STM_WALLPAPER_HEADLESS
     if (g_srv == nullptr) return;
+    // R-Fix Bug2 契约：本函数绘制进视口背景绘制列表（1.92 单视口：无参重载 ==
+    // Viewports[0]），位于一切普通窗口之下 —— 壁纸能否可见取决于外壳
+    // （ui/Pages.cpp DrawShell）在 WallpaperActive() 时推透明 WindowBg/ChildBg。
+    // 必须在 ImGui::NewFrame() 之后调用（本帧内被追加才会并入 DrawData，
+    // imgui 以 g.Time 戳判定；V18 探针实证）。
     const ImGuiIO& io = ImGui::GetIO();
     if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
@@ -259,7 +284,7 @@ void WallpaperDrawBackground(float maskAlpha) {
                           IM_COL32(0, 0, 0, static_cast<int>(a * 255.0f + 0.5f)));
     }
 #else
-    (void)maskAlpha;  // headless build: nothing is ever drawn
+    (void)maskAlpha;  // 无头构建：什么都不绘制
 #endif
 }
 
@@ -276,7 +301,7 @@ bool WallpaperAutoRestore(void* d3dDevice, void* d3dContext) {
         if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
         WallpaperState restored;
         if (WallpaperLoad(d3dDevice, d3dContext, candidate, &restored)) {
-            // Restore keeps sourcePath == storedPath: the original pick is unknown.
+            // 恢复时 sourcePath == storedPath：原始选择路径未知。
             STM_LOG_INFO("wallpaper", Fmt(L"启动恢复壁纸：{}", candidate));
             return true;
         }

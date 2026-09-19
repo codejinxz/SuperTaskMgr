@@ -1,10 +1,10 @@
 #pragma once
-// Header-only pure-logic helpers for the phase-3 pages (network / startup /
-// services / drivers / sensors). Shared between the UI layer (Pages3.cpp) and
-// the selftest (ui3_test.cpp); intentionally free of ImGui and app objects so
-// stm_selftest can include it while linking only core+collect+ops.
-// All user-facing strings are Chinese and returned as wide strings; the UI
-// converts them through ui::U8() at the call site.
+// 第 3 阶段页面（网络/启动项/服务/驱动/传感器）的仅头文件
+// 纯逻辑辅助。UI 层（Pages3.cpp）与 selftest（ui3_test.cpp）共享；
+// 刻意不依赖 ImGui 与应用对象，使 stm_selftest 只链接
+// core+collect+ops 即可包含它。
+// 所有面向用户的字符串都是中文并以宽字符串返回；UI 在调用点
+// 经 ui::U8() 转换。
 #include <string>
 #include <algorithm>
 #include <cwctype>
@@ -18,7 +18,7 @@ namespace stm {
 namespace ui3 {
 
 // ---------------------------------------------------------------------------
-// Services: SERVICE_STATE (winsvc.h values 1..7) -> Chinese short label.
+// 服务：SERVICE_STATE（winsvc.h 值 1..7）-> 中文短标签。
 // ---------------------------------------------------------------------------
 inline std::wstring ServiceStateLabel(uint32_t state) {
     switch (state) {
@@ -34,7 +34,7 @@ inline std::wstring ServiceStateLabel(uint32_t state) {
 }
 
 // ---------------------------------------------------------------------------
-// Services: start type (SERVICE_*_START constants 0..4) -> Chinese label.
+// 服务：启动类型（SERVICE_*_START 常量 0..4）-> 中文标签。
 // ---------------------------------------------------------------------------
 inline std::wstring ServiceStartTypeLabel(uint32_t startType) {
     switch (startType) {
@@ -48,7 +48,7 @@ inline std::wstring ServiceStartTypeLabel(uint32_t startType) {
 }
 
 // ---------------------------------------------------------------------------
-// Startup items: source enum -> Chinese label (table column 来源).
+// 启动项：来源枚举 -> 中文标签（表格列“来源”）。
 // ---------------------------------------------------------------------------
 inline std::wstring StartupSourceLabel(ops::StartupSource source) {
     switch (source) {
@@ -61,23 +61,23 @@ inline std::wstring StartupSourceLabel(ops::StartupSource source) {
     }
 }
 
-// A startup item may only be toggled without elevation when the enumerator
-// marked it canToggle (HKCU writable entries); everything else needs admin.
+// 只有枚举器标记 canToggle（HKCU 可写项）的启动项才能在未提权时
+// 切换；其余一律需要管理员。
 inline bool StartupNeedsElevation(const ops::StartupItem& item, bool elevated) {
     return !elevated && !item.canToggle;
 }
 
 // ---------------------------------------------------------------------------
-// Connections: thin wrapper over the contract's TcpStateLabel. Guarantees a
-// non-empty display value: UDP rows carry state 0 and the contract maps
-// unknown states to hex, so an empty result degrades to the em dash.
+// 连接：契约 TcpStateLabel 的薄包装。保证展示值非空：
+// UDP 行状态为 0，契约把未知状态映射为十六进制，
+// 空结果退化为破折号。
 // ---------------------------------------------------------------------------
 inline std::wstring UiTcpStateLabel(uint32_t state) {
     std::wstring label = TcpStateLabel(state);
     return label.empty() ? std::wstring(L"—") : label;
 }
 
-// "addr:port"; an empty address (UDP remote) renders as the em dash.
+// "addr:port"；空地址（UDP 远端）渲染为破折号。
 inline std::wstring ConnEndpoint(const std::wstring& addr, uint16_t port) {
     if (addr.empty()) return L"—";
     return addr + L":" + std::to_wstring(port);
@@ -85,15 +85,15 @@ inline std::wstring ConnEndpoint(const std::wstring& addr, uint16_t port) {
 
 // ---------------------------------------------------------------------------
 // Drivers: the contract returns the literal error 需要管理员权限 on 24H2+
-// without elevation; the page degrades to a full-page notice in that case.
+// 未提权时；该情形下页面退化为整页提示。
 // ---------------------------------------------------------------------------
 inline bool DriverErrNeedsAdmin(const std::wstring& err) {
     return err.find(L"需要管理员权限") != std::wstring::npos;
 }
 
 // ---------------------------------------------------------------------------
-// Sensor page (W2 redesign): per-group visibility, persisted in the config.
-// Pure helpers so stm_selftest can cover keys/defaults without a GUI.
+// 传感器页（W2 重设计）：分组可见性，持久化于配置。
+// 纯辅助函数，stm_selftest 无 GUI 即可覆盖键/默认值。
 // ---------------------------------------------------------------------------
 enum class SensorGroup { Cpu, Gpu, Mem, Disk, Net, Battery, Fan, Extra, Count };
 
@@ -134,9 +134,9 @@ inline const wchar_t* SensorGroupTitle(SensorGroup g) {
     }
 }
 
-// Classifies a LibreHardwareMonitor reading (label = its node path, already
-// suffixed with ［LHM］) into the sensor group it merges into. Case-insensitive
-// keyword scan, ordered so unambiguous keywords win (fan before disk etc.).
+// 把 LibreHardwareMonitor 读数（label = 其节点路径，已带
+// ［LHM］ 后缀）归类到它应并入的传感器组。大小写不敏感
+// 关键字扫描，顺序保证无歧义关键字优先（风扇先于磁盘等）。
 enum class LhmGroup { Other, Cpu, Gpu, Mem, Disk, Net, Battery, Fan };
 inline LhmGroup LhmGroupOf(const std::wstring& lhmLabel) {
     std::wstring s(lhmLabel.size(), L'\0');
@@ -156,9 +156,9 @@ inline LhmGroup LhmGroupOf(const std::wstring& lhmLabel) {
     return LhmGroup::Other;
 }
 
-// Extracts the core index from per-core CPU sensor labels produced by the
+// 从采集器产出的每核 CPU 传感器标签中提取核心索引
 // collector ("CPU 核 N 频率" / "CPU 核 N 占用率"); -1 = aggregate/other row.
-// isFreqOut reports whether the row is a frequency (MHz) or an utilization (%).
+// isFreqOut 报告该行是频率（MHz）还是利用率（%）。
 inline int SensorCoreIndex(const std::wstring& label, bool* isFreqOut) {
     if (isFreqOut) *isFreqOut = label.find(L"频率") != std::wstring::npos;
     const size_t at = label.find(L"核");

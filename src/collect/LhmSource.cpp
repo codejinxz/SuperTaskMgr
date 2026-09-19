@@ -1,18 +1,18 @@
-// LhmSource.cpp — optional LibreHardwareMonitor (LHM) HTTP bridge (LhmSource.h).
-// We are a CLIENT of the user-run LHM web server; the app itself keeps the
-// "no listening port" guarantee. WinHTTP is bound dynamically from
-// C:\Windows\System32\winhttp.dll (absolute path, driver/OS-owned) so the
-// link line needs nothing new; loopback-only hosts and 1 s timeouts are
-// enforced here. No thread, no timer: PollLhm runs synchronously when called.
+// LhmSource.cpp — 可选的 LibreHardwareMonitor（LHM）HTTP 桥接（见 LhmSource.h）。
+// 我们是用户运行的 LHM web 服务器的客户端；应用本身保持
+// “不监听端口”的承诺。WinHTTP 从
+// C:\Windows\System32\winhttp.dll（绝对路径，驱动/OS 所有）动态绑定，
+// 链接行无需新增任何东西；仅回环主机与 1s 超时在此强制执行。
+// 不建线程，不用定时器：PollLhm 被调用时同步执行。
 //
-// data.json (LHM remote web server) is a tree of nodes:
+// data.json（LHM 远程 web 服务器）是一棵节点树：
 //   {"id":0,"Text":"LibreHardwareMonitor","Value":null,"Children":[
 //      {"Text":"Intel Core i7 ...","Children":[
 //         {"Text":"Temperatures","Sensor":[{"Text":"Core #1","Value":"45.000"}]}]}]}
-// Each "Sensor" array entry becomes one SensorReading; label = node path
-// (Text chain) + "［LHM］"; value = numeric prefix of the Value string; unit =
-// the non-numeric remainder when present ("38.000 °C" -> °C). Missing/null
-// values map to State::NoHardware — never a fabricated 0.
+// 每个 "Sensor" 数组条目变成一条 SensorReading；label = 节点路径
+//（Text 链）+ "［LHM］"；value = Value 字符串的数字前缀；unit =
+// 存在时的非数字余部（"38.000 °C" -> °C）。缺失/null 值映射为
+// State::NoHardware——绝不伪造 0。
 #include "collect/LhmSource.h"
 #include "core/Log.h"
 #include "core/Str.h"
@@ -30,19 +30,19 @@ namespace stm {
 namespace {
 
 constexpr wchar_t kTag[] = L"［LHM］";
-constexpr size_t kMaxReadings = 512;               // cap a runaway tree
-constexpr size_t kMaxBodyBytes = 8u * 1024 * 1024; // 8 MB response cap
-constexpr int kMaxDepth = 64;                      // recursion cap
+constexpr size_t kMaxReadings = 512;               // 防失控树的上限
+constexpr size_t kMaxBodyBytes = 8u * 1024 * 1024; // 响应 8 MB 上限
+constexpr int kMaxDepth = 64;                      // 递归上限
 
 // ---------------------------------------------------------------------------
-// thread-safe global options (plain process-global state, per contract)
+// 线程安全的全局选项（普通进程级全局状态，按契约）
 // ---------------------------------------------------------------------------
 std::mutex g_mu;
 LhmOptions g_opts;
 
 // ---------------------------------------------------------------------------
-// minimal recursive JSON parser — only what data.json needs: objects, arrays,
-// strings (\u escapes incl. surrogate pairs), numbers, true/false/null.
+// 最小递归 JSON 解析器——只实现 data.json 需要的部分：对象、数组、
+// 字符串（\u 转义含代理对）、数字、true/false/null。
 // ---------------------------------------------------------------------------
 struct JVal {
     enum class T { Null, Bool, Num, Str, Arr, Obj };
@@ -70,7 +70,7 @@ struct JParser {
         if (p >= end) return false;
         if (!ParseValue(root, 0)) return false;
         SkipWs();
-        return p >= end;  // reject trailing garbage
+        return p >= end;  // 拒绝尾部垃圾字符
     }
 
     void SkipWs() {
@@ -152,7 +152,7 @@ struct JParser {
             out->b = which == 0;
             return true;
         }
-        // number: [-]digits[.digits][e[+-]digits] via from_chars (locale-free)
+        // 数字：[-]digits[.digits][e[+-]digits]，经 from_chars（不受区域设置影响）
         const char* s = p;
         if (*p == '-' || *p == '+') ++p;
         const char* d0 = p;
@@ -167,18 +167,18 @@ struct JParser {
             if (p < end && (*p == '-' || *p == '+')) ++p;
             const char* ds = p;
             while (p < end && *p >= '0' && *p <= '9') ++p;
-            if (p == ds) p = save;  // dangling exponent: not part of the number
+            if (p == ds) p = save;  // 悬空的指数：不属于数字的一部分
         }
-        if (p == d0) return false;  // no digits at all
+        if (p == d0) return false;  // 完全没有数字
         const std::from_chars_result res = std::from_chars(s, p, out->num);
         out->t = JVal::T::Num;
         return res.ec == std::errc();
     }
 
-    // Parses one JSON string; *p is on the opening quote. Bytes accumulate as
-    // UTF-8 (escapes decoded, incl. surrogate pairs), converted once at the end.
+    // 解析一个 JSON 字符串；*p 位于开引号上。字节以 UTF-8 累积
+    //（转义解码，含代理对），最后一次性转换。
     bool ParseString(std::wstring* out) {
-        ++p;  // opening quote
+        ++p;  // 开引号
         std::string u8;
         while (p < end && *p != '"') {
             const unsigned char c = static_cast<unsigned char>(*p);
@@ -190,7 +190,7 @@ struct JParser {
                     ++p;
                     uint32_t cp = 0;
                     if (!Hex4(&p, end, &cp)) return false;
-                    if (cp >= 0xD800 && cp <= 0xDBFF) {  // high surrogate: need \uDC00-\uDFFF
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {  // 高代理：需要 \uDC00-\uDFFF
                         if (end - p < 6 || p[0] != '\\' || p[1] != 'u') return false;
                         p += 2;
                         uint32_t lo = 0;
@@ -198,7 +198,7 @@ struct JParser {
                         if (lo < 0xDC00 || lo > 0xDFFF) return false;
                         cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
                     } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-                        return false;  // lone low surrogate
+                        return false;  // 孤立低代理
                     }
                     AppendUtf8(&u8, cp);
                     continue;
@@ -217,12 +217,12 @@ struct JParser {
                 ++p;
                 continue;
             }
-            if (c < 0x20) return false;  // bare control char is invalid JSON
+            if (c < 0x20) return false;  // 裸控制字符是非法 JSON
             u8 += static_cast<char>(c);
             ++p;
         }
         if (p >= end) return false;
-        ++p;  // closing quote
+        ++p;  // 闭引号
         *out = Utf8ToWide(u8);
         return true;
     }
@@ -267,7 +267,7 @@ struct JParser {
     }
 };
 
-// "45.000" -> 45.0 + empty unit; "38.000 °C" -> 38.0 + "°C"; junk -> false.
+// "45.000" -> 45.0 + 空单位；"38.000 °C" -> 38.0 + "°C"；垃圾输入 -> false。
 bool ParseNumUnit(const std::wstring& text, double* value, std::wstring* unit) {
     size_t i = 0;
     while (i < text.size() && (text[i] == L' ' || text[i] == L'\t')) ++i;
@@ -275,7 +275,7 @@ bool ParseNumUnit(const std::wstring& text, double* value, std::wstring* unit) {
     while (i < text.size() &&
            ((text[i] >= L'0' && text[i] <= L'9') || text[i] == L'-' || text[i] == L'+' ||
             text[i] == L'.' || text[i] == L'e' || text[i] == L'E')) {
-        if (text[i] == L'+') {  // from_chars rejects a leading '+': skip it
+        if (text[i] == L'+') {  // from_chars 拒绝前导 '+'：跳过它
             ++i;
             continue;
         }
@@ -298,7 +298,7 @@ struct WalkCtx {
 void WalkNode(const JVal& node, const std::wstring& prefix, WalkCtx* ctx) {
     if (ctx->truncated || node.t != JVal::T::Obj) return;
 
-    // This node's own Text extends the path; unnamed nodes never pollute it.
+    // 本节点自身的 Text 追加到路径；无名节点不污染路径。
     const JVal* nodeTxt = node.Find(L"Text");
     const std::wstring self =
         (nodeTxt != nullptr && nodeTxt->t == JVal::T::Str) ? nodeTxt->str : std::wstring();
@@ -311,8 +311,8 @@ void WalkNode(const JVal& node, const std::wstring& prefix, WalkCtx* ctx) {
         selfPath = prefix + L" / " + self;
     }
 
-    // "Sensor" entries owned by THIS node -> readings labeled by its full path
-    // (the hardware/subsystem name is part of the label, HWiNFO-style).
+    // 本节点拥有的 "Sensor" 条目 -> 读数以其完整路径作标签
+    //（硬件/子系统名是标签的一部分，HWiNFO 风格）。
     if (const JVal* sensors = node.Find(L"Sensor");
         sensors != nullptr && sensors->t == JVal::T::Arr) {
         for (const JVal& s : sensors->arr) {
@@ -325,7 +325,7 @@ void WalkNode(const JVal& node, const std::wstring& prefix, WalkCtx* ctx) {
             if (txt == nullptr || txt->t != JVal::T::Str || txt->str.empty()) continue;
             SensorReading r;
             r.label = selfPath.empty() ? txt->str : selfPath + L" / " + txt->str;
-            r.label += kTag;  // provenance: this reading came from the external LHM source
+            r.label += kTag;  // 来源标记：该读数来自外部 LHM 源
             const JVal* val = s.Find(L"Value");
             if (val != nullptr && val->t == JVal::T::Str &&
                 ParseNumUnit(val->str, &r.value, &r.unit)) {
@@ -334,20 +334,20 @@ void WalkNode(const JVal& node, const std::wstring& prefix, WalkCtx* ctx) {
                 r.value = val->num;
                 r.state = SensorReading::State::Ok;
             } else {
-                r.state = SensorReading::State::NoHardware;  // node exists, no value now
+                r.state = SensorReading::State::NoHardware;  // 节点存在但当前无值
             }
             ctx->out->push_back(std::move(r));
         }
     }
 
-    // Recurse into Children, extending the path with this node's own Text.
+    // 递归进入 Children，用本节点自身的 Text 扩展路径。
     if (const JVal* kids = node.Find(L"Children"); kids != nullptr && kids->t == JVal::T::Arr) {
         for (const JVal& k : kids->arr) WalkNode(k, selfPath, ctx);
     }
 }
 
 // ---------------------------------------------------------------------------
-// dynamic WinHTTP binding (winhttp.dll is OS-owned; no link-line change)
+// 动态 WinHTTP 绑定（winhttp.dll 属 OS 所有；不改链接行）
 // ---------------------------------------------------------------------------
 struct WinHttpApi {
     using OpenFn = HINTERNET(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
@@ -384,7 +384,7 @@ struct WinHttpApi {
 const WinHttpApi* WinHttp() {
     static const WinHttpApi api = []() {
         WinHttpApi a;
-        // Absolute path like the nvml.dll binding: never a search-order load.
+        // 与 nvml.dll 绑定一样使用绝对路径：绝不按搜索顺序加载。
         const HMODULE mod = ::LoadLibraryW(L"C:\\Windows\\System32\\winhttp.dll");
         if (mod == nullptr) return a;
         auto proc = [&](const char* name) { return ::GetProcAddress(mod, name); };
@@ -405,7 +405,7 @@ const WinHttpApi* WinHttp() {
     return &api;
 }
 
-struct HGuard {  // RAII for the WinHTTP handle chain
+struct HGuard {  // WinHTTP 句柄链的 RAII
     HINTERNET h = nullptr;
     const WinHttpApi* api = nullptr;
     ~HGuard() {
@@ -462,7 +462,7 @@ bool PollLhm(std::vector<SensorReading>* out, std::wstring* err) {
     if (!opts.enabled) {
         return fail(L"LibreHardwareMonitor 数据源未启用（默认关闭）");
     }
-    if (!IsLoopbackHost(opts.host)) {  // red line: this tool only talks to localhost
+    if (!IsLoopbackHost(opts.host)) {  // 红线：本工具只与本机通信
         return fail(L"LHM 数据源仅允许本机地址（127.0.0.1 / localhost / ::1）");
     }
     const WinHttpApi* api = WinHttp();
@@ -476,7 +476,7 @@ bool PollLhm(std::vector<SensorReading>* out, std::wstring* err) {
     if (session.h == nullptr) {
         return fail(L"WinHttpOpen 失败，无法轮询 LibreHardwareMonitor");
     }
-    api->setTimeouts(session.h, 1000, 1000, 1000, 1000);  // resolve/connect/send/receive
+    api->setTimeouts(session.h, 1000, 1000, 1000, 1000);  // 解析/连接/发送/接收
 
     HGuard conn{api->connect(session.h, opts.host.c_str(), opts.port, 0), api};
     if (conn.h == nullptr) {

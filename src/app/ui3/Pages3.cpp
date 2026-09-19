@@ -1,17 +1,17 @@
-// PHASE-3 UI EXTENSION: network / startup / services / drivers / sensors tabs
+// 第 3 阶段 UI 扩展：网络/启动项/服务/驱动/传感器标签页。
 // plus the optional threshold alert watcher (docs/phase/01_架构设计文档.md §8).
-// Design rules inherited from app/ui/Pages.cpp:
-//  - every user-facing Chinese string goes through ui::U8() (UTF-8 text cache)
-//  - all data is fetched through the ops job queue into per-page caches
-//    (ui3::AsyncFetch) with page-specific min refresh intervals (2 s net /
-//    5 s services+drivers / 10 s sensors); the UI thread never blocks and
+// 继承自 app/ui/Pages.cpp 的设计规则：
+//  - 每条面向用户的中文都经 ui::U8()（UTF-8 文本缓存）
+//  - 所有数据经 ops 任务队列抓取进每页缓存（ui3::AsyncFetch），
+//    带各页最小刷新间隔（网络 2s / 服务+驱动 5s / 传感器 10s）；
+//    UI 线程绝不阻塞，
 //    pages render a "加载中…" state instead
-//  - destructive ops open a two-stage confirm dialog (cancel button first and
-//    keyboard-focused, action button removed from keyboard navigation), then
-//    submit through the job queue and report via the notification queue
-//  - unavailable values render as "—"; unknown/error states render honest
-//    Chinese explanations, never fake data
-// Only additive integration points live in app/ui/Pages.cpp and app/main.cpp.
+//  - 破坏性操作打开两段式确认对话框（取消按钮在前且持有键盘焦点，
+//    动作按钮移出键盘导航），随后
+//    经任务队列提交并经通知队列上报；
+//  - 不可得的值渲染为 "—"；未知/错误状态渲染诚实的
+//    中文说明，绝不伪造数据。
+// 增量式集成点只位于 app/ui/Pages.cpp 与 app/main.cpp。
 #include "app/ui3/Pages3.h"
 #include "app/ui3/AsyncFetch.h"
 #include "app/ui3/GcPages.h"    // F4#3: 宿主服务模态
@@ -44,7 +44,7 @@
 namespace stm {
 namespace ui3 {
 
-// Shared slots (defined at the bottom; used inside the anonymous namespace).
+// 共享槽位（定义在文件底部；匿名命名空间内使用）。
 std::shared_ptr<AppContext>& P3Slot();
 BalloonSink& SinkSlot();
 
@@ -53,7 +53,7 @@ namespace {
 using ui::U8;
 
 // ===========================================================================
-// Small shared helpers (local to this translation unit).
+// 小型共享辅助（本编译单元内部使用）。
 // ===========================================================================
 
 ImVec4 ColDone() { return ImVec4(0.45f, 0.80f, 0.45f, 1.0f); }
@@ -81,22 +81,22 @@ std::wstring LowerCopy(const std::wstring& s) {
     return lower;
 }
 
-// Case-insensitive ASCII substring match (same semantics as the process page).
+// ASCII 大小写不敏感子串匹配（与进程页同语义）。
 bool ContainsLower(const std::wstring& hay, const std::wstring& needle) {
     if (needle.empty()) return true;
     return LowerCopy(hay).find(needle) != std::wstring::npos;
 }
 
 // P2 (2026-09-18, "CPU 温度信息增强"): refine the shared LHM classifier for
-// CPU-group fidelity. LhmGroupOf (PageHelpers.h, frozen) matches "cpu" well for
-// Intel-style paths (".../ Temperatures / CPU Core #1［LHM］"), but AMD-style
-// per-core temperature sensors carry no "cpu" token (".../ Temperatures /
-// Core (Tctl/Tdie)", "CCD1 (Tdie)") and fell into Other — those readings
-// vanished from the CPU group. Conservative fix local to the sensor page: a
-// base-classifier "Other" row is promoted to CPU only when the node path names
-// a TEMPERATURE section AND a per-core/package token. Everything else stays
-// Other because the temperature gate fails ("Voltages / VCore", "Clocks /
-// Core #1", DIMM temps … never leak into CPU).
+// CPU 组保真。LhmGroupOf（PageHelpers.h，已冻结）对 Intel 风格路径
+//（".../ Temperatures / CPU Core #1［LHM］") 的 "cpu" 匹配良好，但 AMD 风格
+// 的每核温度传感器不带 "cpu" 记号（".../ Temperatures /
+// Core (Tctl/Tdie)"、"CCD1 (Tdie)"），于是落入 Other——这些读数
+// 从 CPU 组消失。传感器页本地的保守修复：仅当节点路径同时点名
+// TEMPERATURE 段与每核/整包记号时，基础分类为 "Other" 的行才升入 CPU。
+// 其余一律保持 Other，因为温度闸门未过（"Voltages / VCore"、
+// "Clocks / Core #1"、DIMM 温度……绝不混入 CPU）。
+//
 LhmGroup LhmGroupOfCpuTemps(const std::wstring& lhmLabel) {
     const LhmGroup base = LhmGroupOf(lhmLabel);
     if (base != LhmGroup::Other) return base;
@@ -115,8 +115,8 @@ std::wstring Truncate(const std::wstring& s, size_t maxChars) {
     return s.substr(0, maxChars) + L"…";
 }
 
-// True on the first Draw call and whenever the page was not drawn on the
-// previous frame (tab switch). kNeverDrawn sentinel: frame 0 is a valid id.
+// 首次 Draw 调用以及上一帧未绘制本页（切换标签）时为 true。
+// kNeverDrawn 哨兵：帧 0 是合法 id。
 constexpr uint64_t kNeverDrawn = ~0ull;
 bool BecameActive(uint64_t& lastFrame) {
     const uint64_t f = ImGui::GetFrameCount();
@@ -127,9 +127,9 @@ bool BecameActive(uint64_t& lastFrame) {
 
 void LowerFilter(const std::string& utf8, std::wstring& out) { out = LowerCopy(Utf8ToWide(utf8)); }
 
-// P1-4 (F2 review): ShellExecuteExW(runas) blocks until the UAC dialog closes —
-// it must never run on the UI thread. Every in-page elevate button goes through
-// the ops worker; cancel/failure posts a toast (same as the toolbar button).
+// P1-4（F2 评审）：ShellExecuteExW(runas) 会阻塞到 UAC 对话框关闭——
+// 它绝不能在 UI 线程上运行。页内每个提权按钮都经 ops 工作线程；
+// 取消/失败投递 toast（与工具栏按钮一致）。
 void RequestElevateRestart(AppContext& ctx) {
     SaveSessionFromCtx(ctx, nullptr);
     std::shared_ptr<AppContext> app = LiveP3Ctx();
@@ -158,16 +158,16 @@ void DrawLoading() {
     ImGui::TextColored(ColMuted(), "%s", U8(L"加载中…"));
 }
 
-// Error line + retry button; sets *retry on the frame the button is pressed
-// (the caller then issues a forced fetch).
+// 错误行 + 重试按钮；按钮按下的那一帧置 *retry
+//（调用方随后发起强制抓取）。
 void DrawLoadError(const std::wstring& err, bool* retry) {
     ImGui::TextColored(ColFail(), "%s",
                        U8(Fmt(L"加载失败：{}", err.empty() ? std::wstring(L"未知错误") : err)));
     if (ImGui::Button(U8(L"重试"))) *retry = true;
 }
 
-// pid -> process name from the current collection snapshot (ascending by pid;
-// a name hint only, no identity verification needed for display).
+// pid -> 当前采集快照中的进程名（按 pid 升序；
+// 仅名称提示，展示用途无需身份校验）。
 const ProcInfo* FindPid(const Snapshot& snap, uint32_t pid) {
     size_t lo = 0, hi = snap.procs.size();
     while (lo < hi) {
@@ -183,8 +183,8 @@ const ProcInfo* FindPid(const Snapshot& snap, uint32_t pid) {
 }
 
 // ===========================================================================
-// NetworkPage: TCP/UDP endpoint table (read-only page, no dangerous ops).
-// Data: collect::SnapshotConnections via jobs, min 2 s between fetches.
+// NetworkPage：TCP/UDP 端点表（只读页，无危险操作）。
+// 数据：经任务队列的 collect::SnapshotConnections，抓取间隔至少 2s。
 // ===========================================================================
 
 const wchar_t* ProtoLabel(ConnProto p) {
@@ -203,12 +203,12 @@ public:
     const wchar_t* Title() const override { return L"网络"; }
 
     void Draw(AppContext& ctx) override {
-        if (!etwLoaded_) {  // one-shot: the collector read-back wins over config
+        if (!etwLoaded_) {  // 一次性：采集器读回值优先于配置
             etwLoaded_ = true;
             const bool cfgWants = ctx.cfg.GetBool(L"netEtw", false);
-            etw_ = cfgWants && ctx.collect.NetEtwEnabled();  // P1-1: honest initial state
+            etw_ = cfgWants && ctx.collect.NetEtwEnabled();  // P1-1：诚实的初始状态
             if (etw_ != cfgWants) {
-                ctx.cfg.SetBool(L"netEtw", etw_);  // persist the honest state
+                ctx.cfg.SetBool(L"netEtw", etw_);  // 持久化真实状态
             }
         }
         fetch_.MaybeFetch(Produce, false);
@@ -242,11 +242,11 @@ private:
     }
 
     void DrawToolbar(AppContext& ctx, const Result* res) {
-        // ETW toggle state machine (P1-1 + P2-1): the checkbox is only a
-        // request. Start/Stop runs on the ops job queue, the checkbox is
-        // disabled while a toggle is in flight, and the collector read-back
-        // (NetEtwEnabled) decides the real state — a mismatch rolls the
-        // checkbox and cfg back and posts a JobFailed toast.
+        // ETW 开关状态机（P1-1 + P2-1）：复选框只是请求。
+        // Start/Stop 在 ops 任务队列上运行，开关在途期间禁用，
+        // 真实状态由采集器读回（NetEtwEnabled）决定——不一致时
+        // 把复选框与 cfg 一并回滚，
+        // 并投递 JobFailed toast。
         if (etwToggle_) {
             bool ready = false;
             bool actual = false;
@@ -258,10 +258,10 @@ private:
             if (ready) {
                 etwToggle_.reset();
                 etw_ = actual;
-                ctx.cfg.SetBool(L"netEtw", actual);  // persist truth / rollback
+                ctx.cfg.SetBool(L"netEtw", actual);  // 持久化真实值 / 回滚
                 if (actual != etwDesired_) {
-                    // P2-7 (F2 review): StartTrace can fail for reasons other than
-                    // elevation (session limit, policy); state the honest scope.
+                    // P2-7（F2 评审）：StartTrace 失败可能不止因为提权
+                    //（会话上限、策略）；如实说明原因范围。
                     PushNote(ctx, Notification::Kind::JobFailed,
                              etwDesired_
                                  ? L"按进程流量（ETW）开启失败（原因详见日志：常见为缺少管理员"
@@ -306,7 +306,7 @@ private:
                                  L"自动刷新受该间隔限制）"));
         }
         ImGui::SameLine();
-        ImGui::BeginDisabled(etwToggle_ != nullptr);  // pending: debounce re-toggles
+        ImGui::BeginDisabled(etwToggle_ != nullptr);  // 在途：防抖动避免重复切换
         if (ImGui::Checkbox(U8(L"按进程流量（ETW）"), &etw_)) {
             const bool desired = etw_;
             etwDesired_ = desired;
@@ -316,16 +316,16 @@ private:
             if (app) {
                 if (app->jobs.Submit([app, toggle, desired] {
                         app->collect.SetNetEtwEnabled(desired);
-                        const bool actual = app->collect.NetEtwEnabled();  // read-back = truth
+                        const bool actual = app->collect.NetEtwEnabled();  // 读回值 = 真实状态
                         std::lock_guard<std::mutex> lock(toggle->mu);
                         toggle->actual = actual;
                         toggle->ready = true;
                     }) == 0) {
-                    etw_ = !desired;  // queue already shut down: revert the checkbox
+                    etw_ = !desired;  // 队列已关：回滚复选框
                     etwToggle_.reset();
                 }
             } else {
-                etw_ = !desired;  // teardown race: revert the checkbox
+                etw_ = !desired;  // 拆除竞争：回滚复选框
                 etwToggle_.reset();
             }
         }
@@ -353,7 +353,7 @@ private:
                ContainsLower(pid, appliedFilter_) || ContainsLower(name, appliedFilter_);
     }
 
-    // Filtered row indices; rebuilt only when data or filter changed.
+    // 过滤后的行索引；仅当数据或过滤条件变化时重建。
     void UpdateRows(const Result& res) {
         LowerFilter(filterUtf8_, filterWide_);
         if (filterWide_ == appliedFilter_ && lastData_ == &res) return;
@@ -436,12 +436,12 @@ private:
                 if (c.proto == ConnProto::Tcp4 || c.proto == ConnProto::Tcp6) {
                     ImGui::TextUnformatted(U8(UiTcpStateLabel(c.state)));
                 } else {
-                    ImGui::TextDisabled("%s", U8(L"—"));  // UDP has no state
+                    ImGui::TextDisabled("%s", U8(L"—"));  // UDP 没有状态
                 }
                 ImGui::TableNextColumn();
                 ImGui::Text("%u", c.pid);
                 ImGui::TableNextColumn();
-                std::wstring name = L"—";  // §8: unknown owner renders as em dash
+                std::wstring name = L"—";  // §8：未知持有者渲染为破折号
                 if (c.pid == 0) {
                     name = L"系统";  // contract: pid 0 = bound by kernel/System
                 } else if (const ProcInfo* p = FindPid(*snap, c.pid)) {
@@ -454,7 +454,7 @@ private:
         ImGui::EndTable();
     }
 
-    // In-flight ETW toggle: written by the ops job, polled by the UI thread.
+    // 在途 ETW 开关：由 ops 任务写入，UI 线程轮询。
     struct EtwToggle {
         std::mutex mu;
         bool ready = false;
@@ -467,15 +467,15 @@ private:
     std::wstring appliedFilter_;
     const Result* lastData_ = nullptr;
     std::vector<int> rows_;
-    std::shared_ptr<EtwToggle> etwToggle_;  // null = no toggle in flight
+    std::shared_ptr<EtwToggle> etwToggle_;  // null = 没有开关在途
     bool etwDesired_ = false;
     bool etw_ = false;
     bool etwLoaded_ = false;
 };
 
 // ===========================================================================
-// StartupPage: 4-source startup items; enable/disable with backup note.
-// Data: ops::EnumStartupItems via jobs; refresh on tab activation + manual.
+// StartupPage：4 来源启动项；启用/禁用并附备份说明。
+// 数据：经任务队列的 ops::EnumStartupItems；标签激活 + 手动刷新。
 // ===========================================================================
 
 class StartupPage final : public IPage {
@@ -486,7 +486,7 @@ public:
     void Draw(AppContext& ctx) override {
         const bool becameActive = BecameActive(lastFrame_);
         fetch_.MaybeFetch(Produce, becameActive);  // 切页刷新 per spec
-        if (refetchPending_ && !fetch_.Busy()) {   // refresh after an op landed
+        if (refetchPending_ && !fetch_.Busy()) {   // 操作落地后刷新
             refetchPending_ = false;
             fetch_.MaybeFetch(Produce, true);
         }
@@ -646,7 +646,7 @@ private:
         }
     }
 
-    // ---- confirm + submit ---------------------------------------------------
+    // ---- 确认 + 提交 --------------------------------------------------------
     struct PendOp {
         bool active = false;
         bool openRequested = false;
@@ -669,7 +669,7 @@ private:
             ImGui::OpenPopup(kPopup);
             pend_.openRequested = false;
         }
-        if (!ImGui::IsPopupOpen(kPopup)) {  // dismissed by clicking outside
+        if (!ImGui::IsPopupOpen(kPopup)) {  // 点击外部被关闭
             pend_ = PendOp{};
             return;
         }
@@ -692,11 +692,11 @@ private:
         ImGui::TextDisabled("%s",
                             U8(L"写入前会先备份原值到本地日志目录，可随时恢复。"));
         ImGui::Separator();
-        // Bug F1 fix (2026-09): focus the cancel button ONCE on the appearing frame.
-        // The old per-frame SetKeyboardFocusHere(0) re-submitted a nav move every
-        // frame; when it applied, NavMoveRequestApplyResult() cleared the ActiveId
+        // Bug F1 修复（2026-09）：出现帧上只聚焦取消按钮一次。
+        // 旧的每帧 SetKeyboardFocusHere(0) 每帧重复提交导航移动；
+        // 一旦生效，NavMoveRequestApplyResult() 会清除 ActiveId
         // of the mouse-held confirm button, so 确认启用/确认禁用 could never receive
-        // the click (mouse-down captured, mouse-up silently dropped).
+        // 点击（按下被捕获、抬起被静默丢弃）。
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
         if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
             pend_ = PendOp{};
@@ -720,10 +720,10 @@ private:
         req.kind = ui::ConfirmKind::StartupToggle;
         req.startupEnable = enable;
         req.startupItem = item;
-        // ExecuteConfirmedAction always reports the outcome through the notes -> toast
-        // pipeline (including a refused submission), so a click can never be a no-op.
+        // ExecuteConfirmedAction 总是经 notes -> toast 管线上报结果
+        //（包括被拒的提交），因此点击绝不会是空操作。
         ui::ExecuteConfirmedAction(LiveP3Ctx(), req);
-        refetchPending_ = true;  // rebuild the list once the op lands
+        refetchPending_ = true;  // 操作落地后重建列表
     }
 
     AsyncFetch<std::vector<ops::StartupItem>> fetch_{2.0};
@@ -739,16 +739,16 @@ private:
 };
 
 // ===========================================================================
-// ServicePage: SCM services; start/stop with running-dependents warning.
-// Data: ops::EnumServices via jobs, min 5 s between fetches + manual refresh.
+// ServicePage：SCM 服务；启动/停止并警告运行中的依赖者。
+// 数据：经任务队列的 ops::EnumServices，抓取至少间隔 5s + 手动刷新。
 // ===========================================================================
 
 ImVec4 ServiceStateColor(uint32_t state) {
     switch (state) {
-        case 4: return ColDone();                          // running
-        case 2: case 3: case 5: case 6: return ColWarn();  // pending transitions
-        case 7: return ColInfo();                          // paused
-        case 1: return ColMuted();                         // stopped
+        case 4: return ColDone();                          // 运行中
+        case 2: case 3: case 5: case 6: return ColWarn();  // 过渡中状态
+        case 7: return ColInfo();                          // 已暂停
+        case 1: return ColMuted();                         // 已停止
         default: return ColFail();
     }
 }
@@ -760,7 +760,7 @@ public:
 
     void Draw(AppContext& ctx) override {
         BecameActive(lastFrame_);
-        fetch_.MaybeFetch(Produce, false);  // 5 s rule + manual refresh
+        fetch_.MaybeFetch(Produce, false);  // 5s 规则 + 手动刷新
         if (refetchPending_ && !fetch_.Busy()) {
             refetchPending_ = false;
             fetch_.MaybeFetch(Produce, true);
@@ -823,10 +823,10 @@ private:
         char start[64], stop[64];
         snprintf(start, sizeof(start), "%s%s", U8(L"启动"), suffix);
         snprintf(stop, sizeof(stop), "%s%s", U8(L"停止"), suffix);
-        // P2-5: gate entries that are guaranteed to fail. A SERVICE_DISABLED
-        // service cannot start (the contract has no enable op); a service whose
-        // accepted-controls set lacks SERVICE_ACCEPT_STOP cannot stop.
-        const bool canStart = sel != nullptr && sel->startType != 4;  // != SERVICE_DISABLED
+        // P2-5：拦下注定失败的条目。SERVICE_DISABLED 服务无法启动
+        //（契约没有启用操作）；接受控制集缺少 SERVICE_ACCEPT_STOP
+        // 的服务无法停止。
+        const bool canStart = sel != nullptr && sel->startType != 4;  // != SERVICE_DISABLED（非禁用）
         const bool canStop = sel != nullptr && sel->canStop;
         ImGui::BeginDisabled(sel == nullptr || !allowed || !canStart);
         if (ImGui::Button(start) && sel != nullptr) RequestConfirm(*sel, true);
@@ -948,17 +948,17 @@ private:
             ImGui::TextColored(ColWarn(), "%s", U8(L"服务操作需要管理员权限（需提权）"));
             ImGui::Separator();
         }
-        // P2-5: entries that would certainly fail stay visible but disabled,
-        // with the reason in the label (P2-5) / greyed by elevation gate.
+        // P2-5：注定失败的条目保持可见但禁用，
+        // 原因写在标签里（P2-5）/ 由提权闸门变灰。
         ImGui::BeginDisabled(!allowed);
-        if (s.state != 4 && s.state != 2) {  // not running / not start-pending
-            if (s.startType == 4) {          // SERVICE_DISABLED
+        if (s.state != 4 && s.state != 2) {  // 非运行 / 非启动挂起
+            if (s.startType == 4) {          // SERVICE_DISABLED（禁用）
                 ImGui::MenuItem(U8(L"启动（服务已禁用）"), nullptr, false, false);
             } else if (ImGui::MenuItem(U8(L"启动…"), nullptr, false, allowed)) {
                 RequestConfirm(s, true);
             }
         }
-        if (s.state == 4 || s.state == 7) {  // running / paused
+        if (s.state == 4 || s.state == 7) {  // 运行中 / 已暂停
             if (!s.canStop) {
                 ImGui::MenuItem(U8(L"停止（不接受停止控制）"), nullptr, false, false);
             } else if (ImGui::MenuItem(U8(L"停止…"), nullptr, false, allowed)) {
@@ -973,8 +973,8 @@ private:
         }
     }
 
-    // ---- confirm + submit ---------------------------------------------------
-    // Running-dependents plan arrives asynchronously (like the kill-tree plan).
+    // ---- 确认 + 提交 --------------------------------------------------------
+    // 运行依赖者规划异步到达（与杀树规划相同）。
     struct DepPlan {
         std::mutex mu;
         bool ready = false;
@@ -986,7 +986,7 @@ private:
         bool openRequested = false;
         bool start = false;
         ops::ServiceInfo svc;
-        std::shared_ptr<DepPlan> plan;  // stop only
+        std::shared_ptr<DepPlan> plan;  // 仅停止用
     };
 
     void RequestConfirm(const ops::ServiceInfo& s, bool start) {
@@ -1000,7 +1000,7 @@ private:
             std::shared_ptr<AppContext> app = LiveP3Ctx();
             std::shared_ptr<DepPlan> plan = pend_.plan;
             if (app) {
-                // P2 (V14): a refused submission must not leave the dialog hanging
+                // P2（V14）：被拒的提交不能让对话框悬着
                 // on "正在查询依赖…" — mark the plan ready and toast the failure.
                 if (app->jobs.Submit([app, plan, name = s.name] {
                         std::vector<std::wstring> deps = ops::GetDependentServices(name);
@@ -1074,9 +1074,9 @@ private:
                                 U8(L"启动失败时通常是因为缺少管理员权限或服务已被禁用。"));
         }
         ImGui::Separator();
-        // Bug F1 fix: focus the cancel button once on the appearing frame (the
-        // per-frame SetKeyboardFocusHere steals the mouse ActiveId from the
-        // confirm button between mouse-down and mouse-up — see StartupPage).
+        // Bug F1 修复：出现帧上只聚焦取消按钮一次（每帧的
+        // SetKeyboardFocusHere 会在按下与抬起之间抢走确认按钮的
+        // 鼠标 ActiveId——见 StartupPage）。
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
         if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
             pend_ = PendOp{};
@@ -1112,7 +1112,7 @@ private:
                                  FailSuffix(elevated)));
                 }
             }) == 0) {
-            // Queue not running (teardown): never fail silently.
+            // 队列未运行（拆除中）：绝不静默失败。
             PushNote(*app, Notification::Kind::JobFailed,
                      L"操作队列未运行，指令未能提交（应用可能正在退出）");
         }
@@ -1132,8 +1132,8 @@ private:
 };
 
 // ===========================================================================
-// DriverPage: loaded kernel drivers; signature checked on demand (selection).
-// Data: ops::EnumDrivers via jobs. 24H2+ non-elevated degrades to a full-page
+// DriverPage：已加载内核驱动；按需（选中时）检查签名。
+// 数据：经任务队列的 ops::EnumDrivers。24H2+ 未提权时退化为
 // notice with the shared elevate button (contract error 需要管理员权限).
 // ===========================================================================
 
@@ -1164,7 +1164,7 @@ public:
             if (retry) fetch_.MaybeFetch(Produce, true);
             return;
         }
-        if (!res->err.empty()) {  // P2-3: partial-data banner, same as other pages
+        if (!res->err.empty()) {  // P2-3：部分数据横幅，与其他页面一致
             ImGui::TextColored(ColWarn(), "%s",
                                U8(Fmt(L"部分数据不可用：{}", res->err)));
         }
@@ -1178,7 +1178,7 @@ private:
     }
 
     struct SigSlot {
-        std::atomic<int> state{-1};  // -1 pending, else ops::SigState as int
+        std::atomic<int> state{-1};  // -1 处理中，否则为 int 形式的 ops::SigState
     };
 
     void DrawDegraded(AppContext& ctx, const std::wstring& err) {
@@ -1245,7 +1245,7 @@ private:
                 ImGui::TextDisabled("%s", U8(L"未知"));
                 break;
             case ops::SigState::NoCheck:
-            default:  // -1: job still in flight
+            default:  // -1：任务仍在途
                 ImGui::TextDisabled("%s", U8(L"查询中…"));
                 break;
         }
@@ -1281,7 +1281,7 @@ private:
                 if (ImGui::Selectable(U8(Truncate(d.name, 44)), selected,
                                       ImGuiSelectableFlags_SpanAllColumns)) {
                     selectedPath_ = d.path;
-                    EnsureSig(d.path);  // signature check triggered by selection
+                    EnsureSig(d.path);  // 选中触发的签名检查
                 }
                 if (ImGui::BeginPopupContextItem("##rowctx")) {
                     if (ImGui::MenuItem(U8(L"复制路径"))) {
@@ -1316,12 +1316,12 @@ private:
 };
 
 // ===========================================================================
-// SensorPage (W2 redesign): honest four-state readings grouped into vertical
-// full-width sections (P1-3: nothing clips at any window width), per-group
+// SensorPage（W2 重设计）：诚实的四态读数分入纵向全宽分区
+//（P1-3：任何窗口宽度都不裁切），分组可见性可配置，
 // 可选显示 toggles persisted in the config, and an optional LibreHardwareMonitor
-// (LHM) data source — OFF by default, localhost-only, probed through the ops
-// queue (P1-4 contract: no UAC/network work on the UI thread).
-// Data: collect::ReadSensors via jobs, min 10 s; LHM polls share the same beat.
+//（LHM）数据源——默认关闭、仅限本机，经 ops 队列探测
+//（P1-4 契约：UI 线程不做 UAC/网络工作）。
+// 数据：经任务队列的 collect::ReadSensors，至少 10s；LHM 轮询同拍。
 // ===========================================================================
 
 class SensorPage final : public IPage {
@@ -1332,8 +1332,8 @@ public:
     void Draw(AppContext& ctx) override {
         const bool becameActive = BecameActive(lastFrame_);
         LoadPrefsOnce(ctx);
-        fetch_.MaybeFetch(Produce, becameActive);  // >=10 s beat + manual refresh
-        if (lhmOn_) lhmFetch_.MaybeFetch(LhmProduce, becameActive);  // same beat
+        fetch_.MaybeFetch(Produce, becameActive);  // >=10s 节拍 + 手动刷新
+        if (lhmOn_) lhmFetch_.MaybeFetch(LhmProduce, becameActive);  // 同一节拍
         PollLhmProbe(ctx);
         std::shared_ptr<const Result> res = fetch_.Peek();
 
@@ -1412,13 +1412,13 @@ public:
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Battery)) {
             BeginGroup("##grp_battery", L"电池", snap.battery.size());
-            readings(snap.battery);   // NoHardware entry = honest empty state
+            readings(snap.battery);   // NoHardware 条目 = 诚实的空态
             readings(FilterLhm(lhm, LhmGroup::Battery));
             EndGroup();
         }
         if (SensorGroupVisible(ctx.cfg, SensorGroup::Fan)) {
             BeginGroup("##grp_fan", L"风扇", snap.fans.size());
-            readings(snap.fans);      // honest NeedDriver entries
+            readings(snap.fans);      // 诚实的 NeedDriver 条目
             readings(FilterLhm(lhm, LhmGroup::Fan));
             EndGroup();
         }
@@ -1439,7 +1439,7 @@ private:
     static SensorSnapshot Produce(std::wstring* err) { return ReadSensors(err); }
     static std::vector<SensorReading> LhmProduce(std::wstring* err) {
         std::vector<SensorReading> out;
-        PollLhm(&out, err);  // localhost-only client, ~1 s bounded timeouts
+        PollLhm(&out, err);  // 仅限本机的客户端，约 1s 有界超时
         return out;
     }
 
@@ -1449,7 +1449,7 @@ private:
                s.battery.empty() && s.memory.empty();
     }
 
-    // ---- preferences (cfg-persisted) ----------------------------------------
+    // ---- 偏好（cfg 持久化）--------------------------------------------------
     void LoadPrefsOnce(AppContext& ctx) {
         if (prefsLoaded_) return;
         prefsLoaded_ = true;
@@ -1458,13 +1458,13 @@ private:
             1024, std::min(65535, static_cast<int>(ctx.cfg.GetInt(L"lhmPort", 8085)))));
         lhmOn_ = ctx.cfg.GetBool(L"lhmEnabled", false);
         if (lhmOn_) {
-            // Restored from a previous session: re-probe before trusting it.
+            // 从上一会话恢复：信任之前先重新探测。
             SetLhmOptions(stm::LhmOptions{lhmOn_, lhmPort_});
             StartLhmProbe(ctx);
         }
     }
 
-    // ---- LHM source (off by default; jobs-validated) -------------------------
+    // ---- LHM 来源（默认关；经任务队列校验）----------------------------------
     struct LhmProbe {
         std::mutex mu;
         bool ready = false;
@@ -1496,8 +1496,8 @@ private:
         });
     }
 
-    // Drives the probe state machine; never blocks the UI (PollLhm runs on the
-    // ops worker). Failure => revert to off with an honest note (P2 requirement).
+    // 驱动探测状态机；绝不阻塞 UI（PollLhm 在 ops 工作线程上
+    // 运行）。失败 => 退回关闭并附诚实说明（P2 要求）。
     void PollLhmProbe(AppContext& ctx) {
         if (!lhmProbe_) return;
         bool ready = false, ok = false;
@@ -1541,7 +1541,7 @@ private:
         bool on = lhmOn_;
         if (ImGui::Checkbox(U8(L"启用（实验性）"), &on)) {
             if (on) {
-                StartLhmProbe(ctx);  // validate through the ops queue before use
+                StartLhmProbe(ctx);  // 使用前经 ops 队列校验
             } else {
                 SetLhmOptions(stm::LhmOptions{false, lhmPort_});
                 lhmOn_ = false;
@@ -1557,7 +1557,7 @@ private:
             if (port != lhmPort_) {
                 lhmPort_ = static_cast<uint16_t>(port);
                 ctx.cfg.SetInt(L"lhmPort", lhmPort_);
-                if (lhmOn_) StartLhmProbe(ctx);  // re-validate with the new port
+                if (lhmOn_) StartLhmProbe(ctx);  // 用新端口重新校验
             }
         }
         if (!lhmOn_) {
@@ -1578,7 +1578,7 @@ private:
         }
     }
 
-    // Current LHM readings (empty when disabled / not fetched yet).
+    // 当前 LHM 读数（禁用 / 尚未抓取时为空）。
     std::vector<SensorReading> CurrentLhmRows() const {
         std::vector<SensorReading> rows;
         if (!lhmOn_) return rows;
@@ -1591,14 +1591,14 @@ private:
                                                 LhmGroup group) {
         std::vector<SensorReading> out;
         for (const SensorReading& r : rows) {
-            // P2: extended classifier — AMD-style per-core temps without a
-            // "cpu" token reach the CPU group too (see LhmGroupOfCpuTemps).
+            // P2：扩展分类器——不带 "cpu" 记号的 AMD 风格每核温度
+            // 也进入 CPU 组（见 LhmGroupOfCpuTemps）。
             if (LhmGroupOfCpuTemps(r.label) == group) out.push_back(r);
         }
         return out;
     }
 
-    // ---- visibility toggles ---------------------------------------------------
+    // ---- 可见性开关 -----------------------------------------------------------
     void DrawVisibilityRow(AppContext& ctx) {
         ImGui::TextDisabled("%s", U8(L"可选显示："));
         auto checkbox = [&](SensorGroup g) {
@@ -1628,7 +1628,7 @@ private:
         ImGui::Separator();
     }
 
-    // ---- group scaffolding (vertical, full width: P1-3) -----------------------
+    // ---- 分组脚手架（纵向、全宽：P1-3）---------------------------------------
     static void BeginGroup(const char* id, const wchar_t* title, size_t readingCount) {
         ImGui::BeginChild(id, ImVec2(0.0f, 0.0f),
                           ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
@@ -1674,7 +1674,7 @@ private:
                     if (!ctx.elevated && ops::CanElevate()) {
                         ImGui::SameLine();
                         if (ImGui::SmallButton(U8(L"提权重启"))) {
-                            RequestElevateRestart(ctx);  // P1-4: jobs worker, not UI thread
+                            RequestElevateRestart(ctx);  // P1-4：任务工作线程，而非 UI 线程
                         }
                     }
                     break;
@@ -1692,8 +1692,8 @@ private:
         ImGui::EndTable();
     }
 
-    // Per-core frequency + utilization table (cpuCores: MHz and % rows paired by
-    // core index; aggregate fallback rows render as plain readings instead).
+    // 每核频率 + 利用率表（cpuCores：MHz 与 % 行按核心索引配对；
+    // 聚合兜底行改为普通读数展示）。
     void DrawCoreTable(AppContext& ctx, const std::vector<SensorReading>& cores) {
         struct CoreRow {
             double mhz = kUnavail;
@@ -1897,16 +1897,16 @@ private:
     std::shared_ptr<LhmProbe> lhmProbe_;
     bool prefsLoaded_ = false;
     bool detailMode_ = false;  // F4#9: 传感器详细模式（cfg sensDetailMode）
-    bool lhmOn_ = false;       // validated state (probe-passed), persisted in cfg
+    bool lhmOn_ = false;       // 已校验状态（探测通过），持久化于 cfg
     uint16_t lhmPort_ = 8085;
     uint64_t lastFrame_ = kNeverDrawn;
 };
 
 // ===========================================================================
-// Threshold alerts (optional phase-3 extra): CPU>90% / memory>95% watched on
-// the UI thread (the values already arrive with every snapshot). One balloon
-// + one toast per episode, 5 min per-metric cooldown, re-armed with a 5%
-// hysteresis. Config: alertOn (default off) / alertCpu / alertMem.
+// 阈值告警（可选的第 3 阶段附加）：CPU>90% / 内存>95% 在 UI 线程上
+// 监视（数值本来就随每次快照到达）。每次事件一个气泡
+// + 一个 toast，每指标 5 分钟冷却，带 5% 迟滞重新布防。
+// 配置：alertOn（默认关）/ alertCpu / alertMem。
 // ===========================================================================
 
 struct AlertState {
@@ -1934,7 +1934,7 @@ void FireAlert(AppContext& ctx, const wchar_t* what, double value, double thresh
 }  // namespace
 
 // ===========================================================================
-// Public entry points (app/ui3/Pages3.h contract).
+// 公共入口（app/ui3/Pages3.h 契约）。
 // ===========================================================================
 
 std::shared_ptr<AppContext>& P3Slot() {
@@ -1959,15 +1959,15 @@ void RegisterPhase3Pages(AppContext& ctx) {
     ctx.pages.push_back(std::make_unique<ServicePage>());
     ctx.pages.push_back(std::make_unique<DriverPage>());
     ctx.pages.push_back(std::make_unique<SensorPage>());
-    // Apply the persisted ETW switch before the collector starts (main calls
-    // RegisterPages before CollectService::Start).
+    // 在采集器启动前应用持久化的 ETW 开关（main 在
+    // CollectService::Start 之前调用 RegisterPages）。
     ctx.collect.SetNetEtwEnabled(ctx.cfg.GetBool(L"netEtw", false));
 }
 
 void AlertTick(AppContext& ctx) {
     AlertState& a = Alerts();
     if (!ctx.cfg.GetBool(L"alertOn", false)) {
-        a.armedCpu = true;  // stay re-armed while disabled
+        a.armedCpu = true;  // 禁用期间保持重新布防
         a.armedMem = true;
         return;
     }
@@ -1977,7 +1977,7 @@ void AlertTick(AppContext& ctx) {
     const SystemInfo& sys = snap->sys;
     const double now = ImGui::GetTime();
 
-    if (sys.cpuTotalPercent == sys.cpuTotalPercent) {  // NaN check
+    if (sys.cpuTotalPercent == sys.cpuTotalPercent) {  // NaN 检查
         if (a.armedCpu && sys.cpuTotalPercent > cpuThr &&
             now - a.lastFireCpu >= kAlertCooldownSec) {
             a.armedCpu = false;
@@ -2051,8 +2051,8 @@ void SetSmokeDrawAll(bool on) { SmokeDrawAllSlot() = on; }
 
 void DrawSmokeAllPages(AppContext& ctx) {
     if (!SmokeDrawAllSlot() || ctx.pages.empty()) return;
-    // Offscreen window: exercises every page's Draw path (empty/error states)
-    // under --smoke without disturbing the visible shell.
+    // 屏外窗口：在 --smoke 下执行每个页面的 Draw 路径
+    //（空态/错误态），不打扰可见外壳。
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x + 24.0f, vp->WorkPos.y));
     ImGui::SetNextWindowSize(ImVec2(900.0f, 640.0f));

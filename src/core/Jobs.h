@@ -1,6 +1,6 @@
 #pragma once
-// Serial worker job queue (arch section 5). One worker thread; destructive/slow ops only.
-// Exit protocol: Shutdown waits at most waitMs for the in-flight job, drops queued jobs.
+// 串行工作任务队列（架构第 5 节）。单工作线程；仅用于破坏性/耗时操作。
+// 退出协议：Shutdown 至多等待 waitMs 让执行中的任务完成，排队任务被丢弃。
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -18,10 +18,10 @@ public:
     JobQueue& operator=(const JobQueue&) = delete;
 
     bool Start();
-    // Returns sequence number, or 0 if the queue is not running.
+    // 返回序号；队列未运行时返回 0。
     uint64_t Submit(std::function<void()> job);
-    size_t PendingCount() const;  // queued (not including in-flight)
-    // waitMs>0: let the in-flight job finish; queued jobs are dropped and logged.
+    size_t PendingCount() const;  // 仅排队数（不含执行中的任务）
+    // waitMs>0：等待执行中的任务完成；排队任务被丢弃并记录日志。
     void Shutdown(uint32_t waitMs);
 
 private:

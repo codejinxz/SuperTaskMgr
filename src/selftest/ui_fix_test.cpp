@@ -1,16 +1,16 @@
-// Bug F1 fix tests (2026-09): the confirm-dialog execution chain, without any GUI.
+// Bug F1 修复测试（2026-09）：确认对话框执行链，完全无 GUI。
 //
 // Regression context: the confirm buttons of the 终止进程 / 终止进程树 / 确认禁用
-// dialogs had no effect. The UI state machines were fixed in app/ui/Pages.cpp and
-// app/ui3/Pages3.cpp; the action itself now lives in ui::ExecuteConfirmedAction()
-// (app/ui/ConfirmAction.h, header-only, ImGui-free). These cases prove the whole
+// 对话框没有效果。UI 状态机已在 app/ui/Pages.cpp 与
+// app/ui3/Pages3.cpp 中修复；动作本身现在位于 ui::ExecuteConfirmedAction()
+//（app/ui/ConfirmAction.h，仅头文件、不依赖 ImGui）。这些用例证明整条
 // "确认 -> jobs.Submit -> ops 生效 -> notes 回填" chain on a real Windows system:
-//   fix_confirm_kill_flow              kill a spawned cmd child, assert it exits
-//   fix_confirm_tree_flow              cmd -> ping tree kill, assert both exit
-//   fix_startup_toggle_action          temp HKCU Run item, assert StartupApproved
-//   fix_confirm_submit_failure_notify  refused submit must produce a JobFailed note
-//   fix_confirm_kill_reject_protected  ops protection gate must surface as a note
-// All cases pass without elevation.
+//   fix_confirm_kill_flow              终止启动的 cmd 子进程，断言其退出
+//   fix_confirm_tree_flow              cmd -> ping 树终止，断言两者退出
+//   fix_startup_toggle_action          临时 HKCU Run 项，断言 StartupApproved
+//   fix_confirm_submit_failure_notify  被拒提交必须产生 JobFailed 通知
+//   fix_confirm_kill_reject_protected  ops 保护闸门必须以通知形式浮现
+// 所有用例无需提权即可通过。
 #include "selftest/TestFramework.h"
 #include "app/ui/ConfirmAction.h"
 #include "core/HandleGuard.h"
@@ -31,8 +31,8 @@ uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
-// Started job queue + notification queue; the minimal environment a confirm action
-// needs (no collect service, no details provider for these paths).
+// 已启动的任务队列 + 通知队列；确认动作所需的
+// 最小环境（这些路径无需采集服务与详情提供者）。
 std::shared_ptr<stm::AppContext> MakeCtx(bool startQueue) {
     auto ctx = std::make_shared<stm::AppContext>();
     if (startQueue) ctx->jobs.Start();
@@ -40,8 +40,8 @@ std::shared_ptr<stm::AppContext> MakeCtx(bool startQueue) {
 }
 
 struct SpawnedProc {
-    stm::UniqueHandle proc;  // full access handle (wait + terminate fallback)
-    stm::UniqueHandle query; // PROCESS_QUERY_LIMITED_INFORMATION for GetProcessTimes
+    stm::UniqueHandle proc;  // 完全访问句柄（等待 + 终止兜底）
+    stm::UniqueHandle query; // 供 GetProcessTimes 用的 PROCESS_QUERY_LIMITED_INFORMATION
     uint32_t pid = 0;
     uint64_t createTime = 0;
 
@@ -50,7 +50,7 @@ struct SpawnedProc {
     }
 };
 
-// Spawns a detached cmd.exe running `ping -n <n> 127.0.0.1` (~n seconds lifetime).
+// 启动分离的 cmd.exe 运行 `ping -n <n> 127.0.0.1`（寿命约 n 秒）。
 bool SpawnPingCmd(int n, SpawnedProc* out) {
     wchar_t cmdLine[128];
     swprintf_s(cmdLine, L"cmd.exe /c ping -n %d 127.0.0.1", n);
@@ -87,7 +87,7 @@ uint32_t FindChildPid(uint32_t parentPid, const wchar_t* name) {
     return 0;
 }
 
-// Waits for the predicate up to timeoutMs; returns the last predicate value.
+// 至多等 timeoutMs 的谓词；返回最后一次谓词值。
 template <typename Pred>
 bool PollUntil(Pred pred, DWORD timeoutMs) {
     const DWORD deadline = GetTickCount() + timeoutMs;
@@ -98,7 +98,7 @@ bool PollUntil(Pred pred, DWORD timeoutMs) {
     }
 }
 
-// Drains the notification queue until a note matching `match` appears.
+// 取空通知队列直到出现匹配 `match` 的通知。
 bool WaitForNote(stm::AppContext& ctx, DWORD timeoutMs,
                  bool (*match)(const stm::Notification&), stm::Notification* found) {
     std::vector<stm::Notification> all;
@@ -115,7 +115,7 @@ bool WaitForNote(stm::AppContext& ctx, DWORD timeoutMs,
     return ok;
 }
 
-// ---- temporary HKCU Run startup item ---------------------------------------
+// ---- 临时 HKCU Run 启动项 ---------------------------------------------------
 
 constexpr wchar_t kTestRunKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -151,8 +151,8 @@ stm::ops::StartupItem MakeTestStartupItem() {
 
 }  // namespace
 
-// A confirm kill request executed through ui::ExecuteConfirmedAction must actually
-// terminate the spawned target within the poll window.
+// 经 ui::ExecuteConfirmedAction 执行的终止确认必须真的在轮询窗口内
+// 终止被启动的目标。
 STM_TEST(fix_confirm_kill_flow) {
     SpawnedProc p;
     if (!SpawnPingCmd(30, &p)) { *err = L"创建 cmd 子进程失败"; return false; }
@@ -172,18 +172,18 @@ STM_TEST(fix_confirm_kill_flow) {
     }
     const bool exited = PollUntil([&] { return p.Exited(); }, 8000);
     if (!exited) *err = L"确认终止后 8 秒内目标进程未退出（kill 链路失效）";
-    TerminateProcess(p.proc.get(), 1);  // best-effort cleanup on failure paths
+    TerminateProcess(p.proc.get(), 1);  // 失败路径上尽力清理
     ctx->jobs.Shutdown(2000);
     return exited;
 }
 
-// A confirm kill-tree request must take down the cmd root AND its ping descendant.
+// 终止树的确认请求必须放倒 cmd 根与其 ping 后代。
 STM_TEST(fix_confirm_tree_flow) {
     SpawnedProc p;
     if (!SpawnPingCmd(30, &p)) { *err = L"创建 cmd 子进程失败"; return false; }
 
     uint32_t pingPid = 0;
-    stm::UniqueHandle ping(  // observe ping's lifetime without owning it
+    stm::UniqueHandle ping(  // 观察而不持有 ping 的生命周期
         [&] {
             PollUntil([&] { return (pingPid = FindChildPid(p.pid, L"ping.exe")) != 0; }, 3000);
             return pingPid ? OpenProcess(SYNCHRONIZE, FALSE, pingPid) : nullptr;
@@ -215,9 +215,9 @@ STM_TEST(fix_confirm_tree_flow) {
     return rootExited && pingExited;
 }
 
-// A confirm disable request on a temporary HKCU Run item must flip the
-// StartupApproved\Run value to the disabled encoding (odd low byte), and the
-// enable request must flip it back — then clean up both registry values.
+// 对临时 HKCU Run 项的禁用确认必须把 StartupApproved\Run 值
+// 翻转为禁用编码（低位奇字节），启用确认必须翻回——
+// 然后清理两个注册表值。
 STM_TEST(fix_startup_toggle_action) {
     HKEY raw = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kTestRunKey, 0, nullptr, REG_OPTION_NON_VOLATILE,
@@ -285,10 +285,10 @@ STM_TEST(fix_startup_toggle_action) {
     return disabled && enabled;
 }
 
-// A refused submission (ops queue not running) must be reported through the
-// notification queue — a confirm click may never be a silent no-op.
+// 被拒的提交（ops 队列未运行）必须经通知队列表报——
+// 确认点击绝不能是静默空操作。
 STM_TEST(fix_confirm_submit_failure_notify) {
-    auto ctx = MakeCtx(false);  // queue NOT started
+    auto ctx = MakeCtx(false);  // 队列未启动
     ui::ConfirmRequest req;
     req.kind = ui::ConfirmKind::Kill;
     req.key = stm::ProcKey{0xDEAD, 0};
@@ -309,13 +309,13 @@ STM_TEST(fix_confirm_submit_failure_notify) {
     return notified;
 }
 
-// The ops protection gate must surface as a JobFailed note through the same
-// notes -> toast pipeline (no privileged bypass from the confirm action).
+// ops 保护闸门必须经同一条 notes -> toast 管线以 JobFailed 通知
+// 浮现（确认动作没有特权旁路）。
 STM_TEST(fix_confirm_kill_reject_protected) {
     auto ctx = MakeCtx(true);
     ui::ConfirmRequest req;
     req.kind = ui::ConfirmKind::Kill;
-    req.key = stm::ProcKey{4, 1};  // pid 4 = System, on the built-in protection list
+    req.key = stm::ProcKey{4, 1};  // pid 4 = System，在内置保护名单上
     req.pid = 4;
     req.name = L"System";
     if (!ui::ExecuteConfirmedAction(ctx, req)) {

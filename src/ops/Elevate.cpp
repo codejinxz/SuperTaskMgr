@@ -12,7 +12,7 @@ namespace stm::ops {
 bool IsElevated() { return IsProcessElevated(); }
 
 bool CanElevate() {
-    // UAC disabled (EnableLUA=0) means runas would silently fail; default true when unset.
+    // UAC 被禁用（EnableLUA=0）时 runas 会静默失败；未设置时默认为 true。
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                       L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
@@ -42,7 +42,7 @@ bool RelaunchAsAdmin(const std::wstring& args) {
         return false;
     }
     STM_LOG_INFO("elevate", L"已发起提权重启，当前实例即将退出");
-    return true;  // caller must exit now (arch section 7)
+    return true;  // 调用方现在必须退出（架构第 7 节）
 }
 
 }  // namespace stm::ops

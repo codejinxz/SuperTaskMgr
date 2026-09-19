@@ -1,7 +1,7 @@
 #pragma once
-// Phase-3 UI extension: network / startup / services / drivers / sensors tabs
-// plus the optional threshold alert watcher. Registered on top of the phase-2
-// pages by appending to RegisterPages (app/ui/Pages.cpp).
+// 第 3 阶段 UI 扩展：网络/启动项/服务/驱动/传感器标签页，
+// 外加可选的阈值告警监视器。以追加方式注册到第 2 阶段页面之上
+//（追加进 RegisterPages，app/ui/Pages.cpp）。
 #include <functional>
 #include <memory>
 #include <string>
@@ -10,30 +10,30 @@
 namespace stm {
 namespace ui3 {
 
-// Page registration (called from RegisterPages; appends after perf).
+// 页面注册（由 RegisterPages 调用；追加在性能页之后）。
 void RegisterPhase3Pages(AppContext& ctx);
 
-// Shared context handle for ops jobs created by the phase-3 pages (lifetime
-// pattern identical to BindAppContext). main.cpp calls this once at startup.
+// 第 3 阶段页面创建的 ops 任务共享上下文句柄（生命周期模式
+// 与 BindAppContext 相同）。main.cpp 启动时调用一次。
 void BindPhase3Context(std::shared_ptr<AppContext> ctx);
 std::shared_ptr<AppContext> LiveP3Ctx();
 
-// Shell hook, called once per frame from DrawShell: threshold alert watcher
-// (default off; cfg keys alertOn / alertCpu / alertMem).
+// 外壳钩子，由 DrawShell 每帧调用一次：阈值告警监视器
+//（默认关；cfg 键 alertOn / alertCpu / alertMem）。
 void AlertTick(AppContext& ctx);
 
-// Perf-page hook: compact alert on/off + threshold controls (appended at the
-// bottom of the performance page; purely additive).
+// 性能页钩子：紧凑的告警开关 + 阈值控件（追加在性能页底部；
+// 纯增量）。
 void DrawAlertControls(AppContext& ctx);
 
-// Smoke support: when enabled (--smoke), DrawSmokeAllPages draws every page
-// once per frame into an offscreen window so the empty/error states of the
-// new tabs are exercised by SuperTaskMgr.exe --smoke.
+// 冒烟支持：启用时（--smoke），DrawSmokeAllPages 把每个页面
+// 每帧在屏外窗口绘制一次，使新标签页的空态/错误态
+// 被 SuperTaskMgr.exe --smoke 执行到。
 void SetSmokeDrawAll(bool on);
 void DrawSmokeAllPages(AppContext& ctx);
 
-// Tray balloon sink for alerts (wired by main.cpp to Tray::ShowBalloon; unset
-// under --smoke, where alerts degrade to toasts only).
+// 告警的托盘气泡 sink（main.cpp 接到 Tray::ShowBalloon；--smoke 下
+// 不接，告警降级为仅 toast）。
 using BalloonSink = std::function<void(const std::wstring& title, const std::wstring& text)>;
 void SetBalloonSink(BalloonSink sink);
 

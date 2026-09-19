@@ -1,10 +1,10 @@
-// Pure-logic tests for ui3/Wallpaper: mask clamp, extension check, state defaults.
-// No D3D, no ImGui (texture upload / draw / load paths are verified by the --smoke
-// integration run instead). stm_selftest does not link app objects, so this TU
-// includes the implementation directly in "headless" mode: the imgui.h reference is
-// compiled out and the remaining D3D calls are plain interface vtable calls, so the
-// only link dependency added is stm_core (Log/FsUtil). This way the tests exercise
-// the REAL ClampMask / IsSupportedImageExt implementations, not copies.
+// ui3/Wallpaper 纯逻辑测试：遮罩钳制、扩展名检查、状态默认值。
+// 无 D3D、无 ImGui（纹理上传/绘制/加载路径改由 --smoke
+// 集成运行验证）。stm_selftest 不链接应用对象，因此本编译单元
+// 以"无头"模式直接包含实现：imgui.h 引用被编译排除，
+// 剩余 D3D 调用只是普通接口虚表调用，因此新增的
+// 链接依赖只有 stm_core（Log/FsUtil）。这样测试执行的是
+// 真实的 ClampMask / IsSupportedImageExt 实现，而非副本。
 #define STM_WALLPAPER_HEADLESS 1
 #include "../app/ui3/Wallpaper.cpp"
 
@@ -12,7 +12,7 @@
 
 #include "selftest/TestFramework.h"
 
-// Readability mask: clamp into [0, 0.85]; out-of-range and NaN fold safely.
+// 可读性遮罩：钳制进 [0, 0.85]；越界与 NaN 安全归并。
 STM_TEST(wallpaper_mask_clamp) {
     if (stm::ui::ClampMask(0.0f) != 0.0f || stm::ui::ClampMask(-0.25f) != 0.0f ||
         stm::ui::ClampMask(-1.0e9f) != 0.0f) {
@@ -36,8 +36,8 @@ STM_TEST(wallpaper_mask_clamp) {
     return true;
 }
 
-// Extension gate: case-insensitive, needs a real final extension; dots inside
-// directory names or Chinese paths must not confuse it.
+// 扩展名闸门：大小写不敏感，必须有真实的最终扩展名；
+// 目录名中的点或中文路径不得使其混淆。
 STM_TEST(wallpaper_ext_check) {
     struct Case {
         const wchar_t* path;
@@ -63,7 +63,7 @@ STM_TEST(wallpaper_ext_check) {
     return true;
 }
 
-// Documented defaults of the public state struct (and the fresh global module state).
+// 公共状态结构体（以及全新的全局模块状态）的文档化默认值。
 STM_TEST(wallpaper_state_defaults) {
     const stm::ui::WallpaperState s;
     if (s.loaded || s.width != 0 || s.height != 0) {

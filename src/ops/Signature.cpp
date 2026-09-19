@@ -1,13 +1,13 @@
-// WinVerifyTrust wrapper (documented wintrust/mscat surfaces only).
+// WinVerifyTrust 包装（只用有文档的 wintrust/mscat 接口）。
 //
-// Protocol notes (ops/Signature.h):
-//  - every VERIFY call is paired with a WTD_STATEACTION_CLOSE call on the same
-//    WINTRUST_DATA (documented requirement; otherwise the trust-state handle leaks);
-//  - embedded-signature check first (WINTRUST_ACTION_GENERIC_VERIFY_V2 / WTD_CHOICE_FILE);
-//    when the image has no embedded signature (TRUST_E_NOSIGNATURE) the catalog path is
-//    tried (WTD_CHOICE_CATALOG + CryptCATAdmin* APIs) because OS images are catalog-signed;
-//  - WTD_UI_NONE everywhere, revocation left at WTD_REVOKE_NONE (no network stalls);
-//  - results cached per lowercased path, cache cleared when it exceeds 512 entries.
+// 协议要点（ops/Signature.h）：
+//  - 每次 VERIFY 调用都与对同一 WINTRUST_DATA 的 WTD_STATEACTION_CLOSE
+//    调用配对（有文档要求；否则信任状态句柄泄漏）；
+//  - 先查内嵌签名（WINTRUST_ACTION_GENERIC_VERIFY_V2 / WTD_CHOICE_FILE）；
+//    映像无内嵌签名（TRUST_E_NOSIGNATURE）时改走目录路径
+//   （WTD_CHOICE_CATALOG + CryptCATAdmin* API），因为 OS 映像都是目录签名；
+//  - 一律 WTD_UI_NONE，吊销保持 WTD_REVOKE_NONE（不产生网络停顿）；
+//  - 结果按小写路径缓存，超过 512 条即清空。
 #include "ops/Signature.h"
 #include "core/HandleGuard.h"
 #include <windows.h>
@@ -24,7 +24,7 @@
 namespace stm::ops {
 namespace {
 
-// One VERIFY pass followed by the mandatory CLOSE pass on the same WINTRUST_DATA.
+// 一轮 VERIFY 后在同一 WINTRUST_DATA 上执行强制的 CLOSE 轮。
 LONG TrustVerifyClose(DWORD unionChoice, void* info, GUID* action) {
     WINTRUST_DATA wd{};
     wd.cbStruct = sizeof(wd);
@@ -39,7 +39,7 @@ LONG TrustVerifyClose(DWORD unionChoice, void* info, GUID* action) {
         wd.pCatalog = static_cast<WINTRUST_CATALOG_INFO_*>(info);
     }
     const LONG result = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), action, &wd);
-    wd.dwStateAction = WTD_STATEACTION_CLOSE;  // required pairing (state cleanup)
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;  // 必需配对（状态清理）
     (void)WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), action, &wd);
     return result;
 }
@@ -53,11 +53,11 @@ LONG VerifyEmbedded(const std::wstring& path) {
     return TrustVerifyClose(WTD_CHOICE_FILE, &fileInfo, &action);
 }
 
-// Catalog verification for images without an embedded signature (typical: OS files).
-// `subsystem` selects the catalog store/trust provider; the WinVerifyTrust action uses
-// the same GUID because the catalog choice is policy-bound to it on some systems.
-// Returns TRUST_E_NOSIGNATURE when the subsystem is unavailable or no catalog covers
-// the file.
+// 对无内嵌签名映像的目录验证（典型：OS 文件）。
+// `subsystem` 选择目录库/信任提供程序；WinVerifyTrust 动作使用
+// 同一 GUID，因为在某些系统上目录选择与它策略绑定。
+// 子系统不可用或没有目录覆盖该文件时返回 TRUST_E_NOSIGNATURE。
+//
 LONG VerifyCatalogWithSubsystem(const std::wstring& path, const GUID& subsystem) {
     const size_t namePos = path.find_last_of(L"\\/");
     const std::wstring memberName = namePos == std::wstring::npos ? path : path.substr(namePos + 1);
@@ -95,7 +95,7 @@ LONG VerifyCatalogWithSubsystem(const std::wstring& path, const GUID& subsystem)
                     catalogInfo.hCatAdmin = catAdmin;
                     verdict = TrustVerifyClose(WTD_CHOICE_CATALOG, &catalogInfo, &action);
                     CryptCATAdminReleaseCatalogContext(catAdmin, catInfo, 0);
-                    break;  // first catalog that carries the hash decides
+                    break;  // 第一个含有该哈希的目录即定论
                 }
             }
         }
@@ -104,11 +104,11 @@ LONG VerifyCatalogWithSubsystem(const std::wstring& path, const GUID& subsystem)
     return verdict;
 }
 
-// Catalog verification with subsystem fallback. Hardened systems sometimes deny the
-// generic catalog subsystem outright (observed on Win11 22631: ERROR_ACCESS_DENIED on
-// CryptCATAdminAcquireContext and TRUST_E_PROVIDER_UNKNOWN on WinVerifyTrust), while the
-// catalog store historically belongs to the driver trust provider, so DRIVER_ACTION_VERIFY
-// is retried when the generic one is unavailable or inconclusive.
+// 带子系统兜底的目录验证。加固系统有时直接拒绝通用
+// 目录子系统（Win11 22631 实测：CryptCATAdminAcquireContext 报
+// ERROR_ACCESS_DENIED、WinVerifyTrust 报 TRUST_E_PROVIDER_UNKNOWN），而
+// 目录库历史上属于驱动信任提供程序，因此在通用子系统
+// 不可用或结论不明时以 DRIVER_ACTION_VERIFY 重试。
 LONG VerifyCatalog(const std::wstring& path) {
     LONG verdict = VerifyCatalogWithSubsystem(path, WINTRUST_ACTION_GENERIC_VERIFY_V2);
     if (verdict == TRUST_E_NOSIGNATURE || verdict == TRUST_E_PROVIDER_UNKNOWN) {
@@ -118,9 +118,9 @@ LONG VerifyCatalog(const std::wstring& path) {
 }
 
 SigState MapVerdict(LONG verifyResult) {
-    if (verifyResult == 0) return SigState::Valid;  // S_OK
+    if (verifyResult == 0) return SigState::Valid;  // S_OK（成功）
     if (verifyResult == TRUST_E_NOSIGNATURE) return SigState::Unsigned;
-    return SigState::Invalid;  // untrusted root, bad hash, policy failures, ...
+    return SigState::Invalid;  // 不受信根、坏哈希、策略失败等
 }
 
 std::wstring LowerCopy(const std::wstring& s) {
@@ -159,7 +159,7 @@ SigState VerifyFileSignature(const std::wstring& path) {
     {
         std::lock_guard<std::mutex> lock(mu);
         cache[cacheKey] = state;
-        if (cache.size() > 512) cache.clear();  // bounded, per contract
+        if (cache.size() > 512) cache.clear();  // 有界，按契约
     }
     return state;
 }

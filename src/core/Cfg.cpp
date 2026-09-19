@@ -16,7 +16,7 @@ std::wstring Trim(std::wstring_view s) {
     return std::wstring(s.substr(b, e - b));
 }
 
-// Minimal JSON string parser: handles \" \\ \/ \n \t \r \uXXXX (BMP only, enough for our config).
+// 极简 JSON 字符串解析器：处理 \" \\ \/ \n \t \r \uXXXX（仅 BMP，对配置而言足够）。
 bool Unescape(std::wstring_view raw, std::wstring* out) {
     out->clear();
     if (raw.size() < 2 || raw.front() != L'"' || raw.back() != L'"') return false;
@@ -82,7 +82,7 @@ bool Config::Load(const std::wstring& path) {
     if (src.empty() && !u8.empty()) return false;
     items_.clear();
 
-    // Locate '{' ... '}' then split top-level "key": value pairs (values have no braces).
+    // 定位 '{' ... '}'，再切分顶层 "key": value 对（值中不含花括号）。
     const size_t begin = src.find(L'{');
     const size_t end = src.rfind(L'}');
     if (begin == std::wstring::npos || end == std::wstring::npos || end <= begin) return false;
@@ -98,7 +98,7 @@ bool Config::Load(const std::wstring& path) {
 
         const size_t colon = src.find(L':', kq2 + 1);
         if (colon == std::wstring::npos || colon >= end) break;
-        // value runs until ',' or '}' at depth 0; strings may contain ',' so honor quotes.
+        // 值在深度 0 处延伸至 ',' 或 '}' 为止；字符串里可能含 ','，所以要处理引号。
         size_t v = colon + 1;
         while (v < end && src[v] == L' ') ++v;
         bool inStr = false;
@@ -124,8 +124,8 @@ bool Config::Save(const std::wstring& path) const {
     }
     j += L"}\n";
     const std::string u8 = WideToUtf8(j);
-    // Atomic write (arch section 7): temp file + MoveFileExW REPLACE_EXISTING, so a
-    // crash mid-write can never leave a truncated config/session behind.
+    // 原子写入（架构第 7 节）：先写临时文件 + MoveFileExW REPLACE_EXISTING，
+    // 这样即使写入中途崩溃也绝不会留下被截断的配置/会话文件。
     const std::wstring tmp = path + L".tmp";
     FILE* f = nullptr;
     if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || !f) return false;
@@ -187,7 +187,7 @@ bool Config::GetBool(std::wstring_view key, bool def) const {
 }
 
 void Config::SetString(std::wstring_view key, std::wstring_view v) {
-    Slot(key) = Escape(v);   // keep insertion order stable across saves
+    Slot(key) = Escape(v);   // 保持插入顺序在多次保存之间稳定
 }
 void Config::SetInt(std::wstring_view key, int64_t v) { Slot(key) = Fmt(L"{}", v); }
 void Config::SetDouble(std::wstring_view key, double v) { Slot(key) = Fmt(L"{:.3f}", v); }

@@ -1,21 +1,21 @@
-// GpuCollector: DXGI adapter enumeration + PDH GPU Engine / GPU Process Memory
-// counters (research R5 #11; the instance-name format pid_<pid>_luid_0x.._phys_
-// .. is not officially documented but stable on Win10 1803+).
+// GpuCollector：DXGI 适配器枚举 + PDH GPU Engine / GPU Process Memory
+// 计数器（调研 R5 #11；实例名格式 pid_<pid>_luid_0x.._phys_..
+// 虽无官方文档，但在 Win10 1803+ 上保持稳定）。
 //
-// Virtual display adapter filter (this machine ships two IddCx indirect-display
-// adapters). A whitelist of real-GPU keywords is unreliable, so virtual-ness is
-// decided from two IDENTITY-STABLE signals:
-//   1. Software flag: DXGI_ADAPTER_FLAG_SOFTWARE (WARP / Microsoft Basic Render
-//      Driver) is never a hardware GPU -> filtered.
-//   2. Name: IddCx indirect display drivers ship self-describing names
-//      ("IddDriver...", "Virtual Display...", ...) -> keyword filter.
-// A third signal from the original design — "LUID absent from \GPU Engine
-// instances" — was REMOVED in review V6-P1-3: engine-instance absence is a
-// transient runtime state (a fully idle real dGPU exposes no engine instances
-// until a process touches it), so it excluded idle real GPUs and made the
-// adapter list flicker; a sticky keep-list cannot recover from a wrong first
-// exclusion either. It never fired on the target machine: the IddCx adapters
-// there DO expose engine counters and are dropped by the name rule anyway.
+// 虚拟显示适配器过滤（本机自带两个 IddCx 间接显示适配器）。
+// 真实 GPU 关键字白名单并不可靠，因此是否虚拟由两个身份稳定的
+// 信号判定：
+//   1. 软件标志：DXGI_ADAPTER_FLAG_SOFTWARE（WARP / Microsoft Basic Render
+//      Driver）绝不是硬件 GPU -> 过滤。
+//   2. 名称：IddCx 间接显示驱动自带描述性名称
+//     （"IddDriver..."、"Virtual Display..." 等）-> 关键字过滤。
+// 原设计的第三种信号——“LUID 在 \GPU Engine 实例中缺失”——
+// 已在评审 V6-P1-3 中移除：引擎实例缺失是一种瞬态运行时状态
+//（完全空闲的真实 dGPU 在有进程触碰之前不会暴露任何引擎实例），
+// 因此它会错误排除空闲的真实 GPU，导致适配器列表闪烁；
+// 粘滞保留表也无法从错误的首次排除中恢复。
+// 该信号在目标机器上从未触发：那两块 IddCx 适配器
+// 确实暴露引擎计数器，反正也会被名称规则过滤。
 #include "collect/CollectDetail.h"
 #include "core/Log.h"
 #include <dxgi.h>
@@ -29,7 +29,7 @@ namespace cd {
 
 namespace {
 
-// ---- instance name parsing -------------------------------------------------
+// ---- 实例名解析 -------------------------------------------------------------
 // Format: pid_<pid>_luid_0x<HighPart>_0x<LowPart>_phys_<n>[_engtype_<t>]
 int HexVal(wchar_t c) {
     if (c >= L'0' && c <= L'9') return c - L'0';
@@ -82,7 +82,7 @@ std::wstring ToLower(std::wstring s) {
     return s;
 }
 
-// Signal 2 of the filter: IddCx-style virtual display names.
+// 过滤信号 2：IddCx 风格的虚拟显示名称。
 bool NameLooksVirtual(const std::wstring& name) {
     const std::wstring l = ToLower(name);
     return l.find(L"virtual") != std::wstring::npos ||
@@ -99,7 +99,7 @@ struct Adapter {
 
 }  // namespace
 
-// Closing the query also releases the counters bound to it (review V7-P1-1).
+// 关闭查询的同时会释放绑定其上的计数器（评审 V7-P1-1）。
 GpuCollector::~GpuCollector() { PdhCloseQuerySafe(&query_); }
 
 void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createTimeByPid,
@@ -110,7 +110,7 @@ void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createT
     procsOut->clear();
     adaptersOut->clear();
 
-    // --- 1. DXGI adapters ---------------------------------------------------
+    // --- 1. DXGI 适配器 -----------------------------------------------------
     std::vector<Adapter> adapters;
     {
         IDXGIFactory1* factory = nullptr;
@@ -134,14 +134,14 @@ void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createT
     }
 
     // --- 2. PDH GPU Engine + GPU Process Memory -----------------------------
-    // (luid, pid) -> aggregated usage. std::map so gpuProcs comes out sorted
-    // by (luid, pid) as the Snapshot contract requires.
+    //（luid, pid）-> 聚合用量。用 std::map 使 gpuProcs 按快照契约要求
+    // 的 (luid, pid) 顺序输出。
     std::map<uint64_t, std::map<uint32_t, Agg>> byLuidPid;
-    std::set<uint64_t> realLuids;  // LUIDs that survive the virtual filter
+    std::set<uint64_t> realLuids;  // 通过虚拟过滤的 LUID
     if (!pdhFailed_) {
         if (query_ == nullptr) {
-            // Wildcard counters added once; PDH tracks the instance set itself
-            // (formatted-array pattern), so no rebuild is ever needed.
+            // 通配计数器只添加一次；实例集合由 PDH 自己维护
+            //（格式化数组模式），因此永远无需重建。
             std::wstring utilT, dedT, shrT;
             if (!PdhLocalizeEnglishPath(L"\\GPU Engine(*)\\Utilization Percentage", &utilT) ||
                 !PdhLocalizeEnglishPath(L"\\GPU Process Memory(*)\\Dedicated Usage", &dedT) ||
@@ -165,8 +165,8 @@ void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createT
                                     PdhFmtArrayDouble(dedCounter_, &deds) &&
                                     PdhFmtArrayDouble(shrCounter_, &shrs);
             if (haveArrays) {
-                // Utilization is a rate counter: fresh instances report invalid
-                // for one sample; those are skipped until the next GPU tick.
+                // 利用率是速率计数器：新实例首个样本报告无效，
+                // 这些样本被跳过，等下一个 GPU tick 再取。
                 for (const PdhArrayItem& it : utils) {
                     uint32_t pid = 0;
                     uint64_t luid = 0;
@@ -197,29 +197,29 @@ void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createT
         }
     }
 
-    // --- 3. adapters after the virtual filter -------------------------------
-    // Filter signals (review V6-P1-3: the former signal 3 — "LUID absent from
-    // \GPU Engine instances" — was REMOVED):
-    //   1. Software flag: WARP / Basic Render Driver is never a hardware GPU.
-    //   2. Name: IddCx indirect display drivers ship self-describing names
-    //      ("Virtual Display", "IddDriver", ...).
-    // Rationale for removing signal 3 instead of making it sticky: engine-
-    // instance absence is a TRANSIENT runtime state (a fully idle real dGPU
-    // exposes no \GPU Engine instances until a process touches it), not a
-    // stable identity signal — it excluded idle real GPUs and made the adapter
-    // list flicker across ticks (the exact bug V6 filed). A sticky keep-list
-    // only masks the first-seen case and cannot recover from a wrong first
-    // exclusion. It added nothing on the target machine either: the two IddCx
-    // adapters there DO expose engine counters (they are dropped by the name
-    // rule), so counter presence was never a working discriminator. Signals 1
-    // and 2 are identity-stable, which is what a filter must be.
+    // --- 3. 虚拟过滤后的适配器 ----------------------------------------------
+    // 过滤信号（评审 V6-P1-3：原信号 3——“LUID 在
+    // \GPU Engine 实例中缺失”——已移除）：
+    //   1. 软件标志：WARP / Basic Render Driver 绝不是硬件 GPU。
+    //   2. 名称：IddCx 间接显示驱动自带描述性名称
+    //     （"Virtual Display"、"IddDriver" 等）。
+    // 移除信号 3 而非将其做成粘滞的理由：引擎实例缺失是一种
+    // 瞬态运行时状态（完全空闲的真实 dGPU 在有进程触碰
+    // 之前不暴露任何 \GPU Engine 实例），不是稳定的身份信号——
+    // 它会错误排除空闲的真实 GPU，并让适配器列表跨 tick 闪烁
+    //（正是 V6 记录的那个 bug）。粘滞保留表只能掩盖首次出现的情况，
+    // 无法从错误的首次排除中恢复。
+    // 它在目标机器上也没有任何作用：那两块 IddCx 适配器
+    // 确实暴露引擎计数器（反正会被名称规则过滤），
+    // 因此“有无计数器”从来就不是一个有效的判据。信号 1
+    // 和信号 2 才是身份稳定的，过滤器必须依赖这种性质。
     std::vector<const Adapter*> kept;
     for (const Adapter& a : adapters) {
         bool keep = true;
         if (a.software) {
-            keep = false;  // signal 1
+            keep = false;  // 信号 1
         } else if (NameLooksVirtual(a.name)) {
-            keep = false;  // signal 2
+            keep = false;  // 信号 2
         }
         if (keep) kept.push_back(&a);
     }
@@ -229,7 +229,7 @@ void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createT
         GpuAdapterInfo info;
         info.name = a->name;
         info.luid = a->luid;
-        info.virtualAdapter = false;  // contract: always false in sys.gpus
+        info.virtualAdapter = false;  // 契约：在 sys.gpus 中恒为 false
         info.memTotal = a->dedicated > 0 ? a->dedicated : kUnavailU64;
         const auto luidAgg = byLuidPid.find(a->luid);
         if (luidAgg != byLuidPid.end()) {
@@ -253,16 +253,16 @@ void GpuCollector::Collect(const std::unordered_map<uint32_t, uint64_t>& createT
         adaptersOut->push_back(std::move(info));
     }
 
-    // --- 4. per-process usage, matched against this tick's snapshot ---------
-    // GPU counter instances carry only a pid; map it to (pid, createTime) via
-    // the current snapshot and drop unknown pids (R5 PID-reuse guidance).
-    // Usage on filtered virtual display adapters is dropped as well: it is
-    // desktop-composition noise, not work on a real GPU.
+    // --- 4. 每进程用量，与本 tick 快照匹配 ----------------------------------
+    // GPU 计数器实例只带 pid；通过当前快照把它映射到 (pid, createTime)，
+    // 并丢弃未知 pid（R5 关于 PID 复用的指导）。
+    // 已过滤虚拟显示适配器上的用量同样丢弃：那是桌面合成的噪音，
+    // 不是真实 GPU 上的工作。
     for (const auto& luidEntry : byLuidPid) {
         if (realLuids.count(luidEntry.first) == 0) continue;
         for (const auto& pidEntry : luidEntry.second) {
             const auto it = createTimeByPid.find(pidEntry.first);
-            if (it == createTimeByPid.end()) continue;  // not in this tick's snapshot
+            if (it == createTimeByPid.end()) continue;  // 不在本 tick 快照中
             const Agg& agg = pidEntry.second;
             GpuProcUsage g;
             g.key.pid = pidEntry.first;

@@ -1,14 +1,14 @@
 #pragma once
-// Rolling file logger + OutputDebugString (debug builds only).
-// Policy (arch section 9): never log command lines or window titles; no per-tick logging.
+// 滚动文件日志 + OutputDebugString（仅 Debug 构建）。
+// 策略（架构第 9 节）：绝不记录命令行或窗口标题；不做每 tick 日志。
 #include <string>
-#include "core/Str.h"  // Fmt used by the STM_LOG macros
+#include "core/Str.h"  // STM_LOG 宏会用到 Fmt
 
 namespace stm {
 
 enum class LogLevel { Debug, Info, Warn, Error };
 
-// dir: e.g. %LOCALAPPDATA%\SuperTaskMgr\logs ; creates dir; rolls at 1MB, keeps 3.
+// dir：例如 %LOCALAPPDATA%\SuperTaskMgr\logs；会创建目录；1MB 滚动，保留 3 份。
 void LogInit(const std::wstring& dir);
 void LogShutdown();
 

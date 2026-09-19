@@ -1,5 +1,5 @@
 #pragma once
-// Single-instance named mutex (arch section 7). Local\ namespace: per login session.
+// 单实例命名互斥体（架构第 7 节）。Local\ 命名空间：按登录会话隔离。
 #include "core/HandleGuard.h"
 
 namespace stm {
@@ -7,8 +7,8 @@ namespace ops {
 
 class SingleInstance {
 public:
-    // Try to acquire "Local\SuperTaskMgr.SingleInstance"; waits up to waitMs
-    // (elevation-relaunch handshake relies on old instance releasing it).
+    // 尝试获取 "Local\SuperTaskMgr.SingleInstance"；至多等待 waitMs
+    //（提权重启握手依赖旧实例释放它）。
     bool TryAcquire(uint32_t waitMs);
     bool Acquired() const { return handle_ != nullptr; }
 

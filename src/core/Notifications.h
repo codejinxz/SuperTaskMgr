@@ -1,5 +1,5 @@
 #pragma once
-// Cross-thread notifications drained by the UI thread once per frame (arch section 5).
+// 跨线程通知，由 UI 线程每帧统一取空处理（架构第 5 节）。
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -11,8 +11,8 @@ namespace stm {
 struct Notification {
     enum class Kind { JobDone, JobFailed, Info, Warn };
     Kind kind = Kind::Info;
-    uint64_t seq = 0;      // JobQueue sequence this refers to (0 = none)
-    std::wstring text;     // user-facing, Chinese; no sensitive values
+    uint64_t seq = 0;      // 所指的 JobQueue 序号（0 = 无）
+    std::wstring text;     // 面向用户的中文文案；不含敏感值
 };
 
 class NotificationQueue {

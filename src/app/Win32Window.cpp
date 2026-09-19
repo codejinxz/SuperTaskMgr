@@ -1,8 +1,8 @@
 #include "app/Win32Window.h"
 #include "imgui_impl_win32.h"
 
-// imgui_impl_win32: backend declares this inside its .cpp; user code declares it
-// at global scope (backend convention, imgui 1.92).
+// imgui_impl_win32：后端在其 .cpp 内部声明它；用户代码按后端约定
+// 在全局作用域声明（后端约定，imgui 1.92）。
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace stm {
@@ -29,7 +29,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             }
             return 0;
         case WM_SYSCOMMAND:
-            // Block ALT-application-key menu beep noise; keep screensaver behavior default.
+            // 拦截 ALT+应用键菜单的蜂鸣噪音；屏幕保护行为保持默认。
             if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
             break;
         case WM_DESTROY:
@@ -49,7 +49,7 @@ bool MainWindow::Create(HINSTANCE inst, const wchar_t* title, int w, int h, int 
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = nullptr;  // D3D clears every frame
+    wc.hbrBackground = nullptr;  // D3D 每帧自行清屏
     wc.lpszClassName = L"SuperTaskMgrWnd";
     if (!RegisterClassExW(&wc)) return false;
 

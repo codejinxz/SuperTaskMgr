@@ -1,61 +1,61 @@
 
-// Sensors.cpp — phase 3 + F3 extension (contract Sensors.h). Every reading
-// follows the honest trichotomy of R6: Ok = real value from a documented
-// user-mode source; NeedAdmin = source exists but is elevation-gated;
-// NeedDriver = unreachable in user mode (fan speeds — no kernel driver ships
-// with this app); NoHardware = adapter/disk present but this sensor absent.
-// NEVER a 0 in place of data.
+// Sensors.cpp — 第 3 阶段 + F3 扩展（契约 Sensors.h）。每条读数都遵循
+// R6 的诚实三分类：Ok = 来自有文档的用户态来源的真实值；
+// NeedAdmin = 来源存在但需提权；
+// NeedDriver = 用户态不可达（风扇转速——本应用不附带内核驱动）；
+// NoHardware = 适配器/磁盘存在但该传感器缺失。
+// 绝不用 0 顶替数据。
 //
-//   CPU frequency  CallNtPowerInformation(ProcessorInformation=11)  documented, no admin
-//   CPU per-core % PDH \Processor Information(*)\% Processor Time (documented, R6 §6)
-//   ACPI thermal   WMI root\WMI\MSAcpi_ThermalZoneTemperature — ONE READING PER
+//   CPU 频率        CallNtPowerInformation(ProcessorInformation=11)  有文档，无需管理员
+//   CPU 每核 %      PDH \Processor Information(*)\% Processor Time（有文档，R6 §6）
+//   ACPI 热区       WMI root\WMI\MSAcpi_ThermalZoneTemperature —— 每实例一条读数
 //                  INSTANCE (G-B multi-value: every zone of the instance set,
 //                  label "ACPI 热区 N" + InstanceName); admin on this box
-//   GPU temp/util  nvml.dll from System32 (driver-supplied) when present; per card
-//                  the NVML path expands to per-sensor readings (G-B): temp,
-//                  slowdown temp threshold, power W, GPU util, VRAM util (the two
-//                  nvmlDeviceGetUtilizationRates components), fan; multi-GPU
-//                  enumerated card by card. Absent nvml.dll -> the gpus group
-//                  keeps its PDH content with an honesty note (IGCL skipped:
-//                  complex interface, see R6 §4). No fake readings anywhere.
-//   GPU engine %   PDH \GPU Engine(*)\Utilization Percentage per engtype_* (R6 §4);
-//                  VRAM dedicated/shared via \GPU Adapter Memory(*)
-//   Network        GetIfTable2 per-adapter octet deltas over a shared 350 ms window
-//                  (F3) + link speed; loopback excluded, non-Up adapters skipped
-//   Battery        CallNtPowerInformation(SystemBatteryState=5) — NoHardware when absent
-//   Memory         GlobalMemoryStatusEx + GetPerformanceInfo (K32 bound dynamically)
-//   Disks          MSFT_PhysicalDisk (coarse health) + NVMe health log page 0x02 /
-//                  ATA SMART via SMART_RCV_DRIVE_DATA for temperature + power-on hours
-//                  + spare/wear/critical-warning detail (F3). One DiskHealth PER
-//                  physical drive, never aggregated (G-B: confirmed per-disk).
-//   Extra (G-B)    best-effort WMI temperature classes outside the ACPI zone;
-//                  empty group = nothing found = not shown. P2 (2026-09-18,
+//   GPU 温度/利用率  存在时用 System32 的 nvml.dll（驱动自带）；每卡
+//                  经 NVML 展开为每传感器读数（G-B）：温度、
+//                  减速温度阈值、功耗 W、GPU 利用率、显存利用率
+//                 （nvmlDeviceGetUtilizationRates 两个分量）、风扇；多 GPU
+//                  逐卡枚举。无 nvml.dll -> gpus 组
+//                  保留 PDH 内容并附诚实备注（跳过 IGCL：
+//                  接口复杂，见 R6 §4）。任何地方都不伪造读数。
+//   GPU 引擎 %      PDH \GPU Engine(*)\Utilization Percentage 按 engtype_*（R6 §4）；
+//                  专用/共享 VRAM 经 \GPU Adapter Memory(*)
+//   网络            GetIfTable2 每适配器字节差值，共享 350 ms 窗口
+//  （F3）+ 链路速度；排除回环，跳过非 Up 适配器
+//   电池            CallNtPowerInformation(SystemBatteryState=5)——无电池时 NoHardware
+//   内存            GlobalMemoryStatusEx + GetPerformanceInfo（K32 动态绑定）
+//   磁盘            MSFT_PhysicalDisk（粗粒度健康）+ NVMe 健康日志页 0x02 /
+//                  经 SMART_RCV_DRIVE_DATA 的 ATA SMART 取温度 + 通电时长
+//                  + 备余/磨损/严重警告细节（F3）。每物理盘一条 DiskHealth，
+//                  绝不聚合（G-B：确认按盘逐条展示）。
+//   Extra（G-B）    尽力而为的 ACPI 热区之外的 WMI 温度类；
+//                  空组 = 未找到 = 不展示。P2（2026-09-18，
 //                  "CPU 温度信息增强") exhausts the documented USER-MODE thermal
-//                  sources here, one reading PER INSTANCE, every label prefixed
+//                  来源逐个列出，每实例一条读数，每条标签都标注
 //                  with its provenance ("WMI 温度 N/（实例）" for Win32_Temperature,
 //                  "WMI 热区计数器 N/（实例）" for the PerfProc thermal-zone counter,
 //                  "DPTF 温度（参与者）" for the Intel DPTF TEMPERATURE set when its
-//                  namespace exists). Per-core DTS temperatures (MSR 0x19C/0x1A2/
-//                  0x1B1) stay unreachable by design: they require a kernel
-//                  driver and this app ships none (red line) — the sensor page
-//                  says so and offers the optional LibreHardwareMonitor bridge.
-//   Fans           NeedDriver, always.
+//                  命名空间存在）。每核 DTS 温度（MSR 0x19C/0x1A2/
+//                  0x1B1）按设计不可达：需要内核驱动，
+//                  而本应用不带任何驱动（红线）——传感器页
+//                  已注明并提供可选的 LibreHardwareMonitor 桥接。
+//   风扇            一律 NeedDriver。
 //
-// Blocking call: run on the ops job queue. Never throws; partial results allowed.
-// The F3 delta window adds one ~350 ms sleep per read (page refreshes are >=10 s).
-#include <winsock2.h>  // must precede iphlpapi/netioapi (LEAN_AND_MEAN hides winsock)
-#include <ws2tcpip.h>  // pulls ws2ipdef.h -> defines _WS2IPDEF_ for netioapi MIB_* decls
+// 阻塞调用：在 ops 任务队列上运行。绝不抛异常；允许部分结果。
+// F3 差值窗口使每次读取多睡约 350 ms（页面刷新间隔 >=10 s）。
+#include <winsock2.h>  // 必须在 iphlpapi/netioapi 之前包含（LEAN_AND_MEAN 会隐藏 winsock）
+#include <ws2tcpip.h>  // 引入 ws2ipdef.h -> 为 netioapi 的 MIB_* 声明定义 _WS2IPDEF_
 #include "collect/Sensors.h"
-#include "collect/CollectDetail.h"  // cd:: PDH wildcard helpers (same library)
+#include "collect/CollectDetail.h"  // cd:: PDH 通配辅助（同一库）
 #include "core/HandleGuard.h"
 #include "core/Log.h"
 #include "core/Str.h"
 #include <windows.h>
-#include <iphlpapi.h>   // GetIfTable2 / FreeMibTable (iphlpapi is on the link line)
+#include <iphlpapi.h>   // GetIfTable2 / FreeMibTable（iphlpapi 在链接行上）
 #include <netioapi.h>   // MIB_IF_TABLE2 / MIB_IF_ROW2
-#include <psapi.h>      // PERFORMANCE_INFORMATION (bound dynamically below)
-#include <winioctl.h>   // SMART_* / STORAGE_* ioctls (also defines DEVICE_TYPE)
-#include <ntddstor.h>   // StorageDeviceProtocolSpecificProperty + NVMe log page
+#include <psapi.h>      // PERFORMANCE_INFORMATION（下文动态绑定）
+#include <winioctl.h>   // SMART_* / STORAGE_* ioctl（也定义 DEVICE_TYPE）
+#include <ntddstor.h>   // StorageDeviceProtocolSpecificProperty + NVMe 日志页
 #include <objbase.h>
 #include <powrprof.h>
 #include <wbemidl.h>
@@ -67,7 +67,7 @@
 namespace stm {
 namespace {
 // ===========================================================================
-// dynamic helpers (libs not in the link line: oleaut32, powrprof, ws2_32-free)
+// 动态辅助（不在链接行上的库：oleaut32、powrprof，无需 ws2_32）
 // ===========================================================================
 using SysAllocStringFn = BSTR(STDAPICALLTYPE*)(const OLECHAR*);
 using SysFreeStringFn = void(STDAPICALLTYPE*)(BSTR);
@@ -92,10 +92,10 @@ SysFreeStringFn SysFree() {
     }();
     return fn;
 }
-// V15/P1: uniform VARIANT teardown. VariantClear releases whichever resource
-// the property read produced (BSTR, SAFEARRAY incl. its data block, ...) exactly
-// once. The VT_ARRAY|VT_UI1 VendorSpecific path previously paired only
-// Access/UnaccessData and leaked one SAFEARRAY per row on every refresh.
+// V15/P1：统一的 VARIANT 清理。VariantClear 恰好一次地释放
+// 属性读取所产生的资源（BSTR、SAFEARRAY 含其数据块等）。
+// 之前 VT_ARRAY|VT_UI1 VendorSpecific 路径只配对了
+// Access/UnaccessData，每次刷新每行泄漏一个 SAFEARRAY。
 VariantClearFn VariantClr() {
     static VariantClearFn fn = []() -> VariantClearFn {
         const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
@@ -104,7 +104,7 @@ VariantClearFn VariantClr() {
     }();
     return fn;
 }
-// SAFEARRAY byte access (oleaut32; only the G-B "extra" WMI SMART path needs it).
+// SAFEARRAY 字节访问（oleaut32；仅 G-B "extra" 的 WMI SMART 路径需要）。
 SafeArrayAccessDataFn SafeArrAccess() {
     static SafeArrayAccessDataFn fn = []() -> SafeArrayAccessDataFn {
         const HMODULE h = ::GetModuleHandleW(L"oleaut32.dll");
@@ -150,7 +150,7 @@ CallNtPowerInformationFn CallNtPower() {
     }();
     return fn;
 }
-// Scoped BSTR (needs oleaut32, bound above).
+// 作用域 BSTR（需要 oleaut32，已在上方绑定）。
 struct Bs {
     BSTR b = nullptr;
     explicit Bs(const wchar_t* s) {
@@ -183,12 +183,12 @@ struct ComPtr {
     T* get() const { return p; }
     explicit operator bool() const { return p != nullptr; }
 };
-// Local GUIDs (wbemuuid.lib is not linked).
+// 本地 GUID（不链接 wbemuuid.lib）。
 constexpr GUID kCLSID_WbemLocator = {
     0x4590f811, 0x1d3a, 0x11d0, {0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
 constexpr GUID kIID_IWbemLocator = {
     0xdc12a687, 0x737f, 0x11cf, {0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
-// Local WBEM constants (values per wbemcli.h; named k* to avoid #define drift).
+// 本地 WBEM 常量（值依 wbemcli.h；命名 k* 以避免与 #define 漂移）。
 constexpr HRESULT kWbemAccessDenied = 0x80041003;     // WBEM_E_ACCESS_DENIED
 constexpr HRESULT kWbemNotFound = 0x80041002;         // WBEM_E_NOT_FOUND
 constexpr HRESULT kWbemInvalidClass = 0x80041010;     // WBEM_E_INVALID_CLASS
@@ -197,8 +197,8 @@ constexpr HRESULT kEAccessDenied = 0x80070005;        // E_ACCESSDENIED (DCM lev
 constexpr long kFlagForwardOnly = 0x10;               // WBEM_FLAG_FORWARD_ONLY
 constexpr long kFlagReturnImmediately = 0x20;         // WBEM_FLAG_RETURN_IMMEDIATELY
 void EnsureComSecurity() {
-    // Must run at most once per process; RPC_E_TOO_LATE (already set by
-    // somebody else) is fine. We only assert the WMI-friendly defaults.
+    // 每进程至多运行一次；RPC_E_TOO_LATE（已被他人设置）
+    // 也没关系。我们只断言对 WMI 友好的默认值。
     static const bool done = []() {
         (void)::CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_DEFAULT,
                                      RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE, nullptr);
@@ -207,20 +207,20 @@ void EnsureComSecurity() {
     (void)done;
 }
 // ===========================================================================
-// minimal WMI query helper
+// 极简 WMI 查询辅助
 // ===========================================================================
 struct WmiVal {
     bool present = false;
     bool isNum = false;
     std::wstring str;
     uint32_t num = 0;
-    std::vector<uint8_t> bytes;  // VT_ARRAY|VT_UI1 (G-B: SMART VendorSpecific)
+    std::vector<uint8_t> bytes;  // VT_ARRAY|VT_UI1（G-B：SMART VendorSpecific）
 };
 using WmiRow = std::map<std::wstring, WmiVal>;
 struct WmiResult {
-    bool ok = false;            // executed; rows (possibly empty) are valid
-    bool denied = false;        // elevation-gated -> NeedAdmin
-    bool notSupported = false;  // namespace/class absent -> NoHardware
+    bool ok = false;            // 已执行；rows（可能为空）即有效
+    bool denied = false;        // 受提权限制 -> NeedAdmin
+    bool notSupported = false;  // 命名空间/类缺失 -> NoHardware
     std::vector<WmiRow> rows;
 };
 void ClassifyWmiHr(HRESULT hr, WmiResult* r) {
@@ -234,14 +234,14 @@ void ClassifyWmiHr(HRESULT hr, WmiResult* r) {
 }
 WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
     WmiVal v;
-    VARIANT var{};  // zero-init == VariantInit (oleaut32 is not linked)
+    VARIANT var{};  // 零初始化 == VariantInit（不链接 oleaut32）
     var.vt = VT_EMPTY;
     if (FAILED(obj->Get(name, 0, &var, nullptr, nullptr))) return v;
     if (var.vt == VT_BSTR && var.bstrVal) {
         v.present = true;
         v.str = var.bstrVal;
     } else if (var.vt == (VT_ARRAY | VT_UI1) && var.parray) {
-        // Byte vector (G-B: MSStorageDriver_FailurePredictData.VendorSpecific).
+        // 字节向量（G-B：MSStorageDriver_FailurePredictData.VendorSpecific）。
         const SafeArrayAccessDataFn acc = SafeArrAccess();
         const SafeArrayUnaccessDataFn unacc = SafeArrUnaccess();
         const SafeArrayGetBoundFn lb = SafeArrLBound();
@@ -252,7 +252,7 @@ WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
             ub(var.parray, 1, &hi) == S_OK && hi >= lo && acc(var.parray, &data) == S_OK) {
             const LONG n = hi - lo + 1;
             const auto* bytes = static_cast<const uint8_t*>(data);
-            v.bytes.assign(bytes, bytes + (n > 4096 ? 4096 : n));  // bound the copy
+            v.bytes.assign(bytes, bytes + (n > 4096 ? 4096 : n));  // 限制拷贝大小
             v.present = true;
             unacc(var.parray);
         }
@@ -272,11 +272,11 @@ WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
         v.present = v.isNum = true;
         v.num = var.bVal;
     }
-    // V15/P1: the VARIANT returned by IWbemClassObject::Get owns its payload.
-    // Copy first (above), then hand ownership to VariantClear exactly once —
-    // this replaces the old manual SysFreeString (double-free hazard) and adds
-    // the missing SAFEARRAY destroy. Degenerate fallback only if oleaut32 went
-    // missing between binding points; the leak regresses to BSTR-free-only.
+    // V15/P1：IWbemClassObject::Get 返回的 VARIANT 拥有其载荷。
+    // 先拷贝（上文），然后把所有权交给 VariantClear 且仅一次——
+    // 这取代了旧的手工 SysFreeString（双重释放隐患），并补上
+    // 缺失的 SAFEARRAY 销毁。仅当 oleaut32 在绑定点之间消失
+    // 时才走退化兜底；泄漏退化为只剩 BSTR 不释放。
     const VariantClearFn clear = VariantClr();
     if (clear) {
         clear(&var);
@@ -286,13 +286,13 @@ WmiVal ReadProp(IWbemClassObject* obj, const wchar_t* name) {
     }
     return v;
 }
-// One query, `props` fetched per row. Row cap keeps a wedged provider bounded.
+// 一次查询，按行取 `props`。行数上限让卡死的提供程序保持有界。
 WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
                    const std::vector<const wchar_t*>& props) {
     WmiResult r;
     const HRESULT ci = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    // RPC_E_CHANGED_MODE: COM is up in STA on this thread — usable, but we do
-    // NOT own the init and must not pair a CoUninitialize for it.
+    // RPC_E_CHANGED_MODE：本线程 COM 已以 STA 启动——可用，但初始化
+    // 不属于我们，绝不能为它配对 CoUninitialize。
     const bool ownInit = SUCCEEDED(ci);
     if (FAILED(ci) && ci != RPC_E_CHANGED_MODE) {
         STM_LOG_WARN("sensors", Fmt(L"CoInitializeEx 失败 hr=0x{:08X}", static_cast<unsigned>(ci)));
@@ -340,12 +340,12 @@ WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
         ULONG got = 0;
         const HRESULT step = en->Next(5000, 1, obj.pp(), &got);
         if (step != S_OK || got == 0) {
-            // G-B honesty fix: the access denial of an elevation-gated class can
-            // surface at ENUMERATION time, not at ExecQuery (measured on
-            // MSAcpi_ThermalZoneTemperature non-admin: ExecQuery S_OK, first
-            // Next() -> 0x80041003 WBEM_E_ACCESS_DENIED). Without this the
+            // G-B 诚实性修复：受提权限制类的访问拒绝可能
+            // 在枚举阶段而非 ExecQuery 阶段暴露（实测
+            // MSAcpi_ThermalZoneTemperature 非管理员：ExecQuery S_OK，第一次
+            // Next() -> 0x80041003 WBEM_E_ACCESS_DENIED）。没有这一步，
             // snapshot claimed NoHardware ("本机无此传感器") where the truth is
-            // NeedAdmin. (The old code hit exactly that on this box.)
+            // NeedAdmin。（旧代码在本机正好踩中这一点。）
             if (step == kWbemAccessDenied || step == kEAccessDenied) r.denied = true;
             break;
         }
@@ -357,10 +357,10 @@ WmiResult WmiQuery(const wchar_t* ns, const wchar_t* wql,
     return r;
 }
 // ===========================================================================
-// CPU: frequency (documented, no admin) + package temperature (ACPI thermal zone)
+// CPU：频率（有文档，无需管理员）+ 整包温度（ACPI 热区）
 // ===========================================================================
 #pragma pack(push, 4)
-struct ProcessorPowerInfo {  // PROCESSOR_POWER_INFORMATION (winnt.h, documented)
+struct ProcessorPowerInfo {  // PROCESSOR_POWER_INFORMATION（winnt.h，有文档）
     ULONG Number;
     ULONG MaxMhz;
     ULONG CurrentMhz;
@@ -386,7 +386,7 @@ void ReadCpuFreq(std::vector<SensorReading>* cpu, std::wstring* notes) {
     }
     int added = 0;
     for (const ProcessorPowerInfo& p : info) {
-        if (p.CurrentMhz == 0) continue;  // honest: no reading instead of a fake 0
+        if (p.CurrentMhz == 0) continue;  // 诚实：宁无读数也不给假 0
         SensorReading r;
         r.label = Fmt(L"CPU 核 {} 频率", p.Number);
         r.value = static_cast<double>(p.CurrentMhz);
@@ -404,9 +404,9 @@ void ReadCpuFreq(std::vector<SensorReading>* cpu, std::wstring* notes) {
     }
 }
 void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
-    // MSAcpi_ThermalZoneTemperature: an INSTANCE SET (one per ACPI thermal zone,
-    // not a single package value) — implemented by the ACPI driver, unit 0.1 K.
-    // G-B: enumerate every instance (WMI collection traversal), one reading per
+    // MSAcpi_ThermalZoneTemperature：一个实例集（每个 ACPI 热区一条，
+    // 而非单一整包值）——由 ACPI 驱动实现，单位 0.1 K。
+    // G-B：枚举每个实例（遍历 WMI 集合），每实例一条读数。
     // zone, labeled "ACPI 热区 N" (+ InstanceName when the row carries one).
     // Non-admin is usually rejected (R6 §3: this box reports 拒绝访问).
     const WmiResult w = WmiQuery(L"ROOT\\WMI",
@@ -414,7 +414,7 @@ void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
                                  L"MSAcpi_ThermalZoneTemperature",
                                  {L"InstanceName", L"CurrentTemperature"});
     if (w.denied && w.rows.empty()) {
-        // The normal non-admin case: enumeration denied before any instance.
+        // 常见的非管理员情形：还没枚举到实例就被拒绝。
         SensorReading r;
         r.label = L"ACPI 热区温度";
         r.unit = L"°C";
@@ -423,11 +423,11 @@ void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
         *notes += L"；ACPI 热区温度需管理员权限";
         return;
     }
-    // V15/P2 honesty: an unclassified failure at locator/connect/proxy/query
-    // stage is WMI INFRASTRUCTURE being unavailable — the thermal-zone source
+    // V15/P2 诚实性：locator/connect/proxy/query 阶段的未分类失败
+    // 意味着 WMI 基础设施不可用——热区来源
     // itself is unproven. That must not render as NoHardware ("本机无此传感器").
-    // Within the frozen four-state contract this surfaces as NeedAdmin + an
-    // explicit note that elevation will NOT fix it (label carries the truth too).
+    // 在冻结的四态契约内表现为 NeedAdmin +
+    // 明确备注提权也无济于事（label 同样如实标注）。
     if (!w.ok && !w.notSupported) {
         STM_LOG_WARN("sensors", L"WMI 基础设施不可用（连接/查询失败），热区状态未知");
         SensorReading r;
@@ -453,16 +453,16 @@ void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
         const auto it = row.find(L"CurrentTemperature");
         if (it == row.end() || !it->second.present || !it->second.isNum) {
             ++invalid;
-            continue;  // honest: no reading instead of a fake 0
+            continue;  // 诚实：宁无读数也不给假 0
         }
         const double c = static_cast<double>(it->second.num) / 10.0 - 273.15;
         if (c < -60.0 || c > 250.0) {
             ++invalid;
-            continue;  // implausible -> no fake reading
+            continue;  // 不合理 -> 不伪造读数
         }
         SensorReading r;
         std::wstring zone = Fmt(L"ACPI 热区 {}", rowIdx);
-        const auto in = row.find(L"InstanceName");  // present but maybe empty
+        const auto in = row.find(L"InstanceName");  // 存在但可能为空
         if (in != row.end() && in->second.present && !in->second.str.empty()) {
             zone += Fmt(L"（{}）", in->second.str);
         }
@@ -483,22 +483,22 @@ void ReadCpuTemp(std::vector<SensorReading>* cpu, std::wstring* notes) {
     } else if (invalid > 0) {
         *notes += Fmt(L"；{} 个 ACPI 热区返回无效值（已省略，不显示假数据）", invalid);
     } else if (w.denied) {
-        // Rare: partial enumeration cut short by a denial after some instances.
+        // 罕见：已枚举部分实例后才被拒绝而中断。
         *notes += L"；ACPI 热区枚举被拒绝（结果可能不完整，需管理员权限）";
     }
 }
 // ===========================================================================
 // GPU: NVML only (driver-supplied nvml.dll in System32). Absent -> empty gpu
-// vector + honesty note; we never fake values for unsupported vendors.
-// G-B: per card the NVML path expands into one reading PER SENSOR (temperature,
-// slowdown temperature threshold, power, GPU util, VRAM util, fan) instead of a
+// 向量 + 诚实备注；对不支持的厂商绝不伪造数值。
+// G-B：每卡经 NVML 展开为每传感器一条读数（温度、
+// 减速温度阈值、功耗、GPU 利用率、显存利用率、风扇），而不是
 // single aggregate — the user asked for "同类传感器多个值都展示出来". The
-// legacy `gpu` vector keeps its exact F3 content (temp/gpu-util/power) for
-// contract stability; the full expansion lands in the `gpus` group.
+// 旧 `gpu` 向量保持原 F3 内容（温度/GPU 利用率/功耗）以保证
+// 契约稳定；完整展开放入 `gpus` 组。
 // ===========================================================================
 namespace nvml {
 using Device = void*;
-constexpr int kRetSuccess = 0;  // nvmlReturn_t NVML_SUCCESS
+constexpr int kRetSuccess = 0;  // nvmlReturn_t NVML_SUCCESS（保留原 API 名）
 constexpr int kTempGpu = 0;     // nvmlTemperatureSensors_t NVML_TEMPERATURE_GPU
 constexpr int kThreshSlowdown = 1;  // nvmlTemperatureThresholds_t ..._SLOWDOWN
 struct Utilization {  // nvmlUtilization_t
@@ -511,9 +511,9 @@ using GetCountFn = int (*)(unsigned*);
 using GetHandleFn = int (*)(unsigned, Device*);
 using GetTempFn = int (*)(Device, int, unsigned*);
 using GetUtilFn = int (*)(Device, Utilization*);
-using GetPowerFn = int (*)(Device, unsigned*);  // milliwatts
-using GetThreshFn = int (*)(Device, int, unsigned*);  // temperature threshold, °C
-using GetFanFn = int (*)(Device, unsigned*);  // percent of max
+using GetPowerFn = int (*)(Device, unsigned*);  // 单位毫瓦
+using GetThreshFn = int (*)(Device, int, unsigned*);  // 温度阈值，°C
+using GetFanFn = int (*)(Device, unsigned*);  // 最大值的百分比
 struct Fns {
     InitFn init = nullptr;
     ShutdownFn shutdown = nullptr;
@@ -522,11 +522,11 @@ struct Fns {
     GetTempFn temp = nullptr;
     GetUtilFn util = nullptr;
     GetPowerFn power = nullptr;
-    GetThreshFn thresh = nullptr;  // optional export
-    GetFanFn fan = nullptr;        // optional export
+    GetThreshFn thresh = nullptr;  // 可选导出
+    GetFanFn fan = nullptr;        // 可选导出
 };
-// Loads C:\Windows\System32\nvml.dll (driver-owned; absolute path — never a
-// search-order load). Returns false with notes filled when unavailable.
+// 加载 C:\Windows\System32\nvml.dll（驱动所有；绝对路径——绝不
+// 按搜索顺序加载）。不可用时返回 false 并填写 notes。
 bool Load(Fns* f, HMODULE* modOut, std::wstring* notes) {
     *modOut = ::LoadLibraryW(L"C:\\Windows\\System32\\nvml.dll");
     if (!*modOut) {
@@ -593,15 +593,15 @@ void Read(std::vector<SensorReading>* legacy, std::vector<SensorReading>* expand
     for (unsigned i = 0; i < count; ++i) {
         Device dev = nullptr;
         if (f.handle(i, &dev) != kRetSuccess) continue;
-        // --- temperature (legacy vector keeps its F3 entry too) ---
+        // --- 温度（旧向量同时保留其 F3 条目）---
         unsigned tempC = 0;
         if (f.temp(dev, kTempGpu, &tempC) == kRetSuccess && tempC > 0) {
             const SensorReading r = Make(Fmt(L"GPU {} 温度", i).c_str(),
                                          static_cast<double>(tempC), L"°C");
-            legacy->push_back(r);      // existing contract vector
-            expanded->push_back(r);    // G-B per-sensor group
+            legacy->push_back(r);      // 既有契约向量
+            expanded->push_back(r);    // G-B 每传感器组
         }
-        // --- slowdown temperature threshold (per card, when the driver knows it) ---
+        // --- 减速温度阈值（每卡，当驱动知晓时）---
         if (f.thresh) {
             unsigned slowC = 0;
             if (f.thresh(dev, kThreshSlowdown, &slowC) == kRetSuccess && slowC > 0) {
@@ -609,7 +609,7 @@ void Read(std::vector<SensorReading>* legacy, std::vector<SensorReading>* expand
                     Make(Fmt(L"GPU {} 慢速温度阈值", i).c_str(), static_cast<double>(slowC), L"°C"));
             }
         }
-        // --- power draw (W) ---
+        // --- 功耗（W）---
         if (f.power) {
             unsigned mw = 0;
             if (f.power(dev, &mw) == kRetSuccess && mw > 0) {
@@ -619,7 +619,7 @@ void Read(std::vector<SensorReading>* legacy, std::vector<SensorReading>* expand
                 expanded->push_back(r);
             }
         }
-        // --- utilization: gpu AND memory components as separate readings ---
+        // --- 利用率：gpu 与 memory 分量各出一条读数 ---
         if (f.util) {
             Utilization u{};
             if (f.util(dev, &u) == kRetSuccess) {
@@ -631,8 +631,8 @@ void Read(std::vector<SensorReading>* legacy, std::vector<SensorReading>* expand
                                          static_cast<double>(std::min(u.memory, 100u)), L"%"));
             }
         }
-        // --- fan (NVML reports % of max; 0% is a REAL reading — zero-RPM idle
-        // mode — so unlike temps it stays Ok at 0) ---
+        // --- 风扇（NVML 报告最大值的百分比；0% 是真实读数——零转速待机
+        // 模式——因此与温度不同，为 0 时保持 Ok）---
         if (f.fan) {
             unsigned pct = 0;
             if (f.fan(dev, &pct) == kRetSuccess) {
@@ -646,11 +646,11 @@ void Read(std::vector<SensorReading>* legacy, std::vector<SensorReading>* expand
 }
 }  // namespace nvml
 // ===========================================================================
-// Disks: per-PhysicalDrive health, honest at every permission level
+// 磁盘：每 PhysicalDrive 的健康状态，任何权限层级都保持诚实
 // ===========================================================================
 enum class BusProto { Nvme, Ata, Usb, Other };
 BusProto ClassifyBus(uint32_t busType) {
-    // STORAGE_BUS_TYPE: 3=ATA 2=ATAPI 11=SATA 17=NVMe 7=USB ...
+    // STORAGE_BUS_TYPE：3=ATA 2=ATAPI 11=SATA 17=NVMe 7=USB ...
     switch (busType) {
         case 17: return BusProto::Nvme;
         case 2:
@@ -685,14 +685,14 @@ std::wstring CStrFromDesc(const BYTE* base, ULONG off) {
     const char* s = reinterpret_cast<const char*>(base + off);
     std::string out;
     for (size_t i = 0; i < 1024 && s[i]; ++i) out += s[i];
-    // Trim trailing spaces (ATA identify padding).
+    // 去除尾部空格（ATA identify 填充）。
     while (!out.empty() && out.back() == ' ') out.pop_back();
     if (out.empty()) return {};
     return Utf8ToWide(out);
 }
 // IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceProtocolSpecificProperty) ->
-// NVMe Get Log Page 0x02 SMART/Health (documented "Working with NVMe drives").
-// F3: also reports available spare % / spare threshold % alongside pctUsed.
+// NVMe Get Log Page 0x02 SMART/Health（有文档 "Working with NVMe drives"）。
+// F3：除 pctUsed 外还报告可用备余百分比 / 备余阈值百分比。
 bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8_t* critWarn,
                 uint32_t* sparePct, uint32_t* spareThreshPct) {
     constexpr size_t kLog = 512;
@@ -704,7 +704,7 @@ bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8
     auto* spd = reinterpret_cast<STORAGE_PROTOCOL_SPECIFIC_DATA*>(q->AdditionalParameters);
     spd->ProtocolType = ProtocolTypeNvme;
     spd->DataType = NVMeDataTypeLogPage;
-    spd->ProtocolDataRequestValue = 0x02;  // SMART / health information log page
+    spd->ProtocolDataRequestValue = 0x02;  // SMART / 健康信息日志页
     spd->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA);
     spd->ProtocolDataLength = kLog;
     DWORD ret = 0;
@@ -719,29 +719,29 @@ bool NvmeHealth(HANDLE h, double* tempC, uint64_t* poh, uint32_t* pctUsed, uint8
     }
     const BYTE* log =
         buf.data() + sizeof(STORAGE_PROPERTY_QUERY) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA);
-    // NVMe SMART/Health log (512 B, NVMe 1.3/1.4 Get Log Page 02h layout):
-    //   [0] Critical Warning  [1-2] Composite Temperature (LE, Kelvin)
-    //   [3] Available Spare   [4] Available Spare Threshold
-    //   [5] Percentage Used   [32-47] Data Units Read  [128-143] Power On Hours
-    // (V9 P0-2: the previous offsets 2-3 / 32-39 read spare%|temp-hi and
-    // Data Units Read — wrong fields. Values are clamped to plausible domains;
-    // anything outside becomes "unknown" instead of a fake reading.)
+    // NVMe SMART/Health 日志（512 B，NVMe 1.3/1.4 Get Log Page 02h 布局）：
+    //   [0] 严重警告          [1-2] 综合温度（小端，开尔文）
+    //   [3] 可用备余          [4] 可用备余阈值
+    //   [5] 已用百分比        [32-47] 已读数据单元   [128-143] 通电小时数
+    //（V9 P0-2：旧的偏移 2-3 / 32-39 读到的是备余%|温度高字节与
+    // 已读数据单元——字段错了。取值先钳制到合理域内；
+    // 域外一律记为"未知"，绝不给出伪造读数。）
     *critWarn = log[0];
     *pctUsed = log[5];
-    // F3: spare fields; 0xFF is unpopulated padding, reported as unavailable.
+    // F3：备余字段；0xFF 是未填充的占位，按不可得上报。
     *sparePct = log[3] == 0xFF ? UINT32_MAX : log[3];
     *spareThreshPct = log[4] == 0xFF ? UINT32_MAX : log[4];
     const uint16_t tempK = static_cast<uint16_t>(log[1] | (log[2] << 8));
     constexpr double kMinC = -20.0, kMaxC = 120.0;
     const double c = static_cast<double>(tempK) - 273.15;
-    *tempC = (c >= kMinC && c <= kMaxC) ? c : 0.0;  // 0 => caller reports NoHardware
+    *tempC = (c >= kMinC && c <= kMaxC) ? c : 0.0;  // 0 => 调用方按 NoHardware 上报
     uint64_t hours = 0;
-    for (int i = 7; i >= 0; --i) hours = (hours << 8) | log[128 + i];  // power on hours @128
-    constexpr uint64_t kMaxHours = 200000;  // ~23 years; beyond = garbage
+    for (int i = 7; i >= 0; --i) hours = (hours << 8) | log[128 + i];  // 通电小时数 @128
+    constexpr uint64_t kMaxHours = 200000;  // 约 23 年；超过即视为垃圾数据
     *poh = (hours <= kMaxHours) ? hours : UINT64_MAX;
     return true;
 }
-// Classic SMART READ DATA via SMART_RCV_DRIVE_DATA (winioctl.h, ATA drives).
+// 经 SMART_RCV_DRIVE_DATA 的经典 SMART READ DATA（winioctl.h，ATA 盘）。
 bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
     GETVERSIONINPARAMS ver{};
     DWORD ret = 0;
@@ -751,13 +751,13 @@ bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
     if ((ver.fCapabilities & CAP_SMART_CMD) == 0) return false;
     SENDCMDINPARAMS inp{};
     inp.cBufferSize = 512;
-    inp.irDriveRegs.bFeaturesReg = 0xD0;  // SMART READ ATTRIBUTE VALUES
+    inp.irDriveRegs.bFeaturesReg = 0xD0;  // SMART READ ATTRIBUTE VALUES（读取属性值）
     inp.irDriveRegs.bSectorCountReg = 1;
     inp.irDriveRegs.bSectorNumberReg = 1;
     inp.irDriveRegs.bCylLowReg = 0x4F;
     inp.irDriveRegs.bCylHighReg = 0xC2;
     inp.irDriveRegs.bDriveHeadReg = 0xA0;
-    inp.irDriveRegs.bCommandReg = 0xB0;  // SMART command
+    inp.irDriveRegs.bCommandReg = 0xB0;  // SMART 命令
     inp.bDriveNumber = driveIndex;
     std::vector<BYTE> outb(sizeof(SENDCMDOUTPARAMS) + 512 - 1);
     if (!::DeviceIoControl(h, SMART_RCV_DRIVE_DATA, &inp, sizeof(inp), outb.data(),
@@ -766,35 +766,35 @@ bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
     }
     const auto* outp = reinterpret_cast<const SENDCMDOUTPARAMS*>(outb.data());
     if (outp->DriverStatus.bDriverError != 0) return false;
-    const BYTE* s = outp->bBuffer;  // 512-byte attribute block
-    // Attribute layout (ATA/ATAPI-6 SMART READ DATA; identical in smartmontools
-    // ata_smart_attribute and CrystalDiskInfo — the reference our R6 cites):
-    //   id(1) flags(2) value(1) worst(1) raw(6, LE) reserved(1); 30 entries after
-    //   a 2-byte version. NOTE (V9 P0-3 review): the review proposed raw@p[4]/8B,
-    //   but under this spec layout p[4] is the *worst* normalized byte (0-100);
-    //   reading it as Celsius would fabricate plausible fake temperatures. We
-    //   therefore keep raw@p[5..10] and enforce strict plausibility domains so
-    //   any layout drift degrades to "unknown" instead of a fake value.
+    const BYTE* s = outp->bBuffer;  // 512 字节属性块
+    // 属性布局（ATA/ATAPI-6 SMART READ DATA；与 smartmontools 的
+    // ata_smart_attribute 及 CrystalDiskInfo 一致——即 R6 引用的参考）：
+    //   id(1) flags(2) value(1) worst(1) raw(6, 小端) reserved(1)；2 字节版本
+    //   之后共 30 个条目。注意（V9 P0-3 评审）：评审曾提议 raw@p[4]/8B，
+    //   但按本规范布局 p[4] 是 *worst* 归一化字节（0-100）；
+    //   把它当摄氏度读会编造出貌似合理的假温度。因此我们
+    //   保留 raw@p[5..10] 并执行严格的合理域校验，任何布局漂移
+    //   都退化为"未知"，而不是假值。
     bool haveTemp = false, haveHours = false;
     double t = 0;
     uint64_t hours = 0;
     for (int a = 0; a < 30; ++a) {
-        const BYTE* p = s + 2 + a * 12;  // version(2) then 12-byte attributes
+        const BYTE* p = s + 2 + a * 12;  // 版本(2) 之后是 12 字节属性
         const uint8_t id = p[0];
         if (id == 0) break;
-        if ((id == 194 || id == 190) && !haveTemp) {  // Temperature / Airflow
-            const double cand = static_cast<double>(p[5]);  // raw[0]
-            if (cand >= -20.0 && cand <= 120.0) {           // plausible Celsius only
+        if ((id == 194 || id == 190) && !haveTemp) {  // Temperature / Airflow（温度/气流）
+            const double cand = static_cast<double>(p[5]);  // raw[0]（原始首字节）
+            if (cand >= -20.0 && cand <= 120.0) {           // 仅接受合理的摄氏值
                 t = cand;
                 haveTemp = true;
             }
-        } else if (id == 9 && !haveHours) {  // Power_On_Hours (raw, LE, 48 bit)
+        } else if (id == 9 && !haveHours) {  // Power_On_Hours（原始，小端，48 位）
             const uint64_t raw = static_cast<uint64_t>(p[5]) | (static_cast<uint64_t>(p[6]) << 8) |
                                  (static_cast<uint64_t>(p[7]) << 16) |
                                  (static_cast<uint64_t>(p[8]) << 24) |
                                  (static_cast<uint64_t>(p[9]) << 32) |
                                  (static_cast<uint64_t>(p[10]) << 40);
-            if (raw > 0 && raw <= 200000ull) {  // ~23 years; beyond = garbage
+            if (raw > 0 && raw <= 200000ull) {  // 约 23 年；超过即垃圾数据
                 hours = raw;
                 haveHours = true;
             }
@@ -806,14 +806,14 @@ bool AtaSmart(HANDLE h, uint8_t driveIndex, double* tempC, uint64_t* poh) {
     return true;
 }
 void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
-    // Coarse OS-level health first (works for standard users on stock Windows;
-    // StorageReliabilityCounter would need admin — R6 §5).
+    // 先取粗粒度的 OS 级健康（标准用户在原版 Windows 上即可用；
+    // StorageReliabilityCounter 需要管理员——R6 §5）。
     struct WmiDisk {
         uint32_t busNum = UINT32_MAX;
-        uint16_t healthStatus = 0xFFFF;  // 0xFFFF = unknown
+        uint16_t healthStatus = 0xFFFF;  // 0xFFFF = 未知
         std::wstring model, serial;
     };
-    std::map<std::wstring, WmiDisk> wmi;  // DeviceId ("0", "1", ...) -> info
+    std::map<std::wstring, WmiDisk> wmi;  // DeviceId（"0"、"1"...）-> 信息
     const WmiResult w = WmiQuery(
         L"ROOT\\Microsoft\\Windows\\Storage",
         L"SELECT DeviceId, FriendlyName, SerialNumber, BusType, HealthStatus FROM MSFT_PhysicalDisk",
@@ -841,11 +841,11 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         const std::wstring path = Fmt(L"\\\\.\\PhysicalDrive{}", n);
         const HANDLE h0 = ::CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING, 0, nullptr);
-        // CreateFileW fails with INVALID_HANDLE_VALUE (-1), not NULL: comparing
-        // against NULL fabricated one fake disk row per absent drive number
-        // (V9 P0-1). core/HandleGuard is frozen, so normalize HERE: skip the
-        // invalid value and never hand it to UniqueHandle/CloseHandle.
-        if (h0 == INVALID_HANDLE_VALUE) continue;  // absent drive; gaps are legal
+        // CreateFileW 失败时返回 INVALID_HANDLE_VALUE（-1）而非 NULL：
+        // 与 NULL 比较会为每个不存在的盘号编造一条假磁盘行
+        //（V9 P0-1）。core/HandleGuard 已冻结，因此在这里归一化：
+        // 跳过无效值，绝不把它交给 UniqueHandle/CloseHandle。
+        if (h0 == INVALID_HANDLE_VALUE) continue;  // 盘不存在；盘号空洞是合法的
         const stm::UniqueHandle h(h0);
         DiskHealth d;
         uint32_t busNum = UINT32_MAX;
@@ -854,7 +854,7 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
             busNum = wit->second.busNum;
             d.model = wit->second.model;
             d.serial = wit->second.serial;
-            switch (wit->second.healthStatus) {  // MSFT_PhysicalDisk.HealthStatus
+            switch (wit->second.healthStatus) {  // MSFT_PhysicalDisk.HealthStatus（健康状态）
                 case 0: d.health = L"良好"; break;
                 case 1: d.health = L"警告"; break;
                 case 2: d.health = L"异常"; break;
@@ -866,8 +866,8 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
         d.tempC = 0.0;
         d.powerOnHours = UINT64_MAX;
         d.tempState = SensorReading::State::NoHardware;
-        // Descriptor: model/serial/bus even where WMI was denied (0-access
-        // handle is enough for the plain property query).
+        // 描述符：即使 WMI 被拒绝也给出型号/序列号/总线（只读访问
+        // 权限为 0 的句柄足以做普通属性查询）。
         BYTE qbuf[2048]{};
         auto* q = reinterpret_cast<STORAGE_PROPERTY_QUERY*>(qbuf);
         q->PropertyId = StorageDeviceProperty;
@@ -890,10 +890,10 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
             }
         }
         d.busType = BusName(busNum == UINT32_MAX ? 0 : busNum);
-        // Never a blank line: WMI and descriptor both unavailable -> the drive
-        // number is the honest fallback name.
+        // 绝不留空白行：WMI 与描述符都不可得时 -> 以盘号作为
+        // 诚实的兜底名称。
         if (d.model.empty()) d.model = Fmt(L"PhysicalDrive{}", n);
-        // Detailed health: only for buses that plausibly report SMART.
+        // 详细健康信息：只对合理报告 SMART 的总线类型执行。
         const BusProto proto = busNum != UINT32_MAX ? ClassifyBus(busNum) : BusProto::Other;
         if (proto == BusProto::Nvme || proto == BusProto::Ata) {
             bool ok = false;
@@ -901,18 +901,18 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
             uint64_t poh = UINT64_MAX;
             uint32_t pct = 0;
             uint8_t crit = 0;
-            uint32_t spare = UINT32_MAX, spareTh = UINT32_MAX;  // F3 NVMe detail
+            uint32_t spare = UINT32_MAX, spareTh = UINT32_MAX;  // F3 NVMe 细节
             if (proto == BusProto::Nvme) {
                 ok = NvmeHealth(h.get(), &t, &poh, &pct, &crit, &spare, &spareTh);
             } else {
                 ok = AtaSmart(h.get(), static_cast<uint8_t>(n), &t, &poh);
             }
             if (!ok) {
-                // Retry behind an elevated handle; classify by the outcome.
+                // 用提权句柄重试；按结果分类。
                 const HANDLE h1 = ::CreateFileW(path.c_str(), GENERIC_READ,
                                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                                 OPEN_EXISTING, 0, nullptr);
-                if (h1 != INVALID_HANDLE_VALUE) {  // V9 P0-1: not NULL on failure
+                if (h1 != INVALID_HANDLE_VALUE) {  // V9 P0-1：失败时不是 NULL
                     const stm::UniqueHandle h1g(h1);
                     ok = proto == BusProto::Nvme
                              ? NvmeHealth(h1g.get(), &t, &poh, &pct, &crit, &spare, &spareTh)
@@ -928,14 +928,14 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
                     d.tempC = t;
                     d.tempState = SensorReading::State::Ok;
                 } else {
-                    d.tempState = SensorReading::State::NoHardware;  // log ok, no temp sensor
+                    d.tempState = SensorReading::State::NoHardware;  // 日志正常但无温度传感器
                 }
                 if (proto == BusProto::Nvme) {
                     if (crit != 0) d.health = L"警告";       // real SMART critical warning
                     else if (pct > 100) d.health = L"警告";  // worn beyond rated endurance
                     else if (d.health == L"未知") d.health = L"良好";
-                    // F3 detail (honest: only from a real log page read; 0xFF padding
-                    // byte is already mapped to UINT32_MAX inside NvmeHealth).
+                    // F3 细节（诚实：只来自真实的日志页读取；0xFF 填充
+                    // 字节已在 NvmeHealth 内部映射为 UINT32_MAX）。
                     d.critWarnValid = true;
                     d.critWarnBits = crit;
                     d.wearPct = pct == 0xFF ? UINT32_MAX : pct;
@@ -957,15 +957,15 @@ void ReadDisks(std::vector<DiskHealth>* disks, std::wstring* notes) {
     }
 }
 // ===========================================================================
-// F3: shared 350 ms delta window. One PDH query carries the rate counters
-// (per-core CPU % via Processor Information; per-engtype GPU Engine; GPU
-// Adapter Memory dedicated/shared) and two GetIfTable2 samples give
-// per-adapter octet rates. All Ok readings come from documented user-mode
-// sources (R6 §4/§6); a missing source yields ONE NoHardware placeholder
-// entry — never fabricated zeros.
+// F3：共享的 350 ms 差值窗口。一个 PDH 查询承载速率计数器
+//（每核 CPU % 经 Processor Information；按 engtype 的 GPU Engine；
+// GPU Adapter Memory 专用/共享），两个 GetIfTable2 样本给出
+// 每适配器字节速率。所有 Ok 读数均来自有文档的用户态
+// 来源（R6 §4/§6）；缺失的来源只产出一条 NoHardware 占位条目——
+// 绝不编造 0。
 // ===========================================================================
 constexpr DWORD kDeltaWindowMs = 350;
-// PDH engine type token -> short display name; nullptr = keep the raw token.
+// PDH 引擎类型记号 -> 短显示名；nullptr = 保留原始记号。
 const wchar_t* EngineTypeLabel(const std::wstring& raw) {
     if (raw == L"3D") return L"3D";
     if (raw == L"Copy") return L"Copy";
@@ -1009,7 +1009,7 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         if (stm::cd::PdhLocalizeEnglishPath(L"\\GPU Adapter Memory(*)\\Shared Usage", &tpl)) {
             haveShr = stm::cd::PdhAddWildcardCounter(q, tpl, &gpuShr);
         }
-        if (haveProc || haveEng) stm::cd::PdhCollect(q);  // rate counters need a warm-up sample
+        if (haveProc || haveEng) stm::cd::PdhCollect(q);  // 速率计数器需要一个预热样本
     }
     const bool haveNet0 = ::GetIfTable2(&ifT0) == NO_ERROR && ifT0 != nullptr;
     cleanup.t0 = ifT0;
@@ -1020,7 +1020,7 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
     const bool haveNet1 = haveNet0 && ::GetIfTable2(&ifT1) == NO_ERROR && ifT1 != nullptr;
     cleanup.t1 = ifT1;
     const double dtSec = static_cast<double>(t1ms - t0ms) / 1000.0;
-    // --- per-core CPU utilization (Processor Information, documented; R6 §6) ---
+    // --- 每核 CPU 利用率（Processor Information，有文档；R6 §6）---
     if (haveProc) {
         std::vector<stm::cd::PdhArrayItem> items;
         int added = 0;
@@ -1028,8 +1028,8 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
             for (const stm::cd::PdhArrayItem& it : items) {
                 if (!it.valid) continue;
                 if (it.name.empty() || it.name.find(L"_Total") != std::wstring::npos) continue;
-                // Instances are "0,3" (processor group, logical core): the number
-                // after the last comma labels the core.
+                // 实例形如 "0,3"（处理器组,逻辑核）：最后一个逗号后的
+                // 数字就是核心标签。
                 std::wstring idx = it.name;
                 const size_t comma = idx.rfind(L',');
                 if (comma != std::wstring::npos) idx = idx.substr(comma + 1);
@@ -1058,17 +1058,17 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         coreUtil->push_back(r);
         *notes += L"；Processor Information 计数器不可用，每核占用率不可用";
     }
-    // --- GPU engine utilization, aggregated per engtype_* (R6 §4) ---
+    // --- GPU 引擎利用率，按 engtype_* 聚合（R6 §4）---
     bool anyEngine = false;
     if (haveEng) {
         std::vector<stm::cd::PdhArrayItem> items;
         if (stm::cd::PdhFmtArrayDouble(gpuEng, &items)) {
-            std::map<std::wstring, std::pair<double, int>> agg;  // engtype -> (sum, instances)
+            std::map<std::wstring, std::pair<double, int>> agg;  // engtype ->（总和, 实例数）
             for (const stm::cd::PdhArrayItem& it : items) {
                 if (!it.valid) continue;
                 const size_t e = it.name.find(L"engtype_");
                 if (e == std::wstring::npos) continue;
-                const std::wstring type = it.name.substr(e + 8);  // len(L"engtype_") == 8
+                const std::wstring type = it.name.substr(e + 8);  // len(L"engtype_") == 8（前缀长度）
                 if (type.empty()) continue;
                 auto& slot = agg[type];
                 slot.first += ClampPct(it.value);
@@ -1078,7 +1078,7 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
                 SensorReading r;
                 const wchar_t* cn = EngineTypeLabel(kv.first);
                 r.label = cn ? Fmt(L"GPU {} 引擎占用率", cn) : Fmt(L"GPU 引擎占用率（{}）", kv.first);
-                r.value = ClampPct(kv.second.first);  // aggregate, clamped like per-engine
+                r.value = ClampPct(kv.second.first);  // 聚合值，与单引擎一样做钳制
                 r.unit = L"%";
                 r.state = SensorReading::State::Ok;
                 gpuOut->push_back(std::move(r));
@@ -1101,7 +1101,7 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         gpuOut->push_back(r);
         *notes += L"；GPU Engine 计数器不可用（需 Win10 1709+ 图形栈）";
     }
-    // --- GPU adapter memory, summed over adapters (raw usage counters) ---
+    // --- GPU 适配器内存，跨适配器求和（原始用量计数器）---
     auto adapterMemoryBytes = [](PDH_HCOUNTER h) {
         if (!h) return -1.0;
         std::vector<stm::cd::PdhArrayItem> items;
@@ -1142,7 +1142,7 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
         gpuOut->push_back(r);
         if (!haveEng) *notes += L"；GPU Adapter Memory 计数器不可用";
     }
-    // --- per-adapter network rates (GetIfTable2 octet deltas) ---
+    // --- 每适配器网络速率（GetIfTable2 字节差值）---
     if (haveNet1) {
         std::map<uint32_t, const MIB_IF_ROW2*> t0rows;
         for (ULONG i = 0; i < ifT0->NumEntries; ++i) {
@@ -1154,13 +1154,13 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
             if (r1.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
             if (r1.OperStatus != IfOperStatusUp) continue;
             const auto it0 = t0rows.find(r1.InterfaceIndex);
-            if (it0 == t0rows.end()) continue;  // appeared mid-window: no honest delta yet
+            if (it0 == t0rows.end()) continue;  // 窗口中途出现：尚无诚实的差值
             const MIB_IF_ROW2& r0 = *it0->second;
             std::wstring name(r1.Alias);
             if (name.empty()) name = r1.Description;
             if (name.empty()) name = Fmt(L"接口 {}", static_cast<unsigned>(r1.InterfaceIndex));
             auto rate = [&](uint64_t now, uint64_t prev) {
-                if (dtSec <= 0.0 || now < prev) return -1.0;  // counter reset is not a spike
+                if (dtSec <= 0.0 || now < prev) return -1.0;  // 计数器重置不是尖峰
                 return static_cast<double>(now - prev) / dtSec;
             };
             const double recv = rate(r1.InOctets, r0.InOctets);
@@ -1171,7 +1171,7 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
             if (recv >= 0.0) {
                 rr.value = recv;
                 rr.state = SensorReading::State::Ok;
-            } else {  // honest placeholder instead of a wrapped-around spike
+            } else {  // 诚实的占位，而不是回绕产生的尖峰
                 rr.label += L"（计数器重置）";
                 rr.state = SensorReading::State::NoHardware;
             }
@@ -1216,11 +1216,11 @@ void ReadDeltaWindow(std::vector<SensorReading>* coreUtil, std::vector<SensorRea
     }
 }
 // ===========================================================================
-// F3: battery (CallNtPowerInformation SystemBatteryState=5, winnt.h layout).
-// No battery -> one NoHardware entry (honest; desktops are the normal case).
+// F3：电池（CallNtPowerInformation SystemBatteryState=5，winnt.h 布局）。
+// 无电池 -> 一条 NoHardware 条目（诚实；台式机是常态）。
 // ===========================================================================
 #pragma pack(push, 4)
-struct BatteryStateRow {  // SYSTEM_BATTERY_STATE
+struct BatteryStateRow {  // SYSTEM_BATTERY_STATE（系统电池状态）
     BYTE AcOnLine;
     BYTE BatteryPresent;
     BYTE Charging;
@@ -1228,8 +1228,8 @@ struct BatteryStateRow {  // SYSTEM_BATTERY_STATE
     BYTE Spare4[3];
     DWORD MaxCapacity;
     DWORD RemainingCapacity;
-    DWORD Rate;           // mW, current charge/discharge rate
-    DWORD EstimatedTime;  // seconds; 0xFFFFFFFF = unknown
+    DWORD Rate;           // 毫瓦，当前充/放电速率
+    DWORD EstimatedTime;  // 秒；0xFFFFFFFF = 未知
     DWORD DefaultAlert1;
     DWORD DefaultAlert2;
 };
@@ -1271,7 +1271,7 @@ void ReadBattery(std::vector<SensorReading>* out, std::wstring* notes) {
         r.state = SensorReading::State::Ok;
         out->push_back(std::move(r));
     }
-    if (bs.EstimatedTime != 0 && bs.EstimatedTime != 0xFFFFFFFF) {  // 0/-1 = unknown
+    if (bs.EstimatedTime != 0 && bs.EstimatedTime != 0xFFFFFFFF) {  // 0/-1 = 未知
         SensorReading r;
         r.label = L"电池 剩余时间";
         r.value = static_cast<double>(bs.EstimatedTime);
@@ -1289,9 +1289,9 @@ void ReadBattery(std::vector<SensorReading>* out, std::wstring* notes) {
     }
 }
 // ===========================================================================
-// F3: memory (GlobalMemoryStatusEx + GetPerformanceInfo). GetPerformanceInfo
-// is bound dynamically (K32GetPerformanceInfo in kernel32, psapi.dll
-// fallback) so the stm_collect link line stays unchanged.
+// F3：内存（GlobalMemoryStatusEx + GetPerformanceInfo）。GetPerformanceInfo
+// 动态绑定（kernel32 的 K32GetPerformanceInfo，psapi.dll 兜底），
+// 因此 stm_collect 的链接行保持不变。
 // ===========================================================================
 using GetPerfInfoFn = BOOL(WINAPI*)(PPERFORMANCE_INFORMATION, DWORD);
 GetPerfInfoFn GetPerfInfo() {
@@ -1301,7 +1301,7 @@ GetPerfInfoFn GetPerfInfo() {
             const auto p = reinterpret_cast<GetPerfInfoFn>(::GetProcAddress(k32, "K32GetPerformanceInfo"));
             if (p) return p;
         }
-        // Deliberately never freed: process-lifetime binding, same as powrprof above.
+        // 刻意永不释放：进程生命周期绑定，同上文的 powrprof。
         const HMODULE psapi = ::LoadLibraryW(L"psapi.dll");
         return psapi ? reinterpret_cast<GetPerfInfoFn>(::GetProcAddress(psapi, "GetPerformanceInfo"))
                      : nullptr;
@@ -1375,21 +1375,21 @@ void ReadMemory(std::vector<SensorReading>* out, std::wstring* notes) {
     }
 }
 // ===========================================================================
-// G-B: "extra" — best-effort readings from documented WMI temperature classes
-// OUTSIDE MSAcpi_ThermalZoneTemperature. The snapshot group is displayed only
-// when non-empty, so every failure path stays silent: absence promises nothing.
-// P2 (2026-09-18): each source is enumerated instance by instance and every
-// label carries its provenance prefix, so same-name readings from different
+// G-B："extra"——尽力从有文档的 WMI 温度类读取，
+// 且位于 MSAcpi_ThermalZoneTemperature 之外。快照组只在非空时展示，
+// 因此所有失败路径都保持沉默：缺失不作任何承诺。
+// P2（2026-09-18）：每个来源逐实例枚举，每条标签带
+// 来源前缀，不同来源的同名读数得以区分。
 // providers can never collide (contract: "同类传感器多值逐项展示").
 // ===========================================================================
 void ReadExtraSensors(std::vector<SensorReading>* out) {
-    // 1) Win32_Temperature (ROOT\CIMV2, DMTF temperature sensor): CurrentReading
-    //    per instance. Almost never implemented by a real provider — an absent
-    //    class is the normal case and simply yields nothing. Unit caveat: the
-    //    value arrives in tenths, but providers differ between tenths of Kelvin
-    //    (ACPI-style) and tenths of °C (DMTF sensor model); the two readings
-    //    can never BOTH fall inside the plausible window, so pick the one that
-    //    fits and drop the row entirely when neither does (never a fake temp).
+    // 1) Win32_Temperature（ROOT\CIMV2，DMTF 温度传感器）：每实例的
+    //    CurrentReading。真实提供程序几乎从不实现——类缺失
+    //    是常态，直接不产出。单位注意：数值以十分之一为单位，
+    //    但提供程序之间有差异：十分之一开尔文（ACPI 风格）与
+    //    十分之一摄氏度（DMTF 传感器模型）并存；两种解读
+    //    不可能同时落在合理窗口内，因此选合理者，
+    //    都不合理时整行丢弃（绝不给假温度）。
     {
         const WmiResult w = WmiQuery(L"ROOT\\CIMV2",
                                      L"SELECT InstanceName, CurrentReading FROM Win32_Temperature",
@@ -1399,10 +1399,10 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             const auto it = row.find(L"CurrentReading");
             if (it == row.end() || !it->second.present || !it->second.isNum) continue;
             const double raw = static_cast<double>(it->second.num);
-            if (raw == 0.0) continue;  // empty-register sentinel; a real 0.0 °C reading is implausible (V15-P2-3)
-            double c = raw / 10.0 - 273.15;  // tenths of Kelvin first
-            if (c < -60.0 || c > 250.0) c = raw / 10.0;  // else tenths of °C
-            if (c < -60.0 || c > 250.0) continue;        // implausible -> skip, no fake
+            if (raw == 0.0) continue;  // 空寄存器哨兵值；真实 0.0 °C 读数不合理（V15-P2-3）
+            double c = raw / 10.0 - 273.15;  // 先按十分之一开尔文
+            if (c < -60.0 || c > 250.0) c = raw / 10.0;  // 否则按十分之一摄氏度
+            if (c < -60.0 || c > 250.0) continue;        // 不合理 -> 跳过，绝不伪造
             SensorReading r;
             r.label = Fmt(L"WMI 温度 {}", added);
             const auto in = row.find(L"InstanceName");
@@ -1416,10 +1416,10 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             ++added;
         }
     }
-    // 2) MSStorageDriver_FailurePredictData (ROOT\WMI): per-drive SMART attribute
-    //    block (same 12-byte layout as AtaSmart); attribute 194/190 raw[0] is the
+    // 2) MSStorageDriver_FailurePredictData（ROOT\WMI）：每盘的 SMART 属性
+    //    块（与 AtaSmart 相同的 12 字节布局）；属性 194/190 的 raw[0] 是
     //    temperature. Usually admin-gated (this box: 拒绝访问) — a denial leaves
-    //    the group untouched; the per-disk IOCTL path above remains the source.
+    //    该组保持不动；上面的每盘 IOCTL 路径仍是权威来源。
     {
         const WmiResult w = WmiQuery(L"ROOT\\WMI",
                                      L"SELECT InstanceName, VendorSpecific FROM "
@@ -1432,20 +1432,20 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             const std::vector<uint8_t>& s = vs->second.bytes;
             double t = 0;
             bool have = false;
-            // version(2) then 12-byte attributes: id(1) flags(2) value(1)
-            // worst(1) raw(6, LE) reserved(1) — raw[0] at p[5], see AtaSmart.
+            // 版本(2) 之后是 12 字节属性：id(1) flags(2) value(1)
+            // worst(1) raw(6, 小端) reserved(1)——raw[0] 在 p[5]，见 AtaSmart。
             for (size_t off = 2; off + 6 <= s.size(); off += 12) {
                 const uint8_t id = s[off];
                 if (id == 0) break;
                 if ((id == 194 || id == 190) && !have) {
                     const double cand = static_cast<double>(s[off + 5]);
-                    if (cand >= 10.0 && cand <= 120.0) {  // plausible Celsius only
+                    if (cand >= 10.0 && cand <= 120.0) {  // 仅接受合理的摄氏值
                         t = cand;
                         have = true;
                     }
                 }
             }
-            if (!have) continue;  // honest: unreadable/absent -> no entry at all
+            if (!have) continue;  // 诚实：不可读/缺失 -> 完全不出条目
             SensorReading r;
             r.label = Fmt(L"磁盘 {} 温度（WMI SMART）", added);
             const auto in = row.find(L"InstanceName");
@@ -1459,15 +1459,15 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             ++added;
         }
     }
-    // 3) Win32_PerfFormattedData_Counters_ThermalZoneInformation (ROOT\CIMV2,
-    //    PerfProc): one instance per ACPI thermal zone. Documented unit is
-    //    tenths of Kelvin, but firmware providers differ — this box (measured,
-    //    \_TZ.TZ00) reports raw=301, i.e. 30.1 °C under a tenths-of-°C reading
-    //    and a bogus -243 °C under the documented one. Same unit ladder as
-    //    source 1: tenths of K first (the documented unit wins whenever it is
-    //    plausible), tenths of °C as the only alternative, anything else is
-    //    dropped. Reads without elevation; absent/broken on many desktops —
-    //    any failure or implausible value stays silent.
+    // 3) Win32_PerfFormattedData_Counters_ThermalZoneInformation（ROOT\CIMV2，
+    //    PerfProc）：每个 ACPI 热区一个实例。文档单位是
+    //    十分之一开尔文，但固件提供程序并不一致——本机（实测
+    //    \_TZ.TZ00）raw=301，按十分之一摄氏度解读为 30.1 °C，
+    //    按文档单位则是荒谬的 -243 °C。与来源 1 相同的单位阶梯：
+    //    先按十分之一开尔文（只要合理就让文档单位胜出），
+    //    十分之一摄氏度作为唯一备选，其余一律丢弃。
+    //    无需提权即可读；许多台式机上缺失/损坏——
+    //    任何失败或不合理值都保持沉默。
     {
         const WmiResult w = WmiQuery(
             L"ROOT\\CIMV2",
@@ -1479,10 +1479,10 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             const auto it = row.find(L"Temperature");
             if (it == row.end() || !it->second.present || !it->second.isNum) continue;
             const double raw = static_cast<double>(it->second.num);
-            if (raw == 0.0) continue;  // empty-register sentinel; never report a fake 0.0 °C (V15-P2-3)
-            double c = raw / 10.0 - 273.15;  // documented tenths of Kelvin first
-            if (c < -60.0 || c > 250.0) c = raw / 10.0;  // measured tenths-of-°C units
-            if (c < -60.0 || c > 250.0) continue;        // implausible -> skip, no fake
+            if (raw == 0.0) continue;  // 空寄存器哨兵值；绝不报告假 0.0 °C（V15-P2-3）
+            double c = raw / 10.0 - 273.15;  // 先按文档单位十分之一开尔文
+            if (c < -60.0 || c > 250.0) c = raw / 10.0;  // 实测的十分之一摄氏度单位
+            if (c < -60.0 || c > 250.0) continue;        // 不合理 -> 跳过，绝不伪造
             SensorReading r;
             r.label = Fmt(L"WMI 热区计数器 {}", added);
             const auto in = row.find(L"Name");
@@ -1496,23 +1496,23 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             ++added;
         }
     }
-    // 4) Intel DPTF (Dynamic Platform and Thermal Framework) participants: the
-    //    driver-owned TEMPERATURE instance set under root\Intel_DPTF (older
-    //    drivers: root\Intel(DPTF)), CurrentTemperature in tenths of Kelvin
-    //    per the DPTF spec. Undocumented by Intel publicly and absent without
-    //    the driver — a missing namespace classifies as notSupported and is
-    //    skipped SILENTLY (the normal case); only plausible Ok rows surface.
+    // 4) Intel DPTF（Dynamic Platform and Thermal Framework）参与者：
+    //    root\Intel_DPTF 下驱动所有的 TEMPERATURE 实例集（较旧
+    //    驱动为 root\Intel(DPTF)），CurrentTemperature 按十分之一
+    //    开尔文计（DPTF 规范）。Intel 未公开文档化，且无驱动时缺失——
+    //    命名空间缺失归类为 notSupported 并静默跳过
+    //（这是常态）；只有合理的 Ok 行才会展示。
     for (const wchar_t* ns : {L"ROOT\\Intel_DPTF", L"ROOT\\Intel(DPTF)"}) {
         const WmiResult w = WmiQuery(ns,
                                      L"SELECT InstanceName, CurrentTemperature FROM TEMPERATURE",
                                      {L"InstanceName", L"CurrentTemperature"});
-        if (w.notSupported) continue;  // namespace/class absent: quiet skip
+        if (w.notSupported) continue;  // 命名空间/类缺失：静默跳过
         int added = 0;
         for (const WmiRow& row : w.rows) {
             const auto it = row.find(L"CurrentTemperature");
             if (it == row.end() || !it->second.present || !it->second.isNum) continue;
             const double c = static_cast<double>(it->second.num) / 10.0 - 273.15;
-            if (c < -60.0 || c > 250.0) continue;  // implausible -> skip, no fake
+            if (c < -60.0 || c > 250.0) continue;  // 不合理 -> 跳过，绝不伪造
             SensorReading r;
             r.label = L"DPTF 温度";
             const auto in = row.find(L"InstanceName");
@@ -1526,7 +1526,7 @@ void ReadExtraSensors(std::vector<SensorReading>* out) {
             out->push_back(std::move(r));
             ++added;
         }
-        if (added > 0) break;  // this namespace delivered; don't double-report
+        if (added > 0) break;  // 该命名空间已产出；不重复报告
     }
 }
 }  // namespace
@@ -1537,21 +1537,21 @@ SensorSnapshot ReadSensors(std::wstring* err) {
         ReadCpuTemp(&snap.cpu, &notes);
         std::vector<SensorReading> coreFreq;
         ReadCpuFreq(&coreFreq, &notes);
-        for (const SensorReading& r : coreFreq) snap.cpu.push_back(r);  // existing contract
-        // F3: shared ~350 ms delta window (per-core %, GPU engine/VRAM, per-NIC rates).
+        for (const SensorReading& r : coreFreq) snap.cpu.push_back(r);  // 既有契约向量
+        // F3：共享的约 350 ms 差值窗口（每核 %、GPU 引擎/显存、每网卡速率）。
         std::vector<SensorReading> coreUtil, gpuEngine, net;
         ReadDeltaWindow(&coreUtil, &gpuEngine, &net, &notes);
         snap.cpuCores = std::move(coreFreq);
         snap.cpuCores.insert(snap.cpuCores.end(), coreUtil.begin(), coreUtil.end());
-        // G-B: gpus = PDH engine/VRAM group + the NVML per-card, per-sensor
-        // expansion (legacy `gpu` vector keeps its exact F3 content).
+        // G-B：gpus = PDH 引擎/显存组 + NVML 每卡、每传感器的
+        // 展开（旧 `gpu` 向量保持原 F3 内容）。
         snap.gpus = std::move(gpuEngine);
         nvml::Read(&snap.gpu, &snap.gpus, &notes);
         snap.network = std::move(net);
         ReadDisks(&snap.disks, &notes);
         ReadBattery(&snap.battery, &notes);
         ReadMemory(&snap.memory, &notes);
-        ReadExtraSensors(&snap.extra);  // G-B: best effort; empty -> not shown
+        ReadExtraSensors(&snap.extra);  // G-B：尽力而为；为空 -> 不展示
         snap.uptimeSec = static_cast<double>(::GetTickCount64()) / 1000.0;
         SensorReading fan;
         fan.label = L"风扇转速";
@@ -1570,7 +1570,7 @@ SensorSnapshot ReadSensors(std::wstring* err) {
         if (err) *err = L"传感器读取未知异常";
         STM_LOG_ERROR("sensors", L"ReadSensors 未知异常");
     }
-    if (notes.size() > 2) notes.erase(0, 1);  // drop the leading '；'
+    if (notes.size() > 2) notes.erase(0, 1);  // 去掉开头的 '；'
     snap.notes = notes;
     return snap;
 }

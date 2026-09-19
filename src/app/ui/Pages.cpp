@@ -1,12 +1,13 @@
-// UI SHELL + PAGES: process table, performance charts, detail panel, confirm dialogs,
+// UI 外壳 + 页面：进程表、性能图表、详情面板、确认对话框。
 // toasts and status bar (docs/phase/01_架构设计文档.md sections 8/11).
-// All user-facing text is Chinese; it goes through ui::U8() because ImGui is a
-// narrow-char (UTF-8) API. The UI thread reads the snapshot exactly once per frame.
+// 所有面向用户的文本都是中文；经 ui::U8() 处理，因为 ImGui 是
+// 窄字符（UTF-8）API。UI 线程每帧恰好读取一次快照。
 #include "app/ui/Pages.h"
 #include "app/AppContext.h"
 #include "app/Theme.h"            // H-A: 主题三态 + 模式感知强调色
 #include "app/ui/AboutUi.h"       // H-A: 工具条「?」关于按钮 + 模态
 #include "app/ui/ConfirmAction.h"
+#include "app/ui/HeaderLayout.h"  // R-Fix Bug1: 工具条右侧实测宽度布局（纯函数）
 #include "app/ui/ModulesUi.h"
 #include "app/ui/SortKey.h"
 #include "app/ui/UiText.h"
@@ -14,7 +15,7 @@
 #include "app/ui3/GcPages.h"      // F4: 崩溃记录/窗口页注册 + 宿主服务模态 + 热键
 #include "app/ui3/JumpState.h"    // F4#3: 跨页跳转槽
 #include "app/ui3/MemCleanup.h"   // P3 任务一: 一键内存优化候选/聚合（纯逻辑）
-#include "app/ui3/Pages3.h"       // phase-3 extension tabs + shell hooks (additive)
+#include "app/ui3/Pages3.h"       // 第 3 阶段扩展标签 + 外壳钩子（增量式）
 #include "app/ui3/PerfCsv.h"      // F4#7: 性能 CSV 记录
 #include "app/ui3/ProcControlUi.h"  // F4#2: 优先级/亲和性文案与掩码换算
 #include "app/ui3/ProcKind.h"     // F4#1: 系统进程分类
@@ -30,7 +31,7 @@
 #include "ops/ProcessControl.h"
 #include "ops/ProcessOps.h"
 #include "imgui.h"
-#include "imgui_internal.h"  // TableSetColumnSortDirection + per-column width readback
+#include "imgui_internal.h"  // TableSetColumnSortDirection + 每列宽度回读
 #include "implot.h"
 #include <algorithm>
 #include <atomic>
@@ -50,37 +51,37 @@ namespace stm {
 
 namespace {
 
-using ui::U8;  // UTF-8 text cache (app/ui/UiText.h); used at every ImGui call site
+using ui::U8;  // UTF-8 文本缓存（app/ui/UiText.h）；每个 ImGui 调用点都在用
 
 // ===========================================================================
-// Shared per-frame UI state (single main window, single UI thread).
+// 共享的每帧 UI 状态（单主窗口、单 UI 线程）。
 // ===========================================================================
 
 struct Toast {
     Notification::Kind kind = Notification::Kind::Info;
     std::wstring text;
-    double expireTime = 0.0;  // ImGui::GetTime() based
+    double expireTime = 0.0;  // 基于 ImGui::GetTime()
 };
 
-// ConfirmKind/ConfirmRequest moved to app/ui/ConfirmAction.h (bug F1 fix): the
-// confirm-action execution is shared with the phase-3 startup dialog and is
-// unit-tested by stm_selftest without a GUI.
+// ConfirmKind/ConfirmRequest 已移至 app/ui/ConfirmAction.h（bug F1 修复）：
+// 确认动作执行与第 3 阶段启动对话框共享，
+// 并由 stm_selftest 在无 GUI 下单元测试。
 
 struct UiState {
-    std::shared_ptr<const Snapshot> snap;  // one Store().Get() per frame (shell owns it)
-    // Owning handle registered by main (BindAppContext). Job lambdas capture it BY
-    // VALUE so an in-flight job outlives main's teardown: JobQueue::Shutdown detaches
-    // a timed-out worker, and this capture keeps notes/jobs/details alive until the
-    // job finishes, whichever thread drops the last reference.
+    std::shared_ptr<const Snapshot> snap;  // 每帧一次 Store().Get()（外壳持有）
+    // main 注册的持有句柄（BindAppContext）。任务 lambda 按值捕获它，
+    // 使在途任务活得比 main 的拆除更久：JobQueue::Shutdown 会把超时的
+    // 工作线程脱离，而该捕获让 notes/jobs/details 保持存活直到
+    // 任务完成，无论哪个线程释放最后引用。
     std::shared_ptr<AppContext> liveCtx;
     std::deque<Toast> toasts;
-    std::wstring lastNote;                  // survives toast expiry for the status bar
+    std::wstring lastNote;                  // 在 toast 过期后仍保留给状态栏
     ui::ConfirmRequest confirm;
-    bool confirmOpenRequested = false;      // set once by the menu handler: open the modal
-    bool confirmOpened = false;             // modal actually reached the open state
-    bool tabSelectArmed = true;             // P1-1: one-shot SetSelected on session restore
+    bool confirmOpenRequested = false;      // 由菜单处理器一次性置位：打开模态框
+    bool confirmOpened = false;             // 模态框确实达到打开状态
+    bool tabSelectArmed = true;             // P1-1：会话恢复时一次性 SetSelected
     bool paused = false;
-    // Selection bookkeeping the session handoff reads (updated by ProcessesPage).
+    // 会话交接读取的选择簿记（由 ProcessesPage 更新）。
     ProcKey selectedKey;
     bool selectedValid = false;
     ui::SortColumn sortColumn = ui::SortColumn::Name;
@@ -103,15 +104,15 @@ UiState& Ui() {
 
 void PushToast(Notification::Kind kind, const std::wstring& text) {
     auto& toasts = Ui().toasts;
-    toasts.push_back({kind, text, ImGui::GetTime() + 5.0});  // auto-dismiss in 5 s
+    toasts.push_back({kind, text, ImGui::GetTime() + 5.0});  // 5 秒后自动消失
     while (toasts.size() > 6) toasts.pop_front();
     Ui().lastNote = text;
 }
 
 // ===========================================================================
-// Confirm-action submission: all destructive ops go through ui::ExecuteConfirmed-
-// Action (app/ui/ConfirmAction.h) on the ops worker queue; results come back as
-// notifications -> toasts. See ConfirmAction.h for the lifetime/feedback contract.
+// 确认动作提交：所有破坏性操作都经 ops 工作队列上的 ui::ExecuteConfirmed-
+// Action（app/ui/ConfirmAction.h）执行；结果以通知 -> toast 返回。
+// 生命周期/反馈契约见 ConfirmAction.h。
 // ===========================================================================
 
 void PostNote(NotificationQueue& notes, Notification::Kind kind, const std::wstring& text) {
@@ -121,7 +122,7 @@ void PostNote(NotificationQueue& notes, Notification::Kind kind, const std::wstr
     notes.Push(n);
 }
 
-// Clears any pending confirm request (used by every dialog exit path).
+// 清除任何待决确认请求（每个对话框退出路径都用）。
 void CloseConfirm() {
     Ui().confirm = ui::ConfirmRequest{};
     Ui().confirmOpenRequested = false;
@@ -142,7 +143,7 @@ void RequestTreePlan(const ProcInfo& p) {
     Ui().confirmOpenRequested = true;
     std::shared_ptr<AppContext> app = Ui().liveCtx;
     if (!app) {
-        // No live context (teardown): no notes queue exists to inform — reset only.
+        // 无存活上下文（拆除中）：没有 notes 队列可通知——仅重置。
         CloseConfirm();
         return;
     }
@@ -155,20 +156,20 @@ void RequestTreePlan(const ProcInfo& p) {
                 plan->store(static_cast<int>(members.size()));
             } else {
                 plan->store(-2);
-                // P2 (V14): same admin-hint suffix as every other failure note.
+                // P2（V14）：与其他失败通知相同的管理员提示后缀。
                 PostNote(app->notes, Notification::Kind::JobFailed,
                          Fmt(L"无法规划进程树：{}{}", err.empty() ? std::wstring(L"未知错误") : err,
                              ui::AdminHintSuffix(elevated)));
             }
         }) == 0) {
-        // P2 (V14): refused submission must never be silent.
+        // P2（V14）：被拒的提交绝不能静默。
         PostNote(app->notes, Notification::Kind::JobFailed,
                  L"操作队列未运行，进程树规划未提交（应用可能正在退出）");
         CloseConfirm();
     }
 }
 
-// Confirm request builders (ProcKey/name/path locked here).
+// 确认请求构造器（ProcKey/name/path 在此锁定）。
 void RequestConfirmKill(const ProcInfo& p) {
     CloseConfirm();
     auto& req = Ui().confirm;
@@ -214,7 +215,7 @@ void RequestConfirmMemCleanup() {
 }
 
 // ===========================================================================
-// Small formatting / color helpers.
+// 小型格式化 / 颜色辅助。
 // ===========================================================================
 
 // 模式感知的界面强调色（H-A）：经 Theme 转换后深/浅两套主题都可读。
@@ -226,7 +227,7 @@ ImVec4 ColFail() { return AccentCol(ThemeAccent::Fail); }
 ImVec4 ColWarn() { return AccentCol(ThemeAccent::Warn); }
 ImVec4 ColInfo() { return AccentCol(ThemeAccent::Info); }
 
-// Module paths read best tail-first (file name at the end); ellipsize the front.
+// 模块路径从尾部读最佳（文件名在末尾）；前部省略号化。
 std::wstring TruncateModulePath(const std::wstring& s) {
     constexpr size_t kMax = 90;
     if (s.size() <= kMax) return s;
@@ -243,7 +244,7 @@ ImVec4 NoteColor(Notification::Kind k) {
 }
 
 // ===========================================================================
-// Toasts (top-right, auto-dismiss 2-5 s; JobFailed shown red).
+// Toast（右上角，2-5 秒自动消失；JobFailed 显示为红色）。
 // ===========================================================================
 
 void DrawToasts() {
@@ -278,12 +279,12 @@ void DrawToasts() {
 }
 
 // ===========================================================================
-// Confirm dialogs (modal, centered; two-stage destructive-op gate).
+// 确认对话框（模态、居中；破坏性操作两段式闸门）。
 // ===========================================================================
 
-// --autotest dialogclick observation point (V14): the driver asserts on this to
-// regression-test the REAL rendered dialog (single-frame regression sentinel +
-// action-button geometry for synthetic mouse injection).
+// --autotest dialogclick 观察点（V14）：驱动据此断言，以回归测试
+// 真实渲染的对话框（单帧回归哨兵 +
+// 供合成鼠标注入用的动作按钮几何）。
 DialogAutotestState g_dialogAutotest;
 
 void DrawConfirmDialogs() {
@@ -308,18 +309,18 @@ void DrawConfirmDialogs() {
     // CloseAsk 不是破坏性 op，不参与 --autotest dialogclick 的观察哨兵。
     if (req.kind != ui::ConfirmKind::CloseAsk) g_dialogAutotest.requestActive = true;
 
-    // Tree plan failure: a failure toast was already posted by the plan job.
+    // 树规划失败：规划任务已投递过失败 toast。
     if (req.kind == ui::ConfirmKind::KillTree && req.planCount && req.planCount->load() == -2) {
         CloseConfirm();
         return;
     }
 
-    // Bug F1 fix (2026-09): the old code returned early when confirmOpenRequested
-    // was false, so BeginPopupModal() ran only on the single frame the request was
-    // created. The modal was rendered for exactly one frame and could never receive
+    // Bug F1 修复（2026-09）：旧代码在 confirmOpenRequested 为 false 时提前
+    // 返回，BeginPopupModal() 只在请求创建的那一帧运行。
+    // 模态框恰好只渲染一帧，永远收不到点击，
     // a click ("终止进程/终止进程树 没有任何效果"), and the abandoned ImGui popup
-    // stayed in the popup stack as an invisible blocking modal. Now the modal is
-    // BEGUN every frame while a request is active; OpenPopup is issued exactly once.
+    // 并以隐形阻塞模态留在 popup 栈中。现在只要请求活动，
+    // 模态框每帧都 Begin；OpenPopup 只发一次。
     if (Ui().confirmOpenRequested) {
         if (!ImGui::IsPopupOpen("##confirm")) {
             ImGui::OpenPopup("##confirm");
@@ -327,15 +328,15 @@ void DrawConfirmDialogs() {
         }
         Ui().confirmOpenRequested = false;
     }
-    if (!Ui().confirmOpened) return;  // tree plan still pending
+    if (!Ui().confirmOpened) return;  // 树规划仍在途
 
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f, 0.0f), ImVec2(460.0f, FLT_MAX));
     if (!ImGui::BeginPopupModal("##confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        // Modal was open before but is gone now: dismissed with Esc (the only
-        // dismiss path outside the buttons). Clear the request — never leave a
-        // stale request or a zombie invisible modal behind.
+        // 模态框之前开着但现在没了：被 Esc 关闭（按钮之外的
+        // 唯一关闭路径）。清除请求——绝不留下过期请求
+        // 或僵尸隐形模态。
         if (!ImGui::IsPopupOpen("##confirm") && !Ui().confirmOpenRequested) CloseConfirm();
         g_dialogAutotest.modalOpen = false;
         g_dialogAutotest.framesOpen = 0;
@@ -343,8 +344,8 @@ void DrawConfirmDialogs() {
     }
     g_dialogAutotest.modalOpen = true;
     ++g_dialogAutotest.framesOpen;
-    // P2 (V14): the tree plan lands asynchronously — show an honest progress line
-    // instead of an empty dialog, and keep the action disabled until it arrives.
+    // P2（V14）：树规划异步到达——显示诚实的进度行而不是
+    // 空对话框，并在其到达前保持动作禁用。
     const bool planPending = req.kind == ui::ConfirmKind::KillTree && req.planCount &&
                              req.planCount->load() < 0;
 
@@ -357,7 +358,7 @@ void DrawConfirmDialogs() {
         case ui::ConfirmKind::PurgeStandby: title = L"确认清理待机列表"; action = L"清理待机列表"; break;
         case ui::ConfirmKind::Suspend: title = L"确认挂起进程"; action = L"挂起进程"; break;
         case ui::ConfirmKind::SetPriority: title = L"调整进程优先级"; action = L"应用"; break;
-        case ui::ConfirmKind::MemCleanup: title = L"一键优化内存"; action = L"开始优化"; break;
+        case ui::ConfirmKind::MemCleanup: title = L"内存加速"; action = L"开始优化"; break;
         case ui::ConfirmKind::CloseAsk: title = L"关闭超级任务管理器"; action = L"退出程序"; break;
         default: break;
     }
@@ -369,7 +370,7 @@ void DrawConfirmDialogs() {
     switch (req.kind) {
         case ui::ConfirmKind::Kill:
             ImGui::TextUnformatted(U8(Fmt(L"目标：{} (PID {})", req.name, req.pid)));
-            // P2 (V14): long image paths overflow the 460px modal — wrap them.
+            // P2（V14）：过长映像路径会溢出 460px 模态框——换行显示。
             ImGui::TextWrapped("%s",
                                U8(Fmt(L"路径：{}", req.path.empty() ? std::wstring(L"—") : req.path)));
             if (req.serviceHost) {
@@ -385,9 +386,9 @@ void DrawConfirmDialogs() {
             } else {
                 int planned = -1;
                 if (req.planCount) planned = req.planCount->load();
-                // PlanTerminateTree returns descendants only; TreeResult.planned
-                // includes the root, so display planned + 1 (target included) to
-                // match that count.
+                // PlanTerminateTree 只返回后代；TreeResult.planned
+                // 含根，因此显示 planned + 1（含目标）以
+                // 与该数目一致。
                 ImGui::TextUnformatted(
                     U8(Fmt(L"预计终止 {} 个（含目标进程，执行时可能变化）", planned + 1)));
             }
@@ -535,9 +536,9 @@ void DrawConfirmDialogs() {
             if (std::shared_ptr<AppContext> app = Ui().liveCtx; app && app->mainHwnd) {
                 ShowWindow(static_cast<HWND>(app->mainHwnd), SW_HIDE);  // 托盘已有恢复逻辑
             }
-            // V18-P2-1: a second X click while this dialog was open re-sets the
-            // pending flag; after minimize the hidden window would otherwise re-open
-            // the dialog invisibly.
+            // V18-P2-1：本对话框打开期间再次点击 X 会重设待决标志；
+            // 最小化后隐藏窗口否则会隐形地重新打开
+            // 该对话框。
             if (std::shared_ptr<AppContext> app = Ui().liveCtx) {
                 app->closeAskPending.store(false);
             }
@@ -547,7 +548,7 @@ void DrawConfirmDialogs() {
         ImGui::SameLine();
         if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
             if (std::shared_ptr<AppContext> app = Ui().liveCtx) {
-                app->closeAskPending.store(false);  // V18-P2-1: same lingering-pending guard
+                app->closeAskPending.store(false);  // V18-P2-1：同样的残留待决防护
             }
             CloseConfirm();  // 不写 cfg：保持当前行为（默认每次询问）
             ImGui::CloseCurrentPopup();
@@ -561,15 +562,15 @@ void DrawConfirmDialogs() {
         return;
     }
 
-    // V8-P1-2: keyboard focus lands on CANCEL (not the destructive action), and the
-    // action button is removed from keyboard nav entirely, so Space/Enter in the
-    // freshly opened modal can never fire a terminate.
-    // Bug F1 fix (2026-09): SetKeyboardFocusHere must run ONCE when the modal
-    // appears. Issuing it every frame re-submits a nav move targeting the cancel
-    // button, and NavMoveRequestApplyResult() (imgui.cpp) calls ClearActiveID()
-    // whenever the mouse-held button is not the nav target — the mouse capture of
-    // the action button is stolen between mouse-down and mouse-up, silently eating
-    // every confirm click (same root cause as the phase-3 startup dialog).
+    // V8-P1-2：键盘焦点落在取消（而非破坏性动作）上，且动作按钮
+    // 完全移出键盘导航，因此新开模态框里的 Space/Enter
+    // 绝不可能触发终止。
+    // Bug F1 修复（2026-09）：SetKeyboardFocusHere 必须在模态框出现时
+    // 只运行一次。每帧都发会重复提交指向取消按钮的导航移动，
+    // 而 NavMoveRequestApplyResult()（imgui.cpp）在鼠标按住的按钮
+    // 不是导航目标时调用 ClearActiveID()——动作按钮的鼠标捕获
+    // 在按下与抬起之间被抢走，静默吞掉
+    // 每一次确认点击（与第 3 阶段启动对话框同根因）。
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(0);
     if (ImGui::Button(U8(L"取消"), ImVec2(120.0f, 0.0f))) {
         CloseConfirm();
@@ -593,8 +594,8 @@ void DrawConfirmDialogs() {
     g_dialogAutotest.actionMaxX = btnMax.x;
     g_dialogAutotest.actionMaxY = btnMax.y;
     if (actionPressed) {
-        // ExecuteConfirmedAction posts a JobFailed note itself when the queue
-        // refuses the job — the toast pipeline reports it either way.
+        // 队列拒绝任务时 ExecuteConfirmedAction 会自行投递 JobFailed
+        // 通知——无论哪种情况 toast 管线都会上报。
         ui::ExecuteConfirmedAction(Ui().liveCtx, req);
         CloseConfirm();
         ImGui::CloseCurrentPopup();
@@ -603,8 +604,8 @@ void DrawConfirmDialogs() {
 }
 
 // ===========================================================================
-// Performance history: ring buffers of the last 120 collection ticks, appended
-// in the shell (single ingestion point) when the tick id changes.
+// 性能历史：最近 120 个采集 tick 的环形缓冲，在 tick id 变化时
+// 于外壳中追加（单一摄取点）。
 // ===========================================================================
 
 constexpr int kHistCap = 120;
@@ -643,7 +644,7 @@ PerfHistory& Hist() {
 
 void AppendHistory(const Snapshot& s) {
     PerfHistory& h = Hist();
-    if (s.tickId == 0 || s.tickId == h.lastTick) return;  // initial empty / same tick
+    if (s.tickId == 0 || s.tickId == h.lastTick) return;  // 初始为空 / 同一 tick
     h.lastTick = s.tickId;
     // F4#7: 性能 CSV 记录与环形历史共用摄取点（每 tick 一行，1 Hz 小写入）。
     // V15-P1: 写入失败（磁盘满等）→ 记录器已自动停止，这里如实 toast（含路径），
@@ -653,7 +654,7 @@ void AppendHistory(const Snapshot& s) {
         PushToast(Notification::Kind::JobFailed,
                   Fmt(L"性能 CSV 记录已自动停止——磁盘写入失败：{}", failedPath));
     }
-    h.cpuTotal.Push(static_cast<float>(s.sys.cpuTotalPercent));      // NaN ok: rendered skipped
+    h.cpuTotal.Push(static_cast<float>(s.sys.cpuTotalPercent));      // NaN 可：渲染时跳过
     h.physAvail.Push(static_cast<float>(s.sys.physAvail));
     h.commit.Push(static_cast<float>(s.sys.commitTotal));
     h.diskRead.Push(static_cast<float>(s.sys.diskReadBps));
@@ -677,7 +678,7 @@ void AppendHistory(const Snapshot& s) {
 
     const size_t n = s.sys.perCorePercent.size();
     if (n > 0 && h.cores.size() != n) {
-        // Core count discovery (or a rare hot-change): (re)allocate, history restarts.
+        // 核心数发现（或罕见热变更）：（重新）分配，历史重启。
         h.cores.assign(n, Ring{});
     }
     for (size_t i = 0; i < h.cores.size() && i < n; ++i) {
@@ -686,11 +687,11 @@ void AppendHistory(const Snapshot& s) {
 }
 
 // ===========================================================================
-// ProcessesPage: full table per arch section 8 + fixed-width detail panel.
+// ProcessesPage：按架构第 8 节的完整表格 + 固定宽度详情面板。
 // ===========================================================================
 
 const ProcInfo* FindByPid(const Snapshot& snap, uint32_t pid) {
-    // Snapshot procs are ascending by pid (contract); binary search + createTime verify.
+    // 快照进程按 pid 升序（契约）；二分查找 + createTime 校验。
     size_t lo = 0, hi = snap.procs.size();
     while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
@@ -704,8 +705,8 @@ const ProcInfo* FindByPid(const Snapshot& snap, uint32_t pid) {
     return nullptr;
 }
 
-// Detail-kind bit set fetched whenever the selection changes (F4: includes the
-// module list — collected by DetailsProvider but never requested/rendered before).
+// 选择变化时抓取详情类别位集（F4：含模块列表——DetailsProvider
+// 会采集但此前从未请求/渲染）。
 constexpr uint32_t kDetailKinds =
     static_cast<uint32_t>(ops::DetailKind::Signature) | static_cast<uint32_t>(ops::DetailKind::CmdLine) |
     static_cast<uint32_t>(ops::DetailKind::UserInfo) | static_cast<uint32_t>(ops::DetailKind::GuiObjects) |
@@ -717,8 +718,8 @@ public:
     const wchar_t* Title() const override { return L"进程"; }
 
     void Draw(AppContext& ctx) override {
-        const std::shared_ptr<const Snapshot>& snap = Ui().snap;  // shell-read, never null
-        metaBudget_ = 3;  // per-frame cap for new GetFileVersionInfoW queries
+        const std::shared_ptr<const Snapshot>& snap = Ui().snap;  // 外壳已读，绝不为 null
+        metaBudget_ = 3;  // 每帧新 GetFileVersionInfoW 查询的上限
         LoadPersistedOnce(ctx);
         // H-A: 外壳「外观→恢复默认列宽」置位世代号后，这里把 widths_ 拉回默认；
         // 表格 id 同步换代（DrawTable），ImGui 内部按 id 记忆的旧列宽随之丢弃。
@@ -767,7 +768,7 @@ public:
     }
 
 private:
-    // ---- persistence ------------------------------------------------------
+    // ---- 持久化 -----------------------------------------------------------
     void LoadPersistedOnce(AppContext& ctx) {
         if (loaded_) return;
         loaded_ = true;
@@ -785,11 +786,11 @@ private:
             Ui().selectedKey = selected_;
             Ui().selectedValid = true;
         }
-        ctx.cfg.SetInt(L"selPid", 0);  // one-shot: never persist a stale selection
+        ctx.cfg.SetInt(L"selPid", 0);  // 一次性：绝不持久化过期选择
         ctx.cfg.SetInt(L"selCreateTime", 0);
 
-        // Name/description are stretch columns (value = weight); the rest are fixed
-        // pixel widths. Persist both flavors in the same slot, keyed per column.
+        // 名称/描述是拉伸列（值=权重）；其余为固定像素宽。
+        // 两种形态存在同一槽位，按列区分。
         for (int i = 0; i <= static_cast<int>(ui::SortColumn::CtxSwitches); ++i) {
             widths_[i] = static_cast<float>(ctx.cfg.GetDouble(
                 std::wstring(L"colW_") + ui::SortColumnId(static_cast<ui::SortColumn>(i)),
@@ -797,9 +798,9 @@ private:
         }
         widths_[11] = static_cast<float>(ctx.cfg.GetDouble(L"colW_badges", kDefaultWidths[11]));
         widths_[12] = static_cast<float>(ctx.cfg.GetDouble(L"colW_desc", kDefaultWidths[12]));
-        // P0-2 (F2 review): the description (and name) slots hold STRETCH WEIGHTS.
-        // Older builds persisted pixels (hundreds) into these slots, collapsing the
-        // name column on every start; any legacy value > 10 cannot be a weight.
+        // P0-2（F2 评审）：描述（与名称）槽位存的是拉伸权重。
+        // 旧构建曾把像素（数百）存进这些槽位，导致名称列每次启动
+        // 都被压扁；任何 > 10 的旧值都不可能是权重。
         constexpr float kMaxPlausibleWeight = 10.0f;
         if (widths_[0] > kMaxPlausibleWeight || widths_[0] <= 0.0f) widths_[0] = kDefaultWidths[0];
         if (widths_[12] > kMaxPlausibleWeight || widths_[12] <= 0.0f) widths_[12] = kDefaultWidths[12];
@@ -816,8 +817,8 @@ private:
     }
 
     void PersistWidths(AppContext& ctx) {
-        // Called at most ~1 Hz from inside the table; cheap key/value writes only
-        // (the file itself is saved by main on exit).
+        // 表格内至多约 1Hz 调用；只做廉价键值写
+        //（文件本身由 main 在退出时保存）。
         // H-A 登记：本函数写入的 colW_* 键清单以 ui3::ColWidthCfgKeys()
         // （app/ui3/ThemeCfg.h）为准并一一对应 —— 0..10 = "colW_"+SortColumnId
         // （含 colW_name），另加 colW_badges、colW_desc。「外观→恢复默认列宽」
@@ -839,22 +840,22 @@ private:
             save(i, std::wstring(L"colW_") + ui::SortColumnId(static_cast<ui::SortColumn>(i)), false);
         }
         save(11, L"colW_badges", false);
-        // P0-2 (F2 review): the description column is WidthStretch — persist its
-        // stretch WEIGHT (the old code wrote WidthGiven pixels into the weight slot,
-        // collapsing the name column on every subsequent start).
+        // P0-2（F2 评审）：描述列是 WidthStretch——持久化其拉伸
+        // 权重（旧代码把 WidthGiven 的像素写进权重槽位，
+        // 导致之后每次启动名称列都被压扁）。
         save(12, L"colW_desc", true);
-        save(0, L"colW_name", true);  // stretch weight for the name column
+        save(0, L"colW_name", true);  // 名称列的拉伸权重
         if (changed) lastWidthSave_ = ImGui::GetTime();
     }
 
-    // ---- selection ---------------------------------------------------------
+    // ---- 选择 -------------------------------------------------------------
     void Select(const ProcInfo& p) {
         if (selectedValid_ && p.key == selected_ && !lost_) return;
         selected_ = p.key;
         selectedValid_ = true;
         lost_ = false;
         lastKnown_ = p;
-        detailKey_ = ProcKey{};  // force a details re-request
+        detailKey_ = ProcKey{};  // 强制重新请求详情
         Ui().selectedKey = selected_;
         Ui().selectedValid = true;
     }
@@ -870,10 +871,10 @@ private:
         }
     }
 
-    // ---- filtering / sorting -----------------------------------------------
+    // ---- 过滤 / 排序 ------------------------------------------------------
     void UpdateFilter() {
-        // Lowercase the needle once here; ContainsLower lowercases the haystack per
-        // row. Matching is case-insensitive for ASCII ("Chrome" matches chrome.exe).
+        // 在此把搜索词小写一次；ContainsLower 按行小写化干草堆。
+        // ASCII 匹配大小写不敏感（"Chrome" 匹配 chrome.exe）。
         std::wstring needle = Utf8ToWide(filterUtf8_);
         std::transform(needle.begin(), needle.end(), needle.begin(),
                        [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
@@ -974,7 +975,7 @@ private:
         ImGui::TextDisabled("%s", U8(Fmt(L"模式：{}", ui3::SysDistModeLabel(sysDistMode_))));
     }
 
-    // ---- toolbar ------------------------------------------------------------
+    // ---- 工具栏 ------------------------------------------------------------
     void DrawToolbar(const Snapshot& snap) {
         char buf[256];
         snprintf(buf, sizeof(buf), "%s", filterUtf8_.c_str());
@@ -1028,7 +1029,7 @@ private:
         ImGui::TextDisabled("%s", U8(Fmt(L"{} / {} 个进程", rows_.size(), snap.procs.size())));
     }
 
-    // ---- table ---------------------------------------------------------------
+    // ---- 表格 ---------------------------------------------------------------
     void DrawTable(AppContext& ctx, const Snapshot& snap) {
         if (snap.procs.empty()) {
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"等待采集数据…"));
@@ -1057,7 +1058,7 @@ private:
             if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
                 if (specs->SpecsDirty) {
                     if (specs->SpecsCount > 0 && specs->Specs[0].ColumnIndex < static_cast<int>(ui::SortColumn::Count)) {
-                        // The sort key changes ONLY on a header click by the user.
+                        // 排序键只在用户点击表头时变化。
                         sortColumn_ = static_cast<ui::SortColumn>(specs->Specs[0].ColumnIndex);
                         sortDesc_ = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
                         Ui().sortColumn = sortColumn_;
@@ -1131,14 +1132,14 @@ private:
     }
 
     void DrawRow(AppContext& ctx, const ProcInfo& p, int depth, ui3::ProcKind kind) {
-        // P2-11 (F2 review): identify rows by the stable ProcKey (pid + createTime),
-        // not a display index — a refresh that reorders rows mid-interaction must
-        // never retarget an open context menu / tooltip to a different process.
+        // P2-11（F2 评审）：用稳定的 ProcKey（pid + createTime）标识行，
+        // 而非显示索引——交互中途刷新导致的行重排绝不能把
+        // 已打开的右键菜单/提示重定向到另一个进程。
         ImGui::PushID(static_cast<int>(p.key.pid));
         ImGui::PushID(static_cast<int>(p.key.createTime & 0x7fffffff));
         ImGui::TableNextRow();
 
-        // Name + row interaction (selection, double click, context menu).
+        // 名称 + 行交互（选择、双击、右键菜单）。
         ImGui::TableNextColumn();
         // F4#4: 树形模式名称列缩进 depth*12px + 「└」连接符（根行无缩进）。
         if (depth > 0) {
@@ -1196,8 +1197,8 @@ private:
             ImGui::SameLine();
         };
         badge(PF_Elevated, "A", ThemeAccent::Warn);    // 管理员提权
-        badge(PF_Uwp, "U", ThemeAccent::Info);         // UWP
-        badge(PF_Wow64, "W", ThemeAccent::Done);       // WOW64
+        badge(PF_Uwp, "U", ThemeAccent::Info);         // UWP（通用 Windows 应用）
+        badge(PF_Wow64, "W", ThemeAccent::Done);       // WOW64（32 位兼容）
         if ((p.flags & PF_ServiceHost) != 0) {
             // F4#3: 服务宿主徽标 tooltip 列出宿主服务名（jobs 缓存，见 GcPages）。
             ImGui::TextColored(AccentCol(ThemeAccent::Purple), "S");
@@ -1257,7 +1258,7 @@ private:
         ImGui::BeginDisabled(protectedProc);
         if (ImGui::MenuItem(U8(L"终止进程"))) RequestConfirmKill(p);
         if (ImGui::MenuItem(U8(L"终止进程树"))) RequestTreePlan(p);
-        // V8-P1-1: trim is a destructive op too — same gate as the terminate items.
+        // V8-P1-1：清理工作集也是破坏性操作——与终止项同一闸门。
         if (ImGui::MenuItem(U8(L"释放工作集"))) RequestConfirmTrim(p);
         ImGui::Separator();
         // F4#2: 挂起/恢复 + 优先级 + 亲和性。保护名单进程全部禁用
@@ -1351,7 +1352,7 @@ private:
         ShellExecuteW(nullptr, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
     }
 
-    // ---- detail panel ---------------------------------------------------------
+    // ---- 详情面板 -------------------------------------------------------------
     void DrawDetailPanel(AppContext& ctx, const Snapshot& snap) {
         if (!selectedValid_) {
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"选择一个进程查看详情"));
@@ -1369,7 +1370,7 @@ private:
         }
         ImGui::Separator();
 
-        // Per-process details arrive async via DetailsProvider (ops JobQueue).
+        // 每进程详情经 DetailsProvider（ops JobQueue）异步到达。
         if (alive) MaybeRequestDetails(ctx, *cur);
 
         ImGui::BeginChild("##detailscroll", ImVec2(0.0f, ImGui::GetContentRegionAvail().y));
@@ -1395,7 +1396,7 @@ private:
         field(L"用户名", alive ? DrawUserNameField(ctx, p) : std::wstring(L"—"));
         field(L"GDI / USER 对象", alive ? DrawGuiObjectsField(ctx, p) : std::wstring(L"—"));
 
-        // Parent process: show name and allow jumping (by ProcKey in this snapshot).
+        // 父进程：显示名称并允许跳转（按本快照中的 ProcKey）。
         const ProcInfo* parent = p.parentPid != 0 ? FindByPid(snap, p.parentPid) : nullptr;
         ImGui::TextDisabled("%s", U8(L"父进程"));
         ImGui::SameLine(110.0f);
@@ -1405,7 +1406,7 @@ private:
                 selected_ = parent->key;
                 lost_ = false;
                 lastKnown_ = *parent;
-                detailKey_ = ProcKey{};  // re-request details for the new selection
+                detailKey_ = ProcKey{};  // 为新选择重新请求详情
                 Ui().selectedKey = selected_;
             }
         } else {
@@ -1424,14 +1425,14 @@ private:
         std::mutex mu;
         bool ready = false;
         bool ok = false;
-        double requestedAt = 0.0;  // ImGui::GetTime() of last request (staleness)
+        double requestedAt = 0.0;  // 上次请求的 ImGui::GetTime()（判断过期）
         ops::ProcessControlInfo info;
         std::wstring err;
     };
 
-    // Returns a COPY under the slot lock (the worker may refresh the slot while
-    // this frame renders — never hand out a pointer into the shared cell).
-    // V15-P2-2: tri-state query result — Pending (job in flight), Ready (values
+    // 在槽位锁下返回副本（本帧渲染期间工作线程可能刷新槽位
+    // ——绝不交出指向共享单元的指针）。
+    // V15-P2-2：三态查询结果——Pending（任务在途）、Ready（有值）
     // valid), Failed (ops reported honestly via err, e.g. 无读取权限). The UI must
     // never render a fake "未知（类 0x0）" for a failed query.
     enum class CtrlQuery { Pending, Ready, Failed };
@@ -1492,8 +1493,8 @@ private:
         ctrlPending_ = slot;
     }
 
-    // Polls the in-flight control-info query (single slot) — keeps the map clean
-    // and resets the single-flight flag once the job lands.
+    // 轮询在途的控制信息查询（单槽位）——保持映射干净，
+    // 并在任务落地后复位单飞标志。
     void PollCtrlInfo() {
         if (!ctrlPending_) return;
         std::lock_guard<std::mutex> lock(ctrlPending_->mu);
@@ -1565,7 +1566,7 @@ private:
     }
 
     void DrawAffinityModal(AppContext& ctx) {
-        (void)ctx;  // submission goes through Ui().liveCtx (ExecuteConfirmedAction)
+        (void)ctx;  // 提交经 Ui().liveCtx 走（ExecuteConfirmedAction）
         if (!aff_.openRequested && !ImGui::IsPopupOpen("##affinity")) return;
         constexpr char kPopup[] = "##affinity";
         if (aff_.openRequested) {
@@ -1684,7 +1685,7 @@ private:
         const wchar_t* text = L"查询中…";
         ImVec4 color(0.6f, 0.6f, 0.6f, 1.0f);
         if (!alive) {
-            // P2-2 (F2 review): an exited process is never queried — showing
+            // P2-2（F2 评审）：已退出的进程绝不查询——
             // "查询中…" forever would be dishonest.
             text = L"已退出，无法查询";
             color = ColWarn();
@@ -1740,9 +1741,9 @@ private:
         return L"—";
     }
 
-    // ---- F4: module list -------------------------------------------------------
-    // Signature verification runs on the ops worker; results are cached per module
-    // path (DriverPage slot pattern). -1 = in flight, else ops::SigState as int.
+    // ---- F4：模块列表 ---------------------------------------------------------
+    // 签名验证在 ops 工作线程运行；结果按模块路径缓存
+    //（DriverPage 槽位模式）。-1 = 在途，否则为 int 形式的 ops::SigState。
     void EnsureModuleSig(const std::wstring& path) {
         if (path.empty()) return;
         auto it = moduleSigs_.find(path);
@@ -1753,14 +1754,14 @@ private:
         if (!app || app->jobs.Submit([app, slot, path] {
                 slot->store(static_cast<int>(ops::VerifyFileSignature(path)));
             }) == 0) {
-            moduleSigs_.erase(path);  // queue down (teardown): keep the row honest
+            moduleSigs_.erase(path);  // 队列已停（拆除中）：保持该行诚实
         }
     }
 
     void DrawModulesSection(AppContext& ctx, const ProcInfo& p, bool alive) {
-        if (!alive) return;  // P2-2: dead process — nothing honest to list here
+        if (!alive) return;  // P2-2：进程已死——这里没有可诚实列出的东西
         const ops::ProcessDetails* d = ctx.details->Peek(p.key);
-        const bool entryDone = d != nullptr && d->sigResolved;  // job completed overall
+        const bool entryDone = d != nullptr && d->sigResolved;  // 任务整体完成
         const bool resolved = d != nullptr && d->modulesResolved;
         const ui::ModuleSectionState state =
             ui::DecideModuleSection(entryDone, resolved, ctx.elevated,
@@ -1784,7 +1785,7 @@ private:
             if (ImGui::IsItemHovered() && shown.size() > 90) {
                 ImGui::SetTooltip("%s", U8(mod));
             }
-            // badge column
+            // 徽标列
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60.0f);
             auto it = moduleSigs_.find(mod);
             const ui::ModuleBadge badge =
@@ -1807,25 +1808,25 @@ private:
         ImGui::EndChild();
     }
 
-    // ---- state ----------------------------------------------------------------
+    // ---- 状态 ----------------------------------------------------------------
     static constexpr int kColCount = static_cast<int>(ui::SortColumn::Count) + 2;
 
-    // Fixed columns: pixel widths. Name (index 0) and description (index 12) are
-    // stretch columns, so their slot holds the stretch weight instead.
+    // 固定列：像素宽。名称（索引 0）与描述（索引 12）是拉伸列，
+    // 其槽位存拉伸权重。
     static constexpr float kDefaultWidths[kColCount] = {
-        2.0f,    // name (stretch weight)
+        2.0f,    // 名称（拉伸权重）
         64.0f,   // pid
         72.0f,   // cpu
-        110.0f,  // mem (private working set)
+        110.0f,  // 内存（私有工作集）
         96.0f,   // commit
         100.0f,  // disk
         100.0f,  // net
-        96.0f,   // hard faults
+        96.0f,   // 硬缺页
         72.0f,   // handles
         72.0f,   // threads
-        104.0f,  // context switches
+        104.0f,  // 上下文切换
         96.0f,   // badges
-        0.6f,    // description (stretch weight)
+        0.6f,    // 描述（拉伸权重）
     };
 
     bool loaded_ = false;
@@ -1833,7 +1834,7 @@ private:
     bool rebuildNeeded_ = true;
     ui::SortColumn sortColumn_ = ui::SortColumn::Name;
     bool sortDesc_ = false;
-    float widths_[kColCount] = {};  // fixed: px width; stretch: weight
+    float widths_[kColCount] = {};  // 固定：像素宽；拉伸：权重
     double lastWidthSave_ = 0.0;
     uint64_t appliedResetGen_ = 0;  // H-A: 已应用的「恢复默认列宽」世代号
 
@@ -1845,11 +1846,11 @@ private:
     ProcKey selected_{};
     bool selectedValid_ = false;
     bool lost_ = false;
-    ProcInfo lastKnown_{};  // frozen copy shown when the process exits
+    ProcInfo lastKnown_{};  // 进程退出后展示的冻结副本
     ProcKey detailKey_{};
     uint64_t lastDetailTick_ = 0;
     int metaBudget_ = 3;
-    // F4: per-module-path signature verification cache (ops worker results).
+    // F4：按模块路径的签名验证缓存（ops 工作线程结果）。
     std::unordered_map<std::wstring, std::shared_ptr<std::atomic<int>>> moduleSigs_;
 
     // F4#1/#4: 系统进程区分模式（0 关 / 1 高亮 / 2 只看用户）与树形视图开关。
@@ -1868,11 +1869,11 @@ private:
 };
 
 // ===========================================================================
-// PerfPage: four ImPlot quadrants (CPU / memory / disk / network), 120 ticks.
+// PerfPage：四个 ImPlot 象限（CPU/内存/磁盘/网络），120 个 tick。
 // ===========================================================================
 
 int FmtBytesAxis(double value, char* buff, int size, void* /*user_data*/) {
-    if (value != value) {  // NaN
+    if (value != value) {  // NaN（无效值）
         return snprintf(buff, static_cast<size_t>(size), "%s", "—");
     }
     const std::string s = WideToUtf8(FormatBytes(value <= 0.0 ? 0u : static_cast<uint64_t>(value)));
@@ -1884,7 +1885,7 @@ void PlotRing(const char* label, const Ring& r, bool noLegend) {
     ImPlotSpec spec;
     spec.Offset = r.Offset();
     if (noLegend) spec.Flags = ImPlotItemFlags_NoLegend;
-    // values-only overload: x = i * xscale, ring offset maps newest sample to the right.
+    // 仅数值重载：x = i * xscale，环形偏移把最新样本映射到右侧。
     ImPlot::PlotLine(label, r.v.data(), r.Count(), 1.0, 0.0, spec);
 }
 
@@ -1894,6 +1895,11 @@ public:
     const wchar_t* Title() const override { return L"性能"; }
 
     void Draw(AppContext& ctx) override {
+        // V19: 顶部固定操作行（图表区上方）——「内存加速…」+ 内存占用速览。
+        // 用户报告「内存加速的我目前也没看到」：原入口绘制在全部图表块之后，
+        // 位于首屏折叠区以下、需滚动才能看到，且受图表显隐复选框影响布局。
+        // 该行不受 lastTick 早退与图表显隐影响，切到「性能」页首屏即可见。
+        DrawMemQuickActionRow(Ui().snap ? Ui().snap->sys : SystemInfo{});
         const PerfHistory& h = Hist();
         if (h.lastTick == 0) {
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"等待采集数据…"));
@@ -1949,7 +1955,7 @@ public:
 
         const SystemInfo& sys = Ui().snap ? Ui().snap->sys : SystemInfo{};
         DrawMemoryBars(sys);
-        ui3::DrawAlertControls(ctx);  // phase-3: threshold alert controls (additive row)
+        ui3::DrawAlertControls(ctx);  // 第 3 阶段：阈值告警控件（增量行）
         DrawCsvControls(ctx, sys);    // F4#7: 性能 CSV 记录开关
     }
 
@@ -2108,6 +2114,25 @@ private:
         }
     }
 
+    // V19: 性能页顶部固定操作行 ——「内存加速…」入口 + 当前内存占用速览
+    // （已用/总量）。复用 RequestConfirmMemCleanup（DrawConfirmDialogs 的
+    // MemCleanup kind -> ExecuteConfirmedAction），不新建执行路径。
+    static void DrawMemQuickActionRow(const SystemInfo& sys) {
+        if (ImGui::Button(U8(L"内存加速…"))) RequestConfirmMemCleanup();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "%s", U8(L"按当前私有工作集挑选高占用进程（默认勾选前 5），批量提示系统"
+                          L"释放工作集内存（估计值，被换出的页再次访问有缺页代价）；"
+                          L"可同时清理系统待机缓存。系统关键进程不可选。"));
+        }
+        if (sys.physTotal > 0) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(U8(Fmt(L"内存占用：{} / {}",
+                                          FormatBytes(sys.physTotal - sys.physAvail),
+                                          FormatBytes(sys.physTotal))));
+        }
+    }
+
     static void DrawMemoryBars(const SystemInfo& sys) {
         char overlay[64];
         if (sys.physTotal > 0) {
@@ -2131,25 +2156,27 @@ private:
             ImGui::SameLine();
             ImGui::TextDisabled("%s", U8(L"提交"));
         }
-        // P3 任务一：「一键优化」入口 —— 打开 MemCleanup 确认模态
-        // （DrawConfirmDialogs 的 MemCleanup kind，每帧渲染模式）。
-        if (ImGui::Button(U8(L"一键优化…"))) RequestConfirmMemCleanup();
+        // 「内存加速」入口（原「一键优化」，V19 文案统一）—— 打开 MemCleanup
+        // 确认模态（DrawConfirmDialogs 的 MemCleanup kind，每帧渲染模式）。
+        // 顶部固定操作行已有同名入口；此处保留块内就近入口。
+        if (ImGui::Button(U8(L"内存加速…"))) RequestConfirmMemCleanup();
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
                 "%s", U8(L"按当前私有工作集挑选高占用进程（默认勾选前 5），批量提示系统释放"
-                          L"工作集内存；可同时清理系统待机缓存。系统关键进程不可选。"));
+                          L"工作集内存（估计值，再次访问被换出的页有缺页代价）；可同时清理"
+                          L"系统待机缓存。系统关键进程不可选。"));
         }
     }
 
     // P1-5 (F2 review): GPU block. P3 任务二起标题栏复选框在网格单元里，
     // 这里只剩内容体（GPU 表格 + 进程 Top5）。数据每 2 s 产出一批。
     static std::wstring GpuUtilText(double v) {
-        return v == v ? Fmt(L"{:.1f}%", v) : std::wstring(L"—");  // NaN = unavailable
+        return v == v ? Fmt(L"{:.1f}%", v) : std::wstring(L"—");  // NaN = 不可得
     }
 
-    // Aggregates the (luid, pid) rows per pid: utilization summed and clamped to
-    // 100, memory summed; rows whose utilization is unavailable still contribute
-    // their memory. Returns at most `top` entries, highest utilization first.
+    // 按 pid 聚合 (luid, pid) 行：利用率求和并钳制到 100，
+    // 内存求和；利用率不可得的行仍贡献其内存。
+    // 至多返回 `top` 条，利用率最高在前。
     struct GpuProcRow {
         const ProcInfo* proc = nullptr;
         double utilPercent = kUnavail;
@@ -2188,7 +2215,7 @@ private:
 
     static void DrawGpuBlockBody(const Snapshot& snap) {
         if (snap.sys.gpus.empty()) {
-            // honest empty state: first tick not in yet, or no adapters present
+            // 诚实的空态：首个 tick 未到，或没有适配器
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s",
                                U8(L"暂无 GPU 数据（等待采集，或本机无适配器）"));
             return;
@@ -2254,16 +2281,16 @@ private:
 };
 
 // ===========================================================================
-// Shell: toolbar / tabs / status bar.
+// 外壳：工具栏/标签/状态栏。
 // ===========================================================================
 
 void DrainNotifications(AppContext& ctx) {
     std::vector<Notification> out;
     ctx.notes.Drain(&out);
     for (const Notification& n : out) {
-        // P2-1 (F2 review): details-provider notes fire on every row selection —
-        // high-frequency noise. They update the status bar only; toasts are
-        // reserved for destructive/observable ops.
+        // P2-1（F2 评审）：详情提供者通知在每次行选择时都会触发——
+        // 高频噪音。它们只更新状态栏；toast 保留给
+        // 破坏性/可观察的操作。
         const bool detailsNoise = n.text.rfind(L"进程详情", 0) == 0 ||
                                   n.text.rfind(L"进程签名", 0) == 0 ||
                                   n.text.rfind(L"无法读取进程详情", 0) == 0;
@@ -2354,11 +2381,80 @@ void DrawAppearancePanel(AppContext& ctx) {
     ImGui::TextColored(ColWarn(), "%s", U8(ui::WallpaperPerfNotice()));
 }
 
+// F4#10: 全局热键 Ctrl+Alt+M 的统一开关路径（R-Fix Bug1 起状态栏复选框与窄窗
+// 「⋮」菜单项共用）。注册/反注册在主线程完成；失败不落 cfg（下一帧按持久状态
+// 回显的诚实状态机），只弹失败 toast。
+void ApplyHotkeyEnabled(AppContext& ctx, bool on) {
+    std::wstring err;
+    if (ui3::GcHotkeySetEnabled(on, &err)) {
+        ctx.cfg.SetBool(L"hotkeyEnabled", on);
+        PushToast(Notification::Kind::Info,
+                  on ? L"已注册全局热键 Ctrl+Alt+M（呼出/隐藏主窗）" : L"已注销全局热键");
+    } else {
+        PushToast(Notification::Kind::JobFailed, err);
+    }
+}
+
+// R-Fix Bug1: 「外观」菜单体（主题三态 + 恢复默认列宽 + 自定义壁纸控件组）。
+// 抽成函数是因为窄窗（<900px）下它折叠进「⋮」溢出菜单、宽窗直接叫「外观」——
+// 两种形态共用同一菜单体，只差入口标签与（仅窄窗时）置顶的全局热键开关项。
+void DrawAppearanceMenuBody(AppContext& ctx, bool narrow) {
+    if (narrow) {
+        // 窄窗下状态栏的全局热键复选框会被 LayoutHeaderRight 优先级隐藏
+        // （次要项先藏），「⋮」里保留等价开关项保证功能仍可达。
+        bool hotkey = ctx.cfg.GetBool(L"hotkeyEnabled", false);
+        if (ImGui::MenuItem(U8(L"全局热键 Ctrl+Alt+M"), nullptr, hotkey)) {
+            ApplyHotkeyEnabled(ctx, !hotkey);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(L"注册 Ctrl+Alt+M 全局热键：任意前台应用下呼出/隐藏本工具"
+                                 L"（仅运行期有效，不写注册表）"));
+        }
+        ImGui::Separator();
+    }
+    const ThemeMode cur = ThemeModeFromInt(ctx.cfg.GetInt(L"themeMode", 0));
+    struct ModeItem { ThemeMode mode; const wchar_t* label; };
+    static const ModeItem kModes[] = {
+        {ThemeMode::Dark,   L"深色"},
+        {ThemeMode::Light,  L"浅色"},
+        {ThemeMode::System, L"跟随系统"},
+    };
+    for (const ModeItem& m : kModes) {
+        if (ImGui::MenuItem(U8(m.label), nullptr, m.mode == cur)) {
+            ctx.cfg.SetInt(L"themeMode", static_cast<int64_t>(m.mode));
+            Theme::Apply(m.mode);
+            PushToast(Notification::Kind::Info, Fmt(L"主题已切换：{}", m.label));
+        }
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem(U8(L"恢复默认列宽"))) {
+        // 键清单登记见 ui3::ColWidthCfgKeys()（app/ui3/ThemeCfg.h，与
+        // ProcessesPage::PersistWidths 写入一一对应）。
+        ui3::SoftDeleteColWidthKeys(ctx.cfg);
+        const int removed = ui3::StripColWidthKeysFromFile(ConfigPath(), false);
+        ++Ui().colWidthResetGen;  // 进程页下一帧重置 widths_ 并换代表格 id
+        PushToast(Notification::Kind::JobDone,
+                  removed < 0 ? Fmt(L"已恢复默认列宽（配置文件格式异常，重启后生效）")
+                              : Fmt(L"已恢复默认列宽（清除 {} 项自定义列宽）", removed));
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("%s", U8(L"自定义壁纸"));
+    DrawAppearancePanel(ctx);  // H-A(Phase-6): 选图/关闭/遮罩/性能提示
+}
+
 void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     (void)snap;
     const float barH = ImGui::GetFrameHeight() + 6.0f;
     ImGui::BeginChild("##toolbar", ImVec2(0.0f, barH), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar);
+    // R-Fix Bug1 结构化重构：工具条只保留动作项，自然流式排列（每项都是实测
+    // 宽度，无一处 SameLine(绝对偏移)）。「全局热键」开关、「管理员」徽标移到
+    // 底部状态栏（见 DrawStatusBar 右段）；「?」关于按钮仍在本条最右侧，用
+    // LayoutHeaderRight 纯函数按实测宽度定位（CalcTextSize+FramePadding 求和，
+    // 不写死像素）。窄窗（<900px）下次要项折叠：「外观」入口换成「⋮」溢出菜单
+    // （内含等价的全局热键开关项），主按钮保留。
+    const bool narrow = ImGui::GetWindowWidth() < 900.0f;
     int interval = static_cast<int>(ctx.cfg.GetInt(L"intervalMs", 1000));
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderInt(U8(L"刷新间隔"), &interval, 500, 5000, "%d ms")) {
@@ -2386,8 +2482,8 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     if (!ctx.elevated && ops::CanElevate()) {
         ImGui::SameLine();
         if (ImGui::Button(U8(L"以管理员身份重启"))) {
-            // ShellExecuteExW(runas) blocks on the UAC dialog: run it on the ops
-            // worker so the UI stays responsive while the prompt is up (phase-4 debt).
+            // ShellExecuteExW(runas) 会在 UAC 对话框上阻塞：放到 ops
+            // 工作线程上跑，提示框弹出期间 UI 保持响应（第 4 阶段债务）。
             SaveSessionFromCtx(ctx, nullptr);
             if (auto app = Ui().liveCtx) {
                 app->jobs.Submit([app] {
@@ -2405,79 +2501,51 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     }
     ImGui::SameLine();
     if (ImGui::Button(U8(L"清理待机缓存"))) RequestConfirmPurgeStandby();
-
-    // H-A: 「外观」菜单 —— 主题三态（即时 Apply + 写 cfg themeMode）与
-    // 「恢复默认列宽」（软删除 + config.json 剔除 colW_*，toast 反馈）。
+    // V19: 「内存加速…」与「清理待机缓存」并排 —— 任意页签下工具条常驻可达，
+    // 打开同一 MemCleanup 模态（用户报告性能页内入口不可见的兜底入口）。
     ImGui::SameLine();
-    if (ImGui::BeginMenu(U8(L"外观"))) {
-        const ThemeMode cur =
-            ThemeModeFromInt(ctx.cfg.GetInt(L"themeMode", 0));
-        struct ModeItem { ThemeMode mode; const wchar_t* label; };
-        static const ModeItem kModes[] = {
-            {ThemeMode::Dark,   L"深色"},
-            {ThemeMode::Light,  L"浅色"},
-            {ThemeMode::System, L"跟随系统"},
-        };
-        for (const ModeItem& m : kModes) {
-            if (ImGui::MenuItem(U8(m.label), nullptr, m.mode == cur)) {
-                ctx.cfg.SetInt(L"themeMode", static_cast<int64_t>(m.mode));
-                Theme::Apply(m.mode);
-                PushToast(Notification::Kind::Info, Fmt(L"主题已切换：{}", m.label));
-            }
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem(U8(L"恢复默认列宽"))) {
-            // 键清单登记见 ui3::ColWidthCfgKeys()（app/ui3/ThemeCfg.h，与
-            // ProcessesPage::PersistWidths 写入一一对应）。
-            ui3::SoftDeleteColWidthKeys(ctx.cfg);
-            const int removed = ui3::StripColWidthKeysFromFile(ConfigPath(), false);
-            ++Ui().colWidthResetGen;  // 进程页下一帧重置 widths_ 并换代表格 id
-            PushToast(Notification::Kind::JobDone,
-                      removed < 0 ? Fmt(L"已恢复默认列宽（配置文件格式异常，重启后生效）")
-                                  : Fmt(L"已恢复默认列宽（清除 {} 项自定义列宽）", removed));
-        }
-        ImGui::Separator();
-        ImGui::TextDisabled("%s", U8(L"自定义壁纸"));
-        DrawAppearancePanel(ctx);  // H-A(Phase-6): 选图/关闭/遮罩/性能提示
-        ImGui::EndMenu();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", U8(L"主题（深色/浅色/跟随系统）与表格列宽"));
-    }
+    if (ImGui::Button(U8(L"内存加速…"))) RequestConfirmMemCleanup();
 
-    // H-A: 工具条「?」关于按钮 + 模态（tooltip 显示当前版本）。
-    ImGui::SameLine(ImGui::GetWindowWidth() - 124.0f);
-    ui::DrawAboutUi();
-
-    // F4#10: 全局热键 Ctrl+Alt+M 呼出/隐藏主窗（cfg hotkeyEnabled，默认关；
-    // 注册/反注册在主线程完成，失败如实提示，不持久化到注册表）。
-    ImGui::SameLine();
+    // --- 右缘「?」关于按钮 + 菜单（R-Fix Bug1/Bug3 关键次序） -----------------
+    // 旧实现用 SameLine(GetWindowWidth()-NNN) 绝对偏移摆放右侧各项，各项实际
+    // 宽度未计入 → 窄窗下互相压盖、「?」点不到（Bug3）。重构后「全局热键」
+    // 开关、「管理员」徽标与运行统计移入底部状态栏（DrawStatusBar 右段），工具
+    // 条右缘只剩「?」，用 ui::LayoutHeaderRight 纯函数按实测宽度
+    // （CalcTextSize+FramePadding 求和，不写死像素）定位，priority 0 永不隐藏。
+    //
+    // 提交次序是本修复的关键（ImGui 悬停竞争）：BeginMenu 在竖排窗口里走
+    // Selectable 的 SpanAvailWidth —— 菜单的悬停/点击矩形从其标签一直延伸到
+    // 窗口右缘，恰好把「?」整块盖住；ImGui 把悬停判给先提交的控件，所以「?」
+    // 必须先于菜单提交才能赢回自己区域的悬停与点击（菜单可见标签区域不受
+    // 影响，依旧可点；这正是旧版「?」永远点不到的最终根因）。
     {
-        bool hotkey = ctx.cfg.GetBool(L"hotkeyEnabled", false);
-        if (ImGui::Checkbox(U8(L"全局热键 Ctrl+Alt+M"), &hotkey)) {
-            std::wstring err;
-            if (ui3::GcHotkeySetEnabled(hotkey, &err)) {
-                ctx.cfg.SetBool(L"hotkeyEnabled", hotkey);
-                PushToast(Notification::Kind::Info,
-                          hotkey ? L"已注册全局热键 Ctrl+Alt+M（呼出/隐藏主窗）"
-                                 : L"已注销全局热键");
-            } else {
-                // 不落 cfg：下一帧复选框按持久状态回显（诚实状态机）。
-                PushToast(Notification::Kind::JobFailed, err);
-            }
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float winW = ImGui::GetWindowWidth();
+        const float menuX = ImGui::GetCursorPosX();    // 菜单自然位置（动作流之后）
+        // 左侧动作流程结束 = 菜单"终点"（起点 + 标签实测宽 + 内边距），否则窄窗下
+        // 右对齐的「?」会压住菜单标签（V19-P1-1）。
+        const float leftEnd =
+            menuX + ImGui::CalcTextSize(narrow ? U8(L"⋮") : U8(L"外观")).x +
+            st.FramePadding.x * 2.0f;
+        const float aboutW =
+            ImGui::CalcTextSize(U8(L"?")).x + st.FramePadding.x * 2.0f;  // 实测按钮宽
+        const ui::HeaderItem kRightItems[1] = {{aboutW, 0}};
+        ui::HeaderPlacement place[1];
+        ui::LayoutHeaderRight(winW - st.WindowPadding.x, leftEnd, st.ItemSpacing.x,
+                              kRightItems, 1, place);
+        // H-A: 工具条「?」关于按钮 + 模态（tooltip 显示当前版本）。先提交。
+        ImGui::SameLine(place[0].x);
+        ui::DrawAboutUi();
+        // H-A: 「外观」菜单（R-Fix Bug1：窄窗折叠为「⋮」溢出菜单）——主题三态、
+        // 「恢复默认列宽」、自定义壁纸控件组，菜单体见 DrawAppearanceMenuBody。
+        ImGui::SameLine(menuX);
+        if (ImGui::BeginMenu(narrow ? U8(L"⋮") : U8(L"外观"))) {
+            DrawAppearanceMenuBody(ctx, narrow);
+            ImGui::EndMenu();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s",
-                              U8(L"注册 Ctrl+Alt+M 全局热键：任意前台应用下呼出/隐藏本工具"
-                                 L"（仅运行期有效，不写注册表）"));
+            ImGui::SetTooltip("%s", U8(L"主题（深色/浅色/跟随系统）、表格列宽与自定义壁纸"));
         }
-    }
-
-    ImGui::SameLine(ImGui::GetWindowWidth() - 90.0f);
-    if (ctx.elevated) {
-        ImGui::TextColored(ColInfo(), "%s", U8(L"管理员"));
-    } else {
-        ImGui::TextDisabled("%s", U8(L"普通权限"));
     }
     ImGui::EndChild();
 }
@@ -2485,57 +2553,139 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
 void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     ImGui::BeginChild("##statusbar", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY,
                       ImGuiWindowFlags_NoScrollbar);
-    ImGui::Text("帧 %.1f ms", ctx.frameMs);
-    // P2-3 (F2 review): paused collection needs a global indicator.
+    // R-Fix Bug1（状态栏两段式）：工具条挤不下的「全局热键」开关、「管理员」
+    // 徽标与运行统计统一收纳于此 —— 左段=采集与队列状态（自然流式），右段=
+    // 外观类与自身开销 [全局热键][权限徽标][帧耗时]（LayoutHeaderRight 实测
+    // 宽度右对齐，热键(次要)先藏、帧耗时永不藏）。左段每段绘制前用
+    // FlowSegmentFits（app/ui/HeaderLayout.h 纯函数）判断，放不下的段连同
+    // 分隔符一起隐藏（窄窗优雅降级，不再截出半截文本或互相压盖）。
+    const float contentRightX = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+    const float pipeW = ImGui::CalcTextSize("|").x;
+    const float sp = ImGui::GetStyle().ItemSpacing.x;
+    const auto segFits = [contentRightX, pipeW, sp](const char* u8Text) {
+        return ui::FlowSegmentFits(ImGui::GetCursorPosX(), contentRightX,
+                                   pipeW + sp + ImGui::CalcTextSize(u8Text).x);
+    };
+    {   // 锚点段（必显）：采集模式（降级时给原因）。
+        const char* mode =
+            snap.degraded
+                ? U8(Fmt(L"兼容模式：{}",
+                         snap.degradeReason.empty() ? std::wstring(L"采集能力受限")
+                                                    : snap.degradeReason))
+                : U8(L"完整模式");
+        if (snap.degraded) {
+            ImGui::TextColored(ColWarn(), "%s", mode);
+        } else {
+            ImGui::TextDisabled("%s", mode);
+        }
+    }
+    // P2-3（F2 评审）：暂停采集需要全局指示。
     if (Ui().paused) {
         ImGui::SameLine();
         ImGui::TextColored(ColWarn(), "%s", U8(L"[已暂停]"));
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("|");
-    ImGui::SameLine();
-    ImGui::Text("采集 p95 %.1f ms", ctx.collect.TickP95Ms());
-    ImGui::SameLine();
-    ImGui::TextDisabled("|");
-    ImGui::SameLine();
     {
-        const size_t pending = ctx.jobs.PendingCount();
-        if (pending > 0) {
-            ImGui::TextColored(ColWarn(), "%s", U8(Fmt(L"操作队列 {}", pending)));
-        } else {
-            ImGui::TextDisabled("%s", U8(L"操作队列空闲"));
+        const char* p95 = U8(Fmt(L"采集 p95 {:.1f} ms", ctx.collect.TickP95Ms()));
+        if (segFits(p95)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(p95);
         }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("|");
-    ImGui::SameLine();
-    ImGui::Text(U8(L"进程 %d"), static_cast<int>(snap.procs.size()));
-    ImGui::SameLine();
-    ImGui::TextDisabled("|");
-    ImGui::SameLine();
-    if (snap.degraded) {
-        ImGui::TextColored(ColWarn(), "%s",
-                           U8(Fmt(L"兼容模式：{}", snap.degradeReason.empty()
-                                                     ? std::wstring(L"采集能力受限")
-                                                     : snap.degradeReason)));
-    } else {
-        ImGui::TextDisabled("%s", U8(L"完整模式"));
+    {
+        const size_t pending = ctx.jobs.PendingCount();
+        const char* queue = pending > 0
+                                ? U8(Fmt(L"操作队列 {}", pending))
+                                : U8(L"操作队列空闲");
+        if (segFits(queue)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            if (pending > 0) {
+                ImGui::TextColored(ColWarn(), "%s", queue);
+            } else {
+                ImGui::TextDisabled("%s", queue);
+            }
+        }
+    }
+    {
+        const char* procs = U8(Fmt(L"进程 {}", static_cast<int>(snap.procs.size())));
+        if (segFits(procs)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(procs);
+        }
     }
     // F4#7: CSV 记录状态在状态栏常显（悬停显示文件路径）。
     if (ui3::SharedPerfCsv().Active()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-        ImGui::TextColored(ColDone(), "%s", U8(L"● 记录 CSV"));
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", U8(ui3::SharedPerfCsv().Path()));
+        const char* csv = U8(L"● 记录 CSV");
+        if (segFits(csv)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::TextColored(ColDone(), "%s", csv);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", U8(ui3::SharedPerfCsv().Path()));
+            }
         }
     }
     if (!Ui().lastNote.empty()) {
-        ImGui::SameLine();
+        const char* note = U8(Ui().lastNote);
+        if (segFits(note)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.60f, 0.62f, 0.68f, 1.0f), "%s", note);
+        }
+    }
+    // --- 右段：外观类与自身开销 [全局热键][权限徽标][帧耗时] ------------------
+    {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float leftEnd = ImGui::GetCursorPosX();  // 左段流程结束（窗口坐标）
+        const float frameH = ImGui::GetFrameHeight();
+        const float hotkeyW = frameH + st.ItemInnerSpacing.x +
+                              ImGui::CalcTextSize(U8(L"全局热键 Ctrl+Alt+M")).x;
+        char frameMsBuf[32];
+        snprintf(frameMsBuf, sizeof(frameMsBuf), "帧 %.1f ms", ctx.frameMs);
+        // 徽标/帧耗时前各带一个「|」分隔符，分隔符宽一并计入测量宽。
+        const float badgeW = pipeW + sp + ImGui::CalcTextSize(U8(ctx.elevated ? L"管理员"
+                                                                              : L"普通权限")).x;
+        const float frameW = pipeW + sp + ImGui::CalcTextSize(frameMsBuf).x;
+        // 数组顺序 == 屏幕从左到右；priority 大者先藏：热键(2) → 徽标(1)，
+        // 帧耗时(0) 永不隐藏。
+        const ui::HeaderItem kRightItems[3] = {{hotkeyW, 2}, {badgeW, 1}, {frameW, 0}};
+        ui::HeaderPlacement place[3];
+        ui::LayoutHeaderRight(contentRightX, leftEnd, sp, kRightItems, 3, place);
+
+        if (place[0].visible) {
+            // F4#10: 全局热键开关（原工具条成员，Bug1 移入状态栏右段）。
+            ImGui::SameLine(place[0].x);
+            bool hotkey = ctx.cfg.GetBool(L"hotkeyEnabled", false);
+            if (ImGui::Checkbox(U8(L"全局热键 Ctrl+Alt+M"), &hotkey)) {
+                ApplyHotkeyEnabled(ctx, hotkey);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s",
+                                  U8(L"注册 Ctrl+Alt+M 全局热键：任意前台应用下呼出/隐藏本工具"
+                                     L"（仅运行期有效，不写注册表；窄窗时折叠进工具条「⋮」菜单）"));
+            }
+        }
+        if (place[1].visible) {
+            ImGui::SameLine(place[1].x);
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            if (ctx.elevated) {
+                ImGui::TextColored(ColInfo(), "%s", U8(L"管理员"));
+            } else {
+                ImGui::TextDisabled("%s", U8(L"普通权限"));
+            }
+        }
+        ImGui::SameLine(place[2].x);
         ImGui::TextDisabled("|");
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.60f, 0.62f, 0.68f, 1.0f), "%s", U8(Ui().lastNote));
+        ImGui::TextUnformatted(frameMsBuf);
     }
     ImGui::EndChild();
 }
@@ -2543,7 +2693,7 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
 }  // namespace
 
 // ===========================================================================
-// Public entry points (Pages.h contract).
+// 公共入口（Pages.h 契约）。
 // ===========================================================================
 
 void RegisterPages(AppContext& ctx) {
@@ -2554,8 +2704,8 @@ void RegisterPages(AppContext& ctx) {
 }
 
 void BindAppContext(std::shared_ptr<AppContext> ctx) {
-    // main registers its owning handle here before the frame loop; ops job lambdas
-    // capture it so in-flight jobs survive teardown (V7-P1-3).
+    // main 在帧循环前在此注册持有句柄；ops 任务 lambda 捕获它，
+    // 使在途任务活过拆除（V7-P1-3）。
     Ui().liveCtx = std::move(ctx);
 }
 
@@ -2581,8 +2731,8 @@ void SaveSessionFromCtx(const AppContext& ctx, HWND mainWnd) {
     s.sortDir = Ui().sortDesc ? 1 : 0;
     s.intervalMs = static_cast<uint32_t>(ctx.cfg.GetInt(L"intervalMs", 1000));
     if (mainWnd != nullptr && !IsIconic(mainWnd)) {
-        // Minimized windows report -32000 coords; persisting them would restore the
-        // window off-screen (final review V11-P2-5) — keep the previous rect instead.
+        // 最小化窗口报告 -32000 坐标；持久化它们会把窗口恢复到
+        // 屏幕之外（终审 V11-P2-5）——改为保留之前的矩形。
         RECT r{};
         if (GetWindowRect(mainWnd, &r)) {
             s.winX = r.left;
@@ -2595,11 +2745,11 @@ void SaveSessionFromCtx(const AppContext& ctx, HWND mainWnd) {
 }
 
 void DrawShell(AppContext& ctx) {
-    // One snapshot read per frame for the whole shell + all pages.
+    // 整个外壳 + 所有页面每帧只读一次快照。
     Ui().snap = ctx.collect.Store().Get();
     AppendHistory(*Ui().snap);
     DrainNotifications(ctx);
-    ui3::AlertTick(ctx);  // phase-3: threshold alert watcher (default off)
+    ui3::AlertTick(ctx);  // 第 3 阶段：阈值告警监视器（默认关）
 
     // F4#3: 跨页跳转 —— 任意页发起的"跳转到进程"切换到进程页，由其下一帧解析
     // （找不到目标进程时 toast "进程已退出"）。
@@ -2616,6 +2766,17 @@ void DrawShell(AppContext& ctx) {
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 4.0f));
+    // R-Fix Bug2 根因修复：壁纸绘制在视口背景绘制列表里（main.cpp，位于一切
+    // 普通窗口之下），而「##approot」是覆盖整个视口的普通窗口 —— 主题给它
+    // 不透明 WindowBg，工具条/页面区的子窗口还有不透明 ChildBg，壁纸被完全
+    // 盖住，用户只见纯色。壁纸激活期间对这一个窗口推透明背景（弹窗/toast/
+    // 确认框/离屏预览窗都绘制在本 End 之后，保持各自颜色不变）；可读性由
+    // 壁纸自身的黑色遮罩（wallpaperMask）负责。
+    const bool wallpaperUnder = ui::WallpaperActive();
+    if (wallpaperUnder) {
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    }
     ImGui::Begin("##approot", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
@@ -2624,9 +2785,9 @@ void DrawShell(AppContext& ctx) {
     const float statusH = ImGui::GetTextLineHeightWithSpacing() + 6.0f;
     ImGui::BeginChild("##pagearea", ImVec2(0.0f, -statusH), ImGuiChildFlags_None);
     if (ImGui::BeginTabBar("##pages")) {
-        // P1-1 (F2 review): session restore wrote activePage but the TabBar never
-        // consumed it. Arm a one-shot SetSelected for the restored index on the
-        // first rendered frame after (re)registration.
+        // P1-1（F2 评审）：会话恢复写入了 activePage 但 TabBar 从未
+        // 消费它。（重新）注册后的首个渲染帧为恢复的索引
+        // 布设一次性 SetSelected。
         for (size_t i = 0; i < ctx.pages.size(); ++i) {
             IPage* page = ctx.pages[i].get();
             ImGuiTabItemFlags tabFlags = 0;
@@ -2645,9 +2806,10 @@ void DrawShell(AppContext& ctx) {
     ImGui::EndChild();
     DrawStatusBar(ctx, *Ui().snap);
     ImGui::End();
+    if (wallpaperUnder) ImGui::PopStyleColor(2);  // ##approot 专用透明背景（见上）
     ImGui::PopStyleVar();
 
-    ui3::DrawSmokeAllPages(ctx);  // phase-3: --smoke exercises every page offscreen
+    ui3::DrawSmokeAllPages(ctx);  // 第 3 阶段：--smoke 在屏外执行每个页面
     ui3::DrawGcModals(ctx);       // F4#3: 宿主服务共享模态
     // H-A(Phase-6): --smoke 离屏绘制「自定义壁纸」控件组（滑条/状态行/性能提示
     // 的渲染路径）。选图对话框是模态 Shell 交互，headless 无法驱动 —— 选图与
@@ -2672,9 +2834,9 @@ void DrawShell(AppContext& ctx) {
 }
 
 // --- --autotest dialogclick (V14) -------------------------------------------
-// Arms the kill confirm through the exact same RequestConfirmKill() path the row
-// context menu uses; the state recorded by DrawConfirmDialogs lets the driver in
-// app/AutotestDialog.cpp aim synthetic mouse events at the REAL rendered button.
+// 经与行右键菜单完全相同的 RequestConfirmKill() 路径布设终止确认；
+// DrawConfirmDialogs 记录的状态让 app/AutotestDialog.cpp 中的驱动
+// 能把合成鼠标事件瞄准真实渲染的按钮。
 
 void ArmKillConfirmForAutotest(uint32_t pid, uint64_t createTime, const wchar_t* name) {
     ProcInfo p;

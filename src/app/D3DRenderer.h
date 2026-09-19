@@ -1,6 +1,6 @@
 #pragma once
-// Minimal D3D11 wrapper around the swap chain back buffer (following the official
-// imgui_impl_dx11 example lifecycle). UI layer only; no app logic here.
+// 围绕交换链后备缓冲的极简 D3D11 封装（遵循官方 imgui_impl_dx11
+// 示例的生命周期）。仅 UI 层；此处无应用逻辑。
 #include <d3d11.h>
 #include <dxgi.h>
 #include <cstdint>
@@ -15,8 +15,8 @@ public:
     bool Init(HWND hwnd, int w, int h);
     void Shutdown();
     void Resize(int w, int h);
-    void BeginFrame();          // bind back buffer + clear
-    void Present();             // vsync
+    void BeginFrame();          // 绑定后备缓冲 + 清屏
+    void Present();             // 垂直同步
 
     ID3D11Device* Device() const { return device_.Get(); }
     ID3D11DeviceContext* Context() const { return context_.Get(); }

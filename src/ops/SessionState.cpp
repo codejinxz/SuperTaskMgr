@@ -29,7 +29,7 @@ bool LoadSession(SessionState* s) {
     if (!c.Load(SessionPath())) return false;
     const int64_t ts = c.GetInt(L"ts", 0);
     const int64_t now = static_cast<int64_t>(time(nullptr));
-    if (ts <= 0 || now - ts > 60) return false;  // stale/corrupted -> fresh start
+    if (ts <= 0 || now - ts > 60) return false;  // 过期/损坏 -> 全新启动
 
     s->page = static_cast<int>(c.GetInt(L"page", 0));
     s->selected.pid = static_cast<uint32_t>(c.GetInt(L"selPid", 0));

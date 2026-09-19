@@ -1,8 +1,8 @@
 #pragma once
-// WinVerifyTrust wrapper (documented API; VERIFY must pair with STATEACTION_CLOSE).
-// System files are catalog-signed => catalog verification path included.
-// Must run on the ops worker thread (ms-level, may touch disk/network for revocation —
-// revocation left to system defaults; we never block the UI thread).
+// WinVerifyTrust 包装（有文档 API；VERIFY 必须与 STATEACTION_CLOSE 配对）。
+// 系统文件是目录签名的 => 包含目录验证路径。
+// 必须在 ops 工作线程运行（毫秒级；吊销检查可能触盘/触网——
+// 吊销沿用系统默认；绝不阻塞 UI 线程）。
 #include <string>
 
 namespace stm {
@@ -10,7 +10,7 @@ namespace ops {
 
 enum class SigState { Unknown, Valid, Unsigned, Invalid, NoCheck };
 
-// path: full image path. Returns NoCheck for empty path / missing file.
+// path：完整映像路径。空路径 / 文件缺失时返回 NoCheck。
 SigState VerifyFileSignature(const std::wstring& path);
 
 }  // namespace ops

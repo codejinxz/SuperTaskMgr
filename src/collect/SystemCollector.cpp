@@ -1,11 +1,11 @@
-// SystemCollector: system-wide metrics per tick.
-// CPU: GetSystemTimes for the total (kernel time includes idle -> busy =
-// kernel-idle+user) and NtQSI(SystemProcessorPerformanceInformation) per core.
-// Memory: GlobalMemoryStatusEx + GetPerformanceInfo. Disk rates + system hard
-// faults: PDH English counters. Network: GetIfTable2 octet deltas. All fields
-// that cannot be collected stay kUnavail — never 0-by-convention.
-#include <winsock2.h>  // must precede iphlpapi/netioapi (LEAN_AND_MEAN hides winsock)
-#include <ws2tcpip.h>  // pulls ws2ipdef.h -> defines _WS2IPDEF_ for netioapi MIB_* decls
+// SystemCollector：每 tick 的系统级指标。
+// CPU：总量用 GetSystemTimes（内核时间含空闲 -> 忙碌 =
+// kernel-idle+user），每核用 NtQSI(SystemProcessorPerformanceInformation)。
+// 内存：GlobalMemoryStatusEx + GetPerformanceInfo。磁盘速率 + 系统硬缺页：
+// PDH 英文计数器。网络：GetIfTable2 字节差值。所有采不到的字段
+// 保持 kUnavail——绝不用约定俗成的 0。
+#include <winsock2.h>  // 必须在 iphlpapi/netioapi 之前包含（LEAN_AND_MEAN 会隐藏 winsock）
+#include <ws2tcpip.h>  // 引入 ws2ipdef.h -> 为 netioapi 的 MIB_* 声明定义 _WS2IPDEF_
 #include "collect/CollectDetail.h"
 #include "core/Log.h"
 #include <iphlpapi.h>
@@ -31,13 +31,13 @@ bool IsTotalInstance(const std::wstring& inst) { return inst == L"_Total"; }
 
 }  // namespace
 
-// Closing the query also releases the counters bound to it (review V7-P1-1).
+// 关闭查询的同时会释放绑定其上的计数器（评审 V7-P1-1）。
 SystemCollector::~SystemCollector() { PdhCloseQuerySafe(&pdhQuery_); }
 
-// PDH disk rates + hard faults. All counters are wildcard/plain English paths
-// added once; the disk instance set is tracked by PDH itself and read back via
-// the formatted array (no rebuild). Rate counters need two collects inside the
-// current query -> kUnavail on the first tick, which the UI renders as "—".
+// PDH 磁盘速率 + 硬缺页。所有计数器都是通配/普通英文路径，
+// 只添加一次；磁盘实例集合由 PDH 自己维护，经格式化数组读回
+//（无需重建）。速率计数器在当前查询内需要两次采集 ->
+// 首 tick 为 kUnavail，UI 渲染为 "—"。
 void SystemCollector::CollectPdh(SystemInfo* out) {
     if (pdhFailed_) return;
     if (pdhQuery_ == nullptr) {
@@ -56,7 +56,7 @@ void SystemCollector::CollectPdh(SystemInfo* out) {
             }
             return;
         }
-        // Hard faults degrade to kUnavail alone when this one path fails.
+        // 该路径失败时仅硬缺页单独降级为 kUnavail。
         std::wstring hfTemplate;
         if (PdhLocalizeEnglishPath(kHardFaults, &hfTemplate)) {
             PdhAddWildcardCounter(pdhQuery_, hfTemplate, &hardFaults_);
@@ -64,8 +64,8 @@ void SystemCollector::CollectPdh(SystemInfo* out) {
     }
     if (!PdhCollect(pdhQuery_)) return;
 
-    // Sum per-disk rates; skip "_Total" to avoid double counting, but fall
-    // back to it when no per-disk instance reports a value.
+    // 汇总每盘速率；跳过 "_Total" 避免重复计数，但若无任何
+    // 单盘实例上报数值，则回退用它。
     std::vector<PdhArrayItem> reads, writes;
     if (!PdhFmtArrayDouble(diskRead_, &reads) || !PdhFmtArrayDouble(diskWrite_, &writes)) return;
     double readSum = 0, writeSum = 0, totalRead = 0, totalWrite = 0;
@@ -94,15 +94,15 @@ void SystemCollector::CollectPdh(SystemInfo* out) {
     }
     double hf = 0;
     if (hardFaults_ && PdhFmtDouble(hardFaults_, &hf)) {
-        out->hardFaultsPerSec = hf;  // honest kUnavail when unavailable
+        out->hardFaultsPerSec = hf;  // 不可得时诚实给 kUnavail
     }
 }
 
-// Network throughput from GetIfTable2 octet deltas over all non-loopback,
-// operational interfaces.
+// 网络吞吐：对所有非回环、
+// 处于运行状态的接口取 GetIfTable2 字节差值。
 void SystemCollector::CollectNet(SystemInfo* out, double elapsedSec) {
     MIB_IF_TABLE2* tbl = nullptr;
-    if (::GetIfTable2(&tbl) != NO_ERROR) return;  // keep previous/kUnavail values
+    if (::GetIfTable2(&tbl) != NO_ERROR) return;  // 保留先前值/kUnavail
     uint64_t recv = 0, send = 0;
     for (ULONG i = 0; i < tbl->NumEntries; ++i) {
         const MIB_IF_ROW2& r = tbl->Table[i];
@@ -113,11 +113,11 @@ void SystemCollector::CollectNet(SystemInfo* out, double elapsedSec) {
     }
     ::FreeMibTable(tbl);
     if (haveNetPrev_ && elapsedSec > 0.0) {
-        // Interface-set changes (VPN torn down, NIC hot-unplugged, counter
-        // reset) make the summed octets REGRESS; the unsigned delta would wrap
-        // to ~1.8e19 and show a bogus spike (review V6-P1-2). Report kUnavail
-        // for this tick; prev updates either way so the next tick is valid
-        // again against the new baseline. Recv/send regress independently.
+        // 接口集合变化（VPN 断开、网卡热拔、计数器重置）会使
+        // 字节总和无符号差回绕到约 1.8e19，
+        // 显示虚假尖峰（评审 V6-P1-2）。本 tick 上报 kUnavail；
+        // 无论哪种情况都更新 prev，下一 tick 相对新基线
+        // 重新有效。收/发各自独立回退。
         if (recv >= prevRecv_) {
             out->netRecvBps = static_cast<double>(recv - prevRecv_) / elapsedSec;
         } else {
@@ -137,13 +137,13 @@ void SystemCollector::CollectNet(SystemInfo* out, double elapsedSec) {
 void SystemCollector::Collect(const ProcessCollector::TickOut& pt, SystemInfo* out) {
     const double elapsedSec = pt.elapsedSec;
 
-    // --- CPU total: GetSystemTimes (kernel includes idle) ------------------
+    // --- CPU 总量：GetSystemTimes（内核含空闲）-----------------------------
     FILETIME ftIdle{}, ftKernel{}, ftUser{};
     if (::GetSystemTimes(&ftIdle, &ftKernel, &ftUser)) {
         const uint64_t idle = FtU64(ftIdle), kern = FtU64(ftKernel), user = FtU64(ftUser);
         if (haveCpuPrev_ && elapsedSec > 0.0) {
             const uint64_t dK = kern - prevKernel_, dU = user - prevUser_, dI = idle - prevIdle_;
-            const uint64_t denom = dK + dU;  // kernel time already contains idle
+            const uint64_t denom = dK + dU;  // 内核时间已含空闲
             if (denom > 0) {
                 out->cpuTotalPercent =
                     100.0 * static_cast<double>(dK - dI + dU) / static_cast<double>(denom);
@@ -155,8 +155,8 @@ void SystemCollector::Collect(const ProcessCollector::TickOut& pt, SystemInfo* o
         haveCpuPrev_ = true;
     }
 
-    // --- CPU per core: NtQSI SystemProcessorPerformanceInformation ---------
-    // Kernel includes idle here too, so busy = kernel - idle + user.
+    // --- CPU 每核：NtQSI SystemProcessorPerformanceInformation -------------
+    // 此处内核同样含空闲，忙碌 = kernel - idle + user。
     std::vector<CoreTimes> coresNow;
     if (NtqsiQueryPerCoreTimes(&coresNow)) {
         out->perCorePercent.assign(coresNow.size(), kUnavail);
@@ -176,7 +176,7 @@ void SystemCollector::Collect(const ProcessCollector::TickOut& pt, SystemInfo* o
         haveCorePrev_ = true;
     }
 
-    // --- Physical memory ----------------------------------------------------
+    // --- 物理内存 -----------------------------------------------------------
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof(ms);
     if (::GlobalMemoryStatusEx(&ms)) {
@@ -184,9 +184,9 @@ void SystemCollector::Collect(const ProcessCollector::TickOut& pt, SystemInfo* o
         out->physAvail = ms.ullAvailPhys;
     }
 
-    // --- Commit / kernel memory + counts fallback ---------------------------
-    // NtQSI(SystemPerformanceInformation) is ~0.1ms; GetPerformanceInfo costs
-    // ~10ms on this machine and is kept only as the degraded-path fallback.
+    // --- 提交/内核内存 + 计数兜底 -------------------------------------------
+    // NtQSI(SystemPerformanceInformation) 约 0.1ms；GetPerformanceInfo 在本机
+    // 约 10ms，仅作降级路径兜底保留。
     uint64_t pageSize = 4096;
     {
         SYSTEM_INFO si{};
@@ -214,7 +214,7 @@ void SystemCollector::Collect(const ProcessCollector::TickOut& pt, SystemInfo* o
         }
     }
     if (pt.ntsiOk) {
-        // Aggregated from the same NtQSI pass as the process list (spec).
+        // 与进程列表同一次 NtQSI 扫描聚合（规格要求）。
         out->procCount = pt.totals.procCount;
         out->handleTotal = pt.totals.handleTotal;
         out->threadTotal = pt.totals.threadTotal;
@@ -224,11 +224,11 @@ void SystemCollector::Collect(const ProcessCollector::TickOut& pt, SystemInfo* o
         out->threadTotal = pi.ThreadCount;
     }
 
-    // --- PDH (disk + hard faults) and network -------------------------------
+    // --- PDH（磁盘 + 硬缺页）与网络 -----------------------------------------
     CollectPdh(out);
     CollectNet(out, elapsedSec);
 
-    // --- Uptime --------------------------------------------------------------
+    // --- 运行时长 ------------------------------------------------------------
     out->uptimeSec = static_cast<double>(::GetTickCount64()) / 1000.0;
 }
 

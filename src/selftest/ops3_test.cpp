@@ -1,6 +1,6 @@
-// Phase-3 ops extension smoke tests (services / startup four sources / drivers).
-// Everything here is designed to pass WITHOUT elevation: admin-required paths are
-// skipped with an [info] note (arch section 7 permission matrix), never asserted.
+// 第 3 阶段 ops 扩展冒烟测试（服务/启动项四来源/驱动）。
+// 这里一切都被设计为无需提权即可通过：需要管理员的路径
+// 以 [info] 说明跳过（架构第 7 节权限矩阵），绝不断言。
 #include "selftest/TestFramework.h"
 #include "core/Err.h"
 #include "core/FsUtil.h"
@@ -18,8 +18,8 @@
 
 namespace {
 
-// RtlGetVersion is the documented, manifest-immune way to read the build number
-// (RtlGetVersion page; GetVersionEx lies behind a manifest).
+// RtlGetVersion 是读取版本号的有文档、免疫清单的方式
+//（RtlGetVersion 页面；GetVersionEx 在清单背后说谎）。
 bool OsBuild(uint32_t* build) {
     using RtlGetVersionFn = long (WINAPI*)(RTL_OSVERSIONINFOW*);
     const HMODULE nt = ::GetModuleHandleW(L"ntdll.dll");
@@ -75,13 +75,13 @@ const stm::ops::StartupItem* FindItem(const std::vector<stm::ops::StartupItem>& 
 
 }  // namespace
 
-// Services: batch enum works non-admin, contains well-known services, states and
-// pids are sane (dwProcessId is only documented valid for non-stopped states, R5 7b).
+// 服务：批量枚举非管理员可用，包含知名服务，状态与
+// pid 正常（dwProcessId 仅对非停止状态有文档保证，R5 7b）。
 namespace {
-// True when the pid can be opened (alive), false with *lastErr otherwise. The sandbox
-// denies cross-process opens wholesale — ERROR_ACCESS_DENIED on QLI is impossible for
-// normal tokens (PPL still grants QLI), so it is reported as envBlocked instead of a
-// data failure (task spec: env-restricted => skip).
+// pid 可打开（存活）返回 true，否则带 *lastErr 返回 false。沙箱
+// 一概拒绝跨进程打开——对普通令牌而言 QLI 不可能报 ERROR_ACCESS_DENIED
+//（PPL 仍授予 QLI），因此按 envBlocked 上报而不是
+// 数据失败（任务规格：环境受限 => 跳过）。
 bool PidOpenable(uint32_t pid, uint32_t* lastErr) {
     SetLastError(0);
     stm::UniqueHandle h(::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
@@ -107,8 +107,8 @@ STM_TEST(services_enum_ok) {
         return false;
     }
     bool hasKnown = false;
-    int envBlocked = 0;  // running-service pids that the sandbox denies opening
-    std::vector<const stm::ops::ServiceInfo*> deadPid;  // transient candidates
+    int envBlocked = 0;  // 被沙箱拒绝打开的运行中服务 pid
+    std::vector<const stm::ops::ServiceInfo*> deadPid;  // 瞬态候选
     for (const auto& s : svcs) {
         if (_wcsicmp(s.name.c_str(), L"Schedule") == 0 || _wcsicmp(s.name.c_str(), L"Themes") == 0) {
             hasKnown = true;
@@ -121,10 +121,10 @@ STM_TEST(services_enum_ok) {
             *err = stm::Fmt(L"服务 {} 状态非法：{}", s.name, s.state);
             return false;
         }
-        // pid is non-zero only for running/paused states (ops normalizes pending/stopped
-        // rows to 0 per the documented dwProcessId validity, R5 7b). A dead pid here can
-        // be a genuine race (host exited while SCM still says RUNNING) — those services
-        // get one re-enum below before failing, so SCM-stale rows are not false alarms.
+        // pid 仅在运行/暂停状态非零（ops 按 dwProcessId 文档有效性把挂起/停止行
+        // 归一化为 0，R5 7b）。这里的死 pid 可能是真实竞争
+        //（宿主已退出而 SCM 仍报 RUNNING）——这些服务
+        // 失败前会再做一次重枚举，SCM 过期行不至于误报。
         if (s.pid != 0) {
             uint32_t lastErr = 0;
             if (!PidOpenable(s.pid, &lastErr)) {
@@ -136,7 +136,7 @@ STM_TEST(services_enum_ok) {
             }
         }
     }
-    for (const stm::ops::ServiceInfo* s : deadPid) {  // re-enum once, then judge
+    for (const stm::ops::ServiceInfo* s : deadPid) {  // 重枚举一次再判定
         ::Sleep(300);
         svcs = stm::ops::EnumServices(&e);
         const stm::ops::ServiceInfo* again = FindService(svcs, s->name);
@@ -164,9 +164,9 @@ STM_TEST(services_enum_ok) {
     return true;
 }
 
-// Stop/start plumbing error contract: an unknown service must fail with a non-empty
-// Chinese error, and the dependent query must not crash on the same input.
-// No real service is touched (start/stop of real services needs admin = env skip).
+// 停止/启动管线错误契约：未知服务必须以非空中文错误失败，
+// 依赖查询对同一输入不得崩溃。
+// 不触碰真实服务（启停真实服务需要管理员 = 环境跳过）。
 STM_TEST(services_stop_unknown_err) {
     std::wstring e;
     if (stm::ops::StopServiceByName(L"stm_selftest_no_such_service", false, &e)) {
@@ -185,9 +185,9 @@ STM_TEST(services_stop_unknown_err) {
     return true;
 }
 
-// Four startup sources: enum must not crash, ids must be unique, and a silent total
-// failure (empty result + empty err) is impossible. Per-source gaps are tolerated
-// (relaxed per task spec) but reported.
+// 四个启动来源：枚举不得崩溃、id 必须唯一、且不可能出现
+// 静默全失败（空结果 + 空 err）。单来源缺口可容忍
+//（按任务规格放宽）但须上报。
 STM_TEST(startup_enum_four_sources) {
     std::wstring e;
     const std::vector<stm::ops::StartupItem> items = stm::ops::EnumStartupItems(&e);
@@ -225,15 +225,15 @@ STM_TEST(startup_enum_four_sources) {
     return true;
 }
 
-// Toggle round-trip on a TEMPORARY HKCU Run value (never touches a real user item):
-// create -> visible/enabled -> disable (backup written) -> enable -> cleanup.
-// Pure HKCU, works without admin.
+// 对临时 HKCU Run 值做切换往返（绝不触碰真实用户条目）：
+// 创建 -> 可见/启用 -> 禁用（写备份）-> 启用 -> 清理。
+// 纯 HKCU，无需管理员。
 STM_TEST(startup_toggle_roundtrip) {
     const wchar_t* runSub = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     const std::wstring id = std::wstring(L"HKCU\\") + runSub + L"\\STMTest3";
     std::wstring e;
 
-    // 0. snapshot backup dir, pre-clean any leftovers from an aborted earlier run.
+    // 0. 快照备份目录，预清理此前中断运行留下的残余。
     const std::vector<std::wstring> before = ListBackupTxtFiles();
     {
         HKEY raw = nullptr;
@@ -241,7 +241,7 @@ STM_TEST(startup_toggle_roundtrip) {
             *err = L"打开 HKCU Run 键失败（环境异常）";
             return false;
         }
-        ::RegDeleteValueW(raw, L"STMTest3");  // ignore: may not exist
+        ::RegDeleteValueW(raw, L"STMTest3");  // 忽略：可能不存在
         const wchar_t value[] = L"cmd.exe";
         const LONG rc = ::RegSetValueExW(raw, L"STMTest3", 0, REG_SZ,
                                          reinterpret_cast<const BYTE*>(value), sizeof(value));
@@ -254,7 +254,7 @@ STM_TEST(startup_toggle_roundtrip) {
 
     bool ok = false;
     std::wstring newBackups;
-    for (;;) {  // single-shot loop: break = cleanup point
+    for (;;) {  // 单次循环：break = 清理点
         std::vector<stm::ops::StartupItem> items = stm::ops::EnumStartupItems(&e);
         const stm::ops::StartupItem* it = FindItem(items, id);
         if (!it) {
@@ -265,7 +265,7 @@ STM_TEST(startup_toggle_roundtrip) {
             e = L"新建启动项初始应为启用态";
             break;
         }
-        // --- disable (backup must be written first) ---
+        // --- 禁用（必须先写备份）---
         if (!stm::ops::SetStartupEnabled(*it, false, &e)) {
             e = L"禁用失败：" + e;
             break;
@@ -281,7 +281,7 @@ STM_TEST(startup_toggle_roundtrip) {
             e = it ? L"禁用后枚举仍显示启用" : L"禁用后项从枚举消失";
             break;
         }
-        // --- enable ---
+        // --- 启用 ---
         if (!stm::ops::SetStartupEnabled(*it, true, &e)) {
             e = L"启用失败：" + e;
             break;
@@ -296,9 +296,9 @@ STM_TEST(startup_toggle_roundtrip) {
         break;
     }
 
-    // cleanup: temp value + ALL backup files this test created. Every toggle writes
-    // its own timestamped backup (review V9 P1-2), so re-diff here — the post-disable
-    // diff alone would miss the backup written by the enable step.
+    // 清理：临时值 + 本测试创建的所有备份文件。每次切换都写
+    // 自己的时间戳备份（评审 V9 P1-2），因此这里重新 diff——
+    // 只 diff 禁用后会漏掉启用步骤写的备份。
     newBackups = NamesDiff(before, ListBackupTxtFiles());
     {
         HKEY raw = nullptr;
@@ -329,7 +329,7 @@ STM_TEST(startup_toggle_roundtrip) {
     return true;
 }
 
-// Drivers: non-admin on 21H2-23H2 must succeed non-empty; on 24H2+ the honest
+// 驱动：21H2-23H2 非管理员必须成功且非空；24H2+ 时诚实的
 // "需要管理员" degradation counts as a pass (noted). At least SOME paths must resolve.
 STM_TEST(drivers_enum_ok) {
     std::wstring e;
@@ -359,7 +359,7 @@ STM_TEST(drivers_enum_ok) {
     bool systemRootSeen = false;
     for (const auto& d : drv) {
         if (d.path.rfind(L"\\\\SystemRoot\\", 0) == 0 || d.path.rfind(L"\\??\\", 0) == 0) {
-            systemRootSeen = true;  // un-normalized prefix left behind
+            systemRootSeen = true;  // 残留未归一化前缀
         }
     }
     if (systemRootSeen) {

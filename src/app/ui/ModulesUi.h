@@ -1,21 +1,21 @@
 #pragma once
-// F4 quick-win #1: detail-panel module list — pure decision helpers, header-only
-// and ImGui-free so stm_selftest can exercise them (same pattern as ConfirmAction.h).
-// The UI (Pages.cpp DetailPanel) requests ops::DetailKind::Modules, renders the
-// list, and verifies per-module signatures through the ops job queue with a
-// per-path cache.
+// F4 快赢 #1：详情面板模块列表——纯决策辅助，仅头文件、
+// 不依赖 ImGui，便于 stm_selftest 测试（与 ConfirmAction.h 同一模式）。
+// UI（Pages.cpp 的 DetailPanel）请求 ops::DetailKind::Modules，渲染列表，
+// 并经 ops 任务队列配合按路径缓存逐模块验证签名。
+//
 #include <cstddef>
 #include "ops/DetailsProvider.h"  // ops::ProcessDetails, ops::SigState
 
 namespace stm {
 namespace ui {
 
-// What the module section should display for the currently selected process.
+// 当前选中进程的模块区应当展示什么。
 enum class ModuleSectionState {
     Pending,    // details job still in flight => "查询中…"
-    NeedAdmin,  // fetch attempted but list unreadable without elevation (honest gate)
-    Unavailable,// fetch attempted, unreadable even elevated (dead race / protected)
-    Ready,      // list available (count may be 0: a process can legitimately have none)
+    NeedAdmin,  // 已尝试抓取但未提权时列表不可读（诚实的闸门）
+    Unavailable,// 已尝试抓取，提权后仍不可读（竞态失效 / 受保护）
+    Ready,      // 列表可用（数量可为 0：进程确实可能没有模块）
 };
 inline ModuleSectionState DecideModuleSection(bool entryDone, bool modulesResolved,
                                               bool elevated, size_t count) {
@@ -35,8 +35,8 @@ inline const wchar_t* ModuleSectionText(ModuleSectionState s) {
     return L"";
 }
 
-// Per-module signature badge (value comes from ops::VerifyFileSignature run on the
-// ops worker; -1 = job still in flight, DriverPage slot pattern).
+// 每模块签名徽标（值来自在 ops 工作线程上运行的 ops::VerifyFileSignature；
+// -1 = 任务仍在途，DriverPage 槽位模式）。
 enum class ModuleBadge { Pending, Valid, Unsigned, Invalid, Unknown };
 inline ModuleBadge ModuleBadgeForSig(int sigStateInt) {
     if (sigStateInt < 0) return ModuleBadge::Pending;

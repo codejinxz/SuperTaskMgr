@@ -142,7 +142,7 @@ inline void RecordTrimResult(CleanupOutcome& o, bool ok, uint64_t candidateBytes
 // toast 文案（诚实表述：释放的是「工作集」估计值，不是进程真实占用）。
 inline std::wstring FormatCleanupDoneText(const CleanupOutcome& o) {
     const double mib = static_cast<double>(o.freedBytes) / static_cast<double>(kMiBBytes);
-    std::wstring text = Fmt(L"一键优化完成：已处理 {} 个进程，释放约 {:.1f} MiB 工作集",
+    std::wstring text = Fmt(L"内存加速完成：已处理 {} 个进程，释放约 {:.1f} MiB 工作集",
                             o.attempted, mib);
     if (o.failed > 0) text += Fmt(L"（失败 {} 个）", o.failed);
     return text;

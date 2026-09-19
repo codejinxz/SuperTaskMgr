@@ -1,5 +1,5 @@
-// stm_selftest: console smoke tests for core/collect/ops (arch section 11).
-// Exit code = number of failures. --json prints a machine-readable summary.
+// stm_selftest：core/collect/ops 的控制台冒烟测试（架构第 11 节）。
+// 退出码 = 失败数。--json 输出机器可读摘要。
 #include "selftest/TestFramework.h"
 #include "core/Cfg.h"
 #include "core/Jobs.h"
@@ -23,7 +23,7 @@ std::vector<TestCase>& Registry() {
 }
 }  // namespace stmtest
 
-// ---- core: string/format helpers ----
+// ---- core：字符串/格式化辅助 ----
 STM_TEST(core_wide_utf8_roundtrip) {
     if (stm::WideToUtf8(stm::Utf8ToWide("进程 abc")) != "进程 abc") {
         *err = L"Utf8ToWide/WideToUtf8 往返失败";
@@ -48,7 +48,7 @@ STM_TEST(core_format_percent_number) {
     return true;
 }
 
-// ---- core: config roundtrip (Chinese values) ----
+// ---- core：配置往返（中文值）----
 STM_TEST(core_cfg_roundtrip) {
     wchar_t temp[MAX_PATH]{};
     GetTempPathW(MAX_PATH, temp);
@@ -73,14 +73,14 @@ STM_TEST(core_cfg_roundtrip) {
     return true;
 }
 
-// ---- core: job queue ----
+// ---- core：任务队列 ----
 STM_TEST(core_jobs_submit_shutdown) {
     stm::JobQueue q;
     if (!q.Start()) { *err = L"JobQueue::Start 失败"; return false; }
     auto done = std::make_shared<bool>(false);
     q.Submit([done] { *done = true; });
-    // Wait for the job to START before shutdown: queued-but-not-started jobs are
-    // dropped by design at Shutdown (arch section 5).
+    // 关停前先等任务开始：排队但未开始的任务按设计会在
+    // Shutdown 时被丢弃（架构第 5 节）。
     for (int i = 0; i < 200 && !*done; ++i) Sleep(10);
     q.Shutdown(2000);
     if (!*done) { *err = L"队列任务未执行"; return false; }
@@ -88,7 +88,7 @@ STM_TEST(core_jobs_submit_shutdown) {
     return true;
 }
 
-// ---- core: notifications ----
+// ---- core：通知 ----
 STM_TEST(core_notifications_drain) {
     stm::NotificationQueue nq;
     stm::Notification n;
@@ -100,7 +100,7 @@ STM_TEST(core_notifications_drain) {
     nq.Drain(&out);
     const bool firstOk = (out.size() == 1 && out[0].seq == 7 && out[0].text == L"完成");
     out.clear();
-    nq.Drain(&out);  // second drain must be empty
+    nq.Drain(&out);  // 第二次取空必须为空
     if (!firstOk || !out.empty()) {
         *err = L"通知队列行为不符合预期";
         return false;
@@ -108,7 +108,7 @@ STM_TEST(core_notifications_drain) {
     return true;
 }
 
-// ---- core: snapshot store ----
+// ---- core：快照仓库 ----
 STM_TEST(core_snapshot_store) {
     stm::SnapshotStore store;
     auto first = store.Get();
@@ -128,7 +128,7 @@ STM_TEST(core_snapshot_store) {
     return true;
 }
 
-// ---- core: protected list ----
+// ---- core：保护名单 ----
 STM_TEST(core_protected_list) {
     if (stm::ProtectedReason(0, L"System Idle Process", L"").empty()) { *err = L"PID 0 未被保护"; return false; }
     if (stm::ProtectedReason(4, L"System", L"").empty()) { *err = L"PID 4 未被保护"; return false; }
@@ -143,7 +143,7 @@ STM_TEST(core_protected_list) {
     return true;
 }
 
-// ---- entry (plain main + wide command line parse) ----
+// ---- 入口（普通 main + 宽命令行解析）----
 int main(int argc, char** argv) {
     bool json = false;
     for (int i = 1; i < argc; ++i) {

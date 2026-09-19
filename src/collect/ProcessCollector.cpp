@@ -1,12 +1,12 @@
-// ProcessCollector: per-tick process snapshot.
-// Fast path: one NtQuerySystemInformation(SystemProcessInformation) call yields
-// pid/ppid/create time/CPU times/working set/private working set/IO/handles/
-// threads/page faults and per-thread context switches for the whole system.
-// Degraded path: Toolhelp + PSAPI (compatibility mode; contextSwitchesPerSec
-// and privateWorkingSet stay kUnavail there).
-// Delta fields (cpuPercent / diskBytesPerSec / pageFaultsPerSec /
-// contextSwitchesPerSec) use (pid, createTime) identity so a recycled PID can
-// never produce a bogus delta; the first tick has no baseline -> kUnavail.
+// ProcessCollector：每 tick 的进程快照。
+// 快路径：一次 NtQuerySystemInformation(SystemProcessInformation) 调用即可取得
+// 全系统的 pid/ppid/创建时间/CPU 时间/工作集/私有工作集/IO/句柄数/
+// 线程数/缺页数以及每线程上下文切换。
+// 降级路径：Toolhelp + PSAPI（兼容模式；contextSwitchesPerSec 与
+// privateWorkingSet 在该路径保持 kUnavail）。
+// 差值字段（cpuPercent / diskBytesPerSec / pageFaultsPerSec /
+// contextSwitchesPerSec）使用 (pid, createTime) 身份，被复用的 PID
+// 绝不会产生虚假差值；首个 tick 没有基线 -> kUnavail。
 #include "collect/CollectDetail.h"
 #include "core/HandleGuard.h"
 #include "core/ProtectedList.h"
@@ -30,13 +30,13 @@ uint64_t FtU64(const FILETIME& f) {
     return (static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
 }
 
-// Normalized per-process row: identical shape for the NtQSI and Toolhelp paths
-// so delta computation / flag assembly / ProcInfo assembly is shared.
+// 归一化的每进程行：NtQSI 与 Toolhelp 两条路径形状一致，
+// 差值计算/标志组装/ProcInfo 组装得以共享。
 struct RawRow {
     uint32_t pid = 0, parentPid = 0, sessionId = 0, handles = 0, threads = 0;
     uint64_t createTime = 0, kernelTime = 0, userTime = 0;
     uint64_t workingSet = 0, commitBytes = 0, pageFaults = 0;
-    int64_t privateWs = 0;  // private working set (bytes); valid only when pwsKnown
+    int64_t privateWs = 0;  // 私有工作集（字节）；仅 pwsKnown 时有效
     uint64_t ioRead = 0, ioWrite = 0, ioOther = 0, ctxSw = 0;
     bool timesKnown = false, wsKnown = false, commitKnown = false;
     bool pfKnown = false, ioKnown = false, ctxKnown = false, pwsKnown = false;
@@ -44,7 +44,7 @@ struct RawRow {
     std::wstring name;
 };
 
-// --- supplementary info helpers (path + flags), shared by both paths ---------
+// --- 补充信息辅助（路径 + 标志），两条路径共享 --------------------------------
 
 bool IsElevatedProcess(HANDLE h) {
     HANDLE tok = nullptr;
@@ -56,9 +56,9 @@ bool IsElevatedProcess(HANDLE h) {
     return e.TokenIsElevated != 0;
 }
 
-// True when the process runs under an AppContainer package (UWP). Two-call
-// protocol: null buffer -> required length; plain Win32 processes fail with
-// APPMODEL_ERROR_NO_PACKAGE (R5 #4b).
+// 进程是否运行于 AppContainer 包（UWP）之下。两次调用协议：
+// 空缓冲 -> 返回所需长度；普通 Win32 进程以
+// APPMODEL_ERROR_NO_PACKAGE 失败（R5 #4b）。
 bool IsPackagedProcess(HANDLE h) {
     UINT32 len = 0;
     const LONG rc = ::GetPackageFullName(h, &len, nullptr);
@@ -72,19 +72,19 @@ BOOL CALLBACK EnumWindowTitleProc(HWND hwnd, LPARAM lp) {
     ::GetWindowThreadProcessId(hwnd, &pid);
     if (pid == 0) return TRUE;
     wchar_t buf[512]{};
-    // For other-process windows this reads the cached caption; it never blocks.
+    // 对其他进程的窗口这里读取缓存标题；绝不阻塞。
     if (::GetWindowTextW(hwnd, buf, 511) <= 0) return TRUE;
-    out->emplace(pid, buf);  // z-order enumeration: first (top) visible window wins
+    out->emplace(pid, buf);  // 按 Z 序枚举：第一个（最顶层）可见窗口胜出
     return TRUE;
 }
 
-// pid -> count of running services hosted (R5 #7b: dwProcessId is only valid
-// for non-stopped services, and only SERVICE_WIN32 services carry a pid).
+// pid -> 承载的运行中服务数（R5 #7b：dwProcessId 仅对非停止服务有效，
+// 且只有 SERVICE_WIN32 服务带 pid）。
 bool EnumRunningServiceHosts(std::unordered_map<uint32_t, uint32_t>* out) {
     out->clear();
-    // EnumServicesStatusExW requires a real SCM handle (NULL fails with
-    // ERROR_INVALID_HANDLE); SC_MANAGER_ENUMERATE_SERVICE is grantee to
-    // non-admin callers.
+    // EnumServicesStatusExW 需要真实的 SCM 句柄（NULL 会以
+    // ERROR_INVALID_HANDLE 失败）；SC_MANAGER_ENUMERATE_SERVICE 授予
+    // 非管理员调用者。
     SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
     if (!scm) return false;
     std::vector<BYTE> buf(64 * 1024);
@@ -111,8 +111,8 @@ bool EnumRunningServiceHosts(std::unordered_map<uint32_t, uint32_t>* out) {
     return true;
 }
 
-// Path + handle-derived flag bits for one process. `services` / `titles` are
-// pre-computed per refresh cycle (every 5th tick) and reused from cache.
+// 单个进程的路径 + 句柄派生标志位。`services` / `titles` 按
+// 刷新周期（每第 5 个 tick）预计算并从缓存复用。
 ProcessCollector::Supp ComputeSupp(uint32_t pid,
                                    const std::unordered_map<uint32_t, uint32_t>& services,
                                    const std::unordered_map<uint32_t, std::wstring>& titles) {
@@ -144,8 +144,8 @@ ProcessCollector::Supp ComputeSupp(uint32_t pid,
     return s;
 }
 
-// Toolhelp+PSAPI slow path rows (compatibility mode). Fields that PSAPI cannot
-// provide (context switches) stay unknown -> kUnavail downstream.
+// Toolhelp+PSAPI 慢路径行（兼容模式）。PSAPI 提供不了的字段
+//（上下文切换）保持未知 -> 下游为 kUnavail。
 bool FillToolhelpRows(std::vector<RawRow>* rows) {
     std::vector<ToolhelpRow> th;
     if (!ToolhelpEnumerate(&th)) return false;
@@ -209,7 +209,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
     const double cores = si.dwNumberOfProcessors > 0 ? static_cast<double>(si.dwNumberOfProcessors)
                                                      : 1.0;
 
-    // --- 1. raw rows: NtQSI fast path, Toolhelp fallback -------------------
+    // --- 1. 原始行：NtQSI 快路径，Toolhelp 兜底 ----------------------------
     std::vector<RawRow> rows;
     bool ntsi = false;
     if (!degraded) {
@@ -228,8 +228,8 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
                 r.kernelTime = n.kernelTime;
                 r.userTime = n.userTime;
                 r.workingSet = n.workingSet;
-                r.privateWs = n.privateWs;  // WorkingSetPrivateSize (signed; see below)
-                r.commitBytes = n.privateCommit;  // PrivatePageCount = commit size
+                r.privateWs = n.privateWs;  // WorkingSetPrivateSize（有符号；见下文）
+                r.commitBytes = n.privateCommit;  // PrivatePageCount = 提交大小
                 r.pageFaults = n.pageFaults;
                 r.ioRead = n.ioReadBytes;
                 r.ioWrite = n.ioWriteBytes;
@@ -248,10 +248,10 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
     std::sort(rows.begin(), rows.end(),
               [](const RawRow& a, const RawRow& b) { return a.pid < b.pid; });
 
-    // --- 2. supplementary caches -------------------------------------------
-    // Whole-map refreshes (services / window titles) every 5th tick; the
-    // per-process handle-derived info is sliced: 1/5 of the list per tick so a
-    // single tick never pays the full OpenProcess storm.
+    // --- 2. 补充信息缓存 ---------------------------------------------------
+    // 整表刷新（服务/窗口标题）每第 5 个 tick 一次；每进程的
+    // 句柄派生信息则切片进行：每 tick 处理列表的 1/5，
+    // 单个 tick 绝不会承受完整的 OpenProcess 风暴。
     const bool suppCycle = (tickId % 5 == 1);
     if (suppCycle) {
         EnumRunningServiceHosts(&servicesByPid_);
@@ -260,7 +260,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
     }
     const size_t slice = static_cast<size_t>(tickId % 5);
 
-    // --- 3. assemble ProcInfo ----------------------------------------------
+    // --- 3. 组装 ProcInfo --------------------------------------------------
     const size_t n = rows.size();
     std::unordered_map<uint32_t, Prev> newPrev;
     newPrev.reserve(n * 2);
@@ -278,7 +278,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
         const RawRow& row = rows[i];
         const ProcKey key{row.pid, row.createTime};
 
-        // Supplementary: compute when uncached, else refresh this 1/5 slice.
+        // 补充信息：无缓存时计算，否则刷新这 1/5 切片。
         auto sit = supp_.find(key);
         if (sit == supp_.end() || (i % 5) == slice) {
             supp_[key] = ComputeSupp(row.pid, servicesByPid_, titlesByPid_);
@@ -288,8 +288,8 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
         if ((sit->second.flags & PF_AccessDenied) != 0) newDenied.insert(key);
         const bool stickyDenied = (denied_.count(key) != 0) || newDenied.count(key) != 0;
 
-        // Delta fields keyed by (pid, createTime): PID reuse has a different
-        // create time and therefore resets the baseline instead of lying.
+        // 差值字段以 (pid, createTime) 为键：复用的 PID 创建时间不同，
+        // 因此重置基线而不是撒谎。
         double cpu = kUnavail, disk = kUnavail, pfps = kUnavail, csps = kUnavail;
         const auto pit = prev_.find(row.pid);
         if (pit != prev_.end() && row.createTime != 0 && pit->second.createTime == row.createTime &&
@@ -297,7 +297,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
             if (row.timesKnown && pit->second.execKnown) {
                 const double dExec = static_cast<double>(row.kernelTime + row.userTime -
                                                          pit->second.execTime);
-                cpu = 100.0 * dExec / (elapsed * 1e7 * cores);  // 100ns -> sec, all-core
+                cpu = 100.0 * dExec / (elapsed * 1e7 * cores);  // 100ns -> 秒，按全部核心归一
             }
             if (row.ioKnown && pit->second.ioKnown) {
                 const double dIo = static_cast<double>(row.ioRead + row.ioWrite + row.ioOther -
@@ -333,9 +333,9 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
         p.userTime = row.timesKnown ? row.userTime : kUnavailU64;
         p.cpuPercent = cpu;
         p.workingSet = row.wsKnown ? row.workingSet : kUnavailU64;
-        // Private working set: straight from NtQSI WorkingSetPrivateSize on the
-        // fast path (source cross-validated once by SelfCheckGate item 6).
-        // Negative estimates and the slow path report kUnavailU64.
+        // 私有工作集：快路径直接取自 NtQSI WorkingSetPrivateSize
+        //（来源已由 SelfCheckGate 第 6 项校验一次）。
+        // 负估计与慢路径上报 kUnavailU64。
         p.privateWorkingSet =
             (row.pwsKnown && row.privateWs >= 0) ? static_cast<uint64_t>(row.privateWs)
                                                  : kUnavailU64;
@@ -343,7 +343,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
         p.ioReadBytes = row.ioKnown ? row.ioRead : kUnavailU64;
         p.ioWriteBytes = row.ioKnown ? row.ioWrite : kUnavailU64;
         p.diskBytesPerSec = disk;
-        p.netBytesPerSec = kUnavail;  // only ETW (phase 3) fills this
+        p.netBytesPerSec = kUnavail;  // 仅 ETW（第 3 阶段）填充此字段
         p.pageFaultsPerSec = pfps;
         p.contextSwitchesPerSec = csps;
         p.handles = row.handles;
@@ -361,7 +361,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
         totals.threadTotal += row.threads;
     }
 
-    // --- 4. prune state so recycled/dead pids never leak --------------------
+    // --- 4. 修剪状态，复用/死亡的 pid 绝不泄漏 ------------------------------
     for (auto it = supp_.begin(); it != supp_.end();) {
         if (seen.count(it->first) == 0) {
             it = supp_.erase(it);
@@ -369,7 +369,7 @@ void ProcessCollector::Collect(uint64_t tickId, bool degraded, TickOut* out) {
             ++it;
         }
     }
-    denied_ = newDenied;  // sticky within process lifetime, pruned on exit
+    denied_ = newDenied;  // 进程存活期内粘滞，退出时修剪
     prev_ = std::move(newPrev);
 
     out->totals = totals;
