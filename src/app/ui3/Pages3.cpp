@@ -17,12 +17,14 @@
 #include "app/ui3/GcPages.h"    // F4#3: 宿主服务模态
 #include "app/ui3/JumpState.h"  // F4#3: 跨页跳转槽
 #include "app/ui3/NetAdapterUi.h"  // A2: 适配器区纯逻辑（速度/排序/复制 IP）
+#include "app/ui3/NetMonUi.h"  // D5: 实时监视区纯逻辑（过滤/CSV/标签）
 #include "app/ui3/PageHelpers.h"
 #include "app/ui/Pages.h"
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/UiText.h"
 #include "collect/AdapterInfo.h"
 #include "collect/LhmSource.h"
+#include "collect/NetMonitor.h"
 #include "collect/NetTables.h"
 #include "collect/Sensors.h"
 #include "core/Str.h"
@@ -36,6 +38,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cwctype>
+#include <ctime>
+#include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -202,6 +207,14 @@ const wchar_t* ProtoLabel(ConnProto p) {
     }
 }
 
+// ---- D5：实时监视数据层实例 -------------------------------------------------
+// 文件级生命周期（晚于 main 返回析构）：析构会 join 差分轮询线程并停止
+// 全部 ETW 会话（无孤儿会话）；UI 线程之外只有 NetMonitor 自己的线程访问。
+stm::NetMonitor& NetMonInst() {
+    static std::unique_ptr<stm::NetMonitor> mon = std::make_unique<stm::NetMonitor>();
+    return *mon;
+}
+
 class NetworkPage final : public IPage {
 public:
     const wchar_t* Id() const override { return L"net"; }
@@ -217,6 +230,8 @@ public:
             }
         }
         DrawAdapterSection();  // A2：适配器区（独立抓取，置于页面顶部）
+        ImGui::Separator();
+        DrawNetMon(ctx);  // D5：实时监视区（适配器区与连接表之间）
         ImGui::Separator();
         fetch_.MaybeFetch(Produce, false);
         std::shared_ptr<const Result> res = fetch_.Peek();
@@ -247,6 +262,517 @@ private:
     static std::vector<ConnEntry> Produce(std::wstring* err) {
         return SnapshotConnections(err);
     }
+
+    // ---- D5：实时监视区 -----------------------------------------------------
+    // 三路数据源：连接事件流（免管理员）、按远程端点聚合（需管理员）、
+    // DNS 解析记录（需管理员，实验性）。约定：
+    //  - Drain 每帧执行（含折叠/暂停帧）：本地 deque 是展示层暂存，
+    //    DrainDns 还承担 DNS 自动禁用检测（契约要求每帧调用）。
+    //  - 「暂停显示」只冻结视图重建；后台记录与入队照常，取消暂停即补齐。
+    //  - 三路开关经 ops 任务队列执行并诚实读回；失败回滚 + toast。
+    struct NetMonToggle {
+        std::mutex mu;
+        bool ready = false;
+        bool desired = false;
+        bool actual = false;
+        std::wstring err;  // DNS 失败原因（契约 SetDnsCapture 产出）
+    };
+    enum class MonWhich { Events, Traffic, Dns };
+
+    static const wchar_t* MonToggleName(MonWhich which) {
+        switch (which) {
+            case MonWhich::Events: return L"连接事件监视";
+            case MonWhich::Traffic: return L"按远程端点聚合";
+            case MonWhich::Dns: return L"DNS 解析记录";
+            default: return L"—";
+        }
+    }
+
+    static std::vector<stm::RemoteTraffic> TopProduce(std::wstring* err) {
+        (void)err;  // TopRemoteTraffic 无错误路径（未开启时为空表）
+        return NetMonInst().TopRemoteTraffic(20);
+    }
+
+    void DrawNetMon(AppContext& ctx) {
+        stm::NetMonitor& mon = NetMonInst();
+        // 每帧取走新事件（顺序翻转为最新在前）；溢出按容量弃旧。
+        std::vector<stm::ConnEvent> fresh;
+        mon.DrainEvents(&fresh);
+        if (!fresh.empty()) {
+            for (auto it = fresh.rbegin(); it != fresh.rend(); ++it) {
+                evAll_.push_front(std::move(*it));
+            }
+            if (evAll_.size() > kNetMonDisplayCap) evAll_.resize(kNetMonDisplayCap);
+            ++evGen_;
+        }
+        std::vector<stm::DnsEvent> freshDns;
+        mon.DrainDns(&freshDns);  // 契约：还承担 DNS 自动禁用检测，每帧必须调用
+        if (!freshDns.empty()) {
+            for (auto it = freshDns.rbegin(); it != freshDns.rend(); ++it) {
+                dnsAll_.push_front(std::move(*it));
+            }
+            if (dnsAll_.size() > kNetMonDnsCap) dnsAll_.resize(kNetMonDnsCap);
+            ++dnsGen_;
+        }
+
+        PollMonToggles(ctx);
+        // 诚实读回：无开关在途时以采集器真实状态为准（含自动禁用）。
+        if (evToggle_ == nullptr) evOn_ = mon.EventCaptureEnabled();
+        if (trafficToggle_ == nullptr) trafficOn_ = mon.RemoteTrafficEnabled();
+        if (dnsToggle_ == nullptr) {
+            const bool actual = mon.DnsCaptureEnabled();
+            if (dnsOn_ && !actual) dnsAutoDisabled_ = true;  // 契约的自动禁用路径
+            dnsOn_ = actual;
+        }
+
+        // 过滤器控件 -> 纯逻辑过滤结构（子串预先小写化）。
+        monFilter_.process = AsciiLower(Utf8ToWide(procFilterUtf8_));
+        monFilter_.remote = AsciiLower(Utf8ToWide(remoteFilterUtf8_));
+        monFilter_.proto = static_cast<ProtoFilter>(protoFilter_);
+        monFilter_.kindMask = (kindNew_ ? kKindBitNew : 0u) |
+                              (kindClosed_ ? kKindBitClosed : 0u) |
+                              (kindState_ ? kKindBitState : 0u);
+        // 暂停 = 冻结视图重建（后台照常记录）；恢复时强制重建一次。
+        const bool filterChanged = !(monFilter_ == monAppliedFilter_);
+        if (!paused_ && (filterChanged || evGen_ != viewEvGen_)) {
+            viewEvents_.clear();
+            for (const stm::ConnEvent& e : evAll_) {
+                if (EventPassesFilter(monFilter_, e)) viewEvents_.push_back(e);
+            }
+            monAppliedFilter_ = monFilter_;
+            viewEvGen_ = evGen_;
+        }
+        if (!paused_ && (filterChanged || dnsGen_ != viewDnsGen_)) {
+            viewDns_.assign(dnsAll_.begin(), dnsAll_.end());
+            viewDnsGen_ = dnsGen_;
+        }
+
+        if (!ImGui::CollapsingHeader(U8(L"实时监视"), ImGuiTreeNodeFlags_DefaultOpen)) return;
+
+        // 诚实边界 + 丢弃警告。
+        ImGui::TextWrapped("%s", U8(L"连接级监视：不捕获通信内容；远程聚合与 DNS 记录需要"
+                                   L"管理员权限并依赖 ETW。"));
+        const uint64_t dropped = mon.DroppedEvents();
+        if (dropped > 0) {
+            ImGui::TextColored(ColWarn(), "%s",
+                               U8(Fmt(L"事件过多，已丢弃 {} 条（保新弃旧）", dropped)));
+        }
+        if (dnsAutoDisabled_ && !dnsOn_) {
+            ImGui::TextColored(ColWarn(), "%s",
+                               U8(L"DNS 记录已被自动禁用（事件字段不可靠或会话失效）；"
+                                  L"可重新开启重试"));
+        }
+
+        DrawNetMonControls(ctx, mon);
+        DrawNetMonFilters();
+        DrawNetMonEventTable(ctx);
+        DrawNetMonTop();
+        DrawNetMonDns();
+    }
+
+    void DrawNetMonControls(AppContext& ctx, stm::NetMonitor& mon) {
+        // 开启监视（免管理员）。关闭只停止差分线程：已记录事件保留展示。
+        ImGui::BeginDisabled(evToggle_ != nullptr);
+        if (ImGui::Checkbox(U8(L"开启监视"), &evOn_)) {
+            RequestMonToggle(ctx, MonWhich::Events, evOn_);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s",
+                              U8(evToggle_ != nullptr
+                                     ? std::wstring(L"正在切换（等待确认）…")
+                                     : std::wstring(L"以约 1 秒节拍差分连接表，记录连接的新建/"
+                                                    L"断开/状态变化（免管理员）。关闭监视不删除"
+                                                    L"已记录的事件")));
+        }
+        // 按远程端点聚合（需管理员；失败回滚 + toast）。
+        ImGui::SameLine();
+        ImGui::BeginDisabled(trafficToggle_ != nullptr);
+        if (ImGui::Checkbox(U8(L"按远程端点聚合（需管理员）"), &trafficOn_)) {
+            RequestMonToggle(ctx, MonWhich::Traffic, trafficOn_);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s",
+                              U8(std::wstring(L"经 ETW Kernel-Network 按远程 ip:端口 聚合收发"
+                                              L"字节（需管理员权限）；失败时开关自动回滚")));
+        }
+        // DNS 解析记录（需管理员；实验性）。
+        ImGui::SameLine();
+        ImGui::BeginDisabled(dnsToggle_ != nullptr);
+        if (ImGui::Checkbox(U8(L"DNS 解析记录（实验性·需管理员）"), &dnsOn_)) {
+            if (dnsOn_) dnsAutoDisabled_ = false;
+            RequestMonToggle(ctx, MonWhich::Dns, dnsOn_);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s",
+                              U8(std::wstring(L"经 ETW DNS-Client 记录本机进程的域名解析"
+                                             L"（需管理员权限，实验性：字段不可靠时会自动"
+                                             L"禁用并提示）")));
+        }
+        // 暂停显示 / 清空 / 导出。
+        ImGui::SameLine();
+        if (ImGui::Checkbox(U8(L"暂停显示"), &paused_)) {
+            if (!paused_) {
+                viewEvGen_ = ~0ull;  // 恢复：强制重建冻结的视图
+                viewDnsGen_ = ~0ull;
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(L"冻结表格刷新；后台照常记录，取消暂停后自动补齐"));
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(U8(L"清空"))) {
+            mon.ClearEvents();  // 同时重置丢弃计数（诚实口径：自上次清空以来）
+            evAll_.clear();
+            dnsAll_.clear();
+            ++evGen_;
+            ++dnsGen_;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(L"清空已记录的连接事件与 DNS 记录（不影响开关状态）"));
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(viewEvents_.empty());
+        if (ImGui::SmallButton(U8(L"导出 CSV"))) ExportNetMonCsv(ctx);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s",
+                              U8(L"把当前显示（已应用过滤）的事件写入 %LOCALAPPDATA%"
+                                 L"\\SuperTaskMgr\\captures\\netmon_*.csv"
+                                 L"（UTF-8 BOM，Excel 可直接打开）"));
+        }
+    }
+
+    void DrawNetMonFilters() {
+        ImGui::SetNextItemWidth(170.0f);
+        ImGui::InputTextWithHint("##nmproc", U8(L"进程名包含"), procFilterUtf8_,
+                                 sizeof(procFilterUtf8_));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(170.0f);
+        ImGui::InputTextWithHint("##nmremote", U8(L"远程包含"), remoteFilterUtf8_,
+                                 sizeof(remoteFilterUtf8_));
+        ImGui::SameLine();
+        const char* protoItems[3] = {U8(L"全部"), U8(L"TCP"), U8(L"UDP")};
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::Combo("##nmproto", &protoFilter_, protoItems, 3);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", U8(L"事件:"));
+        ImGui::SameLine();
+        ImGui::Checkbox(U8(L"新建"), &kindNew_);
+        ImGui::SameLine();
+        ImGui::Checkbox(U8(L"断开"), &kindClosed_);
+        ImGui::SameLine();
+        ImGui::Checkbox(U8(L"状态"), &kindState_);
+    }
+
+    void DrawNetMonEventTable(AppContext& ctx) {
+        (void)ctx;
+        ImGui::TextUnformatted(
+            U8(Fmt(L"连接事件（显示 {} / 记录 {} 条；最新在上）", viewEvents_.size(),
+                   evAll_.size())));
+        if (paused_) {
+            ImGui::SameLine();
+            ImGui::TextColored(ColWarn(), "%s", U8(L"已暂停（后台仍在记录）"));
+        }
+        if (viewEvents_.empty()) {
+            ImGui::TextColored(ColMuted(), "%s",
+                               U8(evOn_ ? L"暂无匹配的事件（开启后新出现的连接才会产生事件）"
+                                        : L"未开启监视；打开「开启监视」开始记录连接事件"));
+            return;
+        }
+        const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                          ImGuiTableFlags_SizingFixedFit;
+        ImGui::BeginChild("##nmevtchild", ImVec2(0.0f, 300.0f), ImGuiChildFlags_Borders);
+        if (ImGui::BeginTable("netmon_events", 8, flags)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, 82.0f);
+            ImGui::TableSetupColumn(U8(L"事件"), ImGuiTableColumnFlags_WidthFixed, 58.0f);
+            ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed, 56.0f);
+            ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn(U8(L"本地"), ImGuiTableColumnFlags_WidthFixed, 168.0f);
+            ImGui::TableSetupColumn(U8(L"远程"), ImGuiTableColumnFlags_WidthFixed, 168.0f);
+            ImGui::TableSetupColumn(U8(L"服务"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableSetupColumn(U8(L"状态"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(viewEvents_.size()));
+            while (clipper.Step()) {
+                for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+                    const stm::ConnEvent& e = viewEvents_[static_cast<size_t>(r)];
+                    ImGui::PushID(r);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(FormatEventClock(e.unixTime)));
+                    ImGui::TableNextColumn();
+                    const ImVec4 tone =
+                        EventToneOf(e.kind) == EventTone::Good
+                            ? ColDone()
+                            : (EventToneOf(e.kind) == EventTone::Bad ? ColFail() : ColWarn());
+                    ImGui::TextColored(tone, "%s", U8(EventKindLabel(e.kind)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(NetMonProtoLabel(e.proto)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(EventProcessDisplay(e)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(MonEndpoint(e.localAddr, e.localPort)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(MonEndpoint(e.remoteAddr, e.remotePort)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(EventServiceDisplay(e)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(
+                        U8(e.stateLabel.empty() ? std::wstring(L"—") : e.stateLabel));
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+    }
+
+    void DrawNetMonTop() {
+        if (!trafficOn_) return;  // 契约：仅 ETW 端点聚合开启时有数据
+        topFetch_.MaybeFetch(TopProduce, false);
+        std::shared_ptr<const AsyncFetch<std::vector<stm::RemoteTraffic>>::Result> res =
+            topFetch_.Peek();
+        ImGui::TextUnformatted(U8(L"Top 远程目标"));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", U8(L"（按收发总量排序，最多 20 行；字节为自启用起累计，"
+                                     L"非速率）"));
+        if (res == nullptr) {
+            ImGui::TextColored(ColMuted(), "%s", U8(L"统计加载中…"));
+            return;
+        }
+        if (res->data.empty()) {
+            ImGui::TextColored(ColMuted(), "%s", U8(L"暂无端点聚合数据（等待本机网络流量…）"));
+            return;
+        }
+        const int flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                          ImGuiTableFlags_SizingFixedFit;
+        if (!ImGui::BeginTable("netmon_top", 5, flags)) return;
+        ImGui::TableSetupColumn(U8(L"远程:端口"), ImGuiTableColumnFlags_WidthFixed, 190.0f);
+        ImGui::TableSetupColumn(U8(L"服务"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn(U8(L"↓入"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn(U8(L"↑出"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < res->data.size(); ++i) {
+            const stm::RemoteTraffic& t = res->data[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(
+                U8(t.remote.empty() ? std::wstring(L"—")
+                                    : t.remote + L":" + std::to_wstring(static_cast<unsigned>(t.port))));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(U8(t.service.empty() ? std::wstring(L"—") : t.service));
+            ImGui::TableNextColumn();
+            std::wstring name = t.processName.empty()
+                                    ? (t.pid == 0 ? std::wstring(L"系统") : std::wstring(L"—"))
+                                    : t.processName;
+            ImGui::TextUnformatted(U8(name + L"（" + std::to_wstring(t.pid) + L"）"));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(U8(FormatBytes(static_cast<uint64_t>(t.bytesIn))));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(U8(FormatBytes(static_cast<uint64_t>(t.bytesOut))));
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    void DrawNetMonDns() {
+        if (!dnsOn_) return;  // 契约：仅 DNS 捕获开启时显示
+        ImGui::TextUnformatted(U8(Fmt(L"DNS 解析记录（{} 条；最新在上）", viewDns_.size())));
+        if (viewDns_.empty()) {
+            ImGui::TextColored(ColMuted(), "%s", U8(L"暂无解析记录（等待本机域名查询…）"));
+            return;
+        }
+        const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                          ImGuiTableFlags_SizingFixedFit;
+        ImGui::BeginChild("##nmdnschild", ImVec2(0.0f, 170.0f), ImGuiChildFlags_Borders);
+        if (ImGui::BeginTable("netmon_dns", 3, flags)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, 82.0f);
+            ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 1.4f);
+            ImGui::TableSetupColumn(U8(L"查询域名"), ImGuiTableColumnFlags_WidthStretch, 2.6f);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(viewDns_.size()));
+            while (clipper.Step()) {
+                for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+                    const stm::DnsEvent& d = viewDns_[static_cast<size_t>(r)];
+                    ImGui::PushID(r);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(FormatEventClock(d.unixTime)));
+                    ImGui::TableNextColumn();
+                    std::wstring name =
+                        d.processName.empty()
+                            ? (d.pid == 0 ? std::wstring(L"系统") : std::wstring(L"—"))
+                            : d.processName;
+                    ImGui::TextUnformatted(U8(name + L"（" + std::to_wstring(d.pid) + L"）"));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(d.query));
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+    }
+
+    void RequestMonToggle(AppContext& ctx, MonWhich which, bool desired) {
+        std::shared_ptr<NetMonToggle> toggle = std::make_shared<NetMonToggle>();
+        toggle->desired = desired;
+        std::shared_ptr<NetMonToggle>* slot =
+            which == MonWhich::Events
+                ? &evToggle_
+                : (which == MonWhich::Traffic ? &trafficToggle_ : &dnsToggle_);
+        *slot = toggle;
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        if (!app) {
+            *slot = nullptr;  // 拆除竞争：读回同步自动回滚复选框
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，开关未执行（应用可能正在退出）");
+            return;
+        }
+        stm::NetMonitor* mon = &NetMonInst();
+        if (app->jobs.Submit([app, toggle, mon, which, desired] {
+                bool actual = false;
+                std::wstring err;
+                switch (which) {
+                    case MonWhich::Events:
+                        actual = mon->SetEventCapture(desired);
+                        break;
+                    case MonWhich::Traffic:
+                        actual = mon->SetRemoteTraffic(desired);
+                        break;
+                    case MonWhich::Dns:
+                        actual = mon->SetDnsCapture(desired, &err);
+                        break;
+                    default:
+                        break;
+                }
+                std::lock_guard<std::mutex> lock(toggle->mu);
+                toggle->actual = actual;
+                toggle->err = std::move(err);
+                toggle->ready = true;
+            }) == 0) {
+            *slot = nullptr;  // 队列已关：回滚（诚实读回恢复原值）
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，开关未执行（应用可能正在退出）");
+        }
+    }
+
+    void PollMonToggles(AppContext& ctx) {
+        auto poll = [&](std::shared_ptr<NetMonToggle>& slot, MonWhich which) {
+            if (!slot) return;
+            bool ready = false, desired = false, actual = false;
+            std::wstring err;
+            {
+                std::lock_guard<std::mutex> lock(slot->mu);
+                ready = slot->ready;
+                desired = slot->desired;
+                actual = slot->actual;
+                err = slot->err;
+            }
+            if (!ready) return;
+            slot.reset();
+            const std::wstring name = MonToggleName(which);
+            if (actual == desired) {
+                PushNote(ctx, Notification::Kind::Info,
+                         Fmt(L"已{}{}", desired ? L"开启" : L"关闭", name));
+                return;
+            }
+            if (desired) {
+                PushNote(ctx, Notification::Kind::JobFailed,
+                         which == MonWhich::Traffic
+                             ? std::wstring(L"按远程端点聚合开启失败：常见为缺少管理员权限"
+                                            L"或 ETW 会话数已达上限/被策略阻止")
+                             : Fmt(L"{}开启失败：{}", name,
+                                   err.empty() ? std::wstring(L"原因详见日志") : err));
+            } else {
+                PushNote(ctx, Notification::Kind::JobFailed,
+                         Fmt(L"{}关闭失败（原因详见日志）", name));
+            }
+        };
+        poll(evToggle_, MonWhich::Events);
+        poll(trafficToggle_, MonWhich::Traffic);
+        poll(dnsToggle_, MonWhich::Dns);
+    }
+
+    void ExportNetMonCsv(AppContext& ctx) {
+        if (viewEvents_.empty()) return;
+        auto rows = std::make_shared<const std::vector<stm::ConnEvent>>(viewEvents_);
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        if (!app) {
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，导出未执行（应用可能正在退出）");
+            return;
+        }
+        if (app->jobs.Submit([app, rows] {
+                const std::wstring dir = NetMonCsvDir();
+                if (EnsureDir(dir).empty()) {  // 契约：失败返回空串
+                    PushNote(*app, Notification::Kind::JobFailed,
+                             Fmt(L"创建目录失败：{}", dir));
+                    return;
+                }
+                const std::wstring path =
+                    dir + L"\\" + NetMonCsvFileName(static_cast<int64_t>(std::time(nullptr)));
+                std::ofstream f(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+                if (!f.is_open()) {
+                    PushNote(*app, Notification::Kind::JobFailed,
+                             L"无法创建 CSV 文件（被占用或无写入权限）");
+                    return;
+                }
+                f << "\xEF\xBB\xBF";  // UTF-8 BOM：Excel 直接双击可读
+                f << WideToUtf8(BuildNetMonCsv(*rows));
+                f.flush();
+                const bool ok = f.good();
+                f.close();
+                if (ok) {
+                    PushNote(*app, Notification::Kind::JobDone,
+                             Fmt(L"已导出 {} 条事件：{}", rows->size(), path));
+                } else {
+                    PushNote(*app, Notification::Kind::JobFailed, L"写入 CSV 失败（磁盘错误）");
+                }
+            }) == 0) {
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，导出未执行（应用可能正在退出）");
+        }
+    }
+
+    // D5 实时监视状态。
+    std::shared_ptr<NetMonToggle> evToggle_;      // 非 null = 开关在途
+    std::shared_ptr<NetMonToggle> trafficToggle_;
+    std::shared_ptr<NetMonToggle> dnsToggle_;
+    bool evOn_ = false;             // 复选框镜像（诚实读回）
+    bool trafficOn_ = false;
+    bool dnsOn_ = false;
+    bool dnsAutoDisabled_ = false;  // 契约的自动禁用已发生（提示一次）
+    bool paused_ = false;           // 暂停显示：冻结视图重建，后台照常记录
+    std::deque<stm::ConnEvent> evAll_;    // 最新在前；容量 kNetMonDisplayCap
+    std::deque<stm::DnsEvent> dnsAll_;    // 最新在前；容量 kNetMonDnsCap
+    uint64_t evGen_ = 0;            // 任一入队/清空即递增（视图重建判据）
+    uint64_t dnsGen_ = 0;
+    uint64_t viewEvGen_ = ~0ull;
+    uint64_t viewDnsGen_ = ~0ull;
+    EventFilter monFilter_;         // 控件当前值
+    EventFilter monAppliedFilter_;  // 上次重建视图时应用的值
+    std::vector<stm::ConnEvent> viewEvents_;  // 冻结/展示用过滤视图
+    std::vector<stm::DnsEvent> viewDns_;
+    char procFilterUtf8_[128] = {};
+    char remoteFilterUtf8_[128] = {};
+    int protoFilter_ = 0;           // ProtoFilter 全部/TCP/UDP
+    bool kindNew_ = true;
+    bool kindClosed_ = true;
+    bool kindState_ = true;
+    AsyncFetch<std::vector<stm::RemoteTraffic>> topFetch_{2.0};
 
     // ---- A2：适配器区 -------------------------------------------------------
     // EnumAdaptersNet 是阻塞调用（毫秒级），只允许在任务工作线程上执行；

@@ -8,10 +8,12 @@
 //   - Stop 干净地 join；异常绝不逃出工作线程。
 #include "collect/CollectService.h"
 #include "collect/CollectDetail.h"
+#include "collect/SelfCheckGate.h"  // 维护轮 10：自检门逐项报告（GateReport）
 #include "core/Log.h"
 #include "core/Str.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <ctime>
 #include <mutex>
@@ -84,10 +86,19 @@ struct CollectService::Impl {
     // ---- ETW 每 pid 网络速率（第 3 阶段；默认关，仅管理员）------
     cd::EtwNetCollector netEtw;
     std::unordered_map<uint32_t, uint64_t> prevNetBytes_;  // pid -> 上一 tick 的累计字节
-    // ---- 自检门限（只在第一个 tick 运行一次）----
+    // ---- 自检门限（只在第一个 tick 运行一次；RequestSelfCheckRetry 触发重跑）----
     bool gateDone = false;
     bool degraded = false;
     std::wstring degradeReason;
+    // ---- 兼容模式诊断（维护轮 10；V24 P1-1 加代际）----
+    // retry：UI/selftest 置位（原子），采集线程在下一 tick 用 exchange 消费。
+    std::atomic<bool> selfCheckRetry{false};
+    // 门每真正跑完一次（报告已写入 lastSelfCheck 之后）+1；UI 据此判定
+    // 一次重跑完成——ticks++ 发生在 DoTick 之后、标志在 DoTick 开头消费，
+    // tick 计数会"提前"于重跑完成，不能作为完成信号。
+    std::atomic<uint64_t> gateRunGen{0};
+    // 最近一次自检门的逐项结果（mu 保护；LastSelfCheckReport 任意线程可调）。
+    std::vector<SelfCheckItem> lastSelfCheck;
     // ---- GPU 节拍 + 最近 GPU 数据（跳过查询的 tick 复用）----
     Clock::time_point nextGpuAt{};  // epoch -> 首个 tick 即到期
     double gpuIntervalMs = 2000.0;
@@ -136,13 +147,31 @@ struct CollectService::Impl {
     }
 
     void DoTick(SnapshotStore* store, uint64_t tickId) {
-        // 自检门限：启动时对 NtQSI 快路径校验一次。
-        if (!gateDone) {
+        // 自检门限：启动第一个 tick 运行；之后仅当收到 RequestSelfCheckRetry
+        //（原子标志，exchange 消费——多次请求合并为一次重跑）时重跑。
+        // 通过则自动退出兼容模式（degraded 归零，后续快照回到快速路径）。
+        if (!gateDone || selfCheckRetry.exchange(false)) {
             gateDone = true;
-            const cd::GateResult g = cd::RunSelfCheckGate();
-            degraded = g.degraded;
-            degradeReason = g.reason;
-            if (degraded) STM_LOG_WARN("collect", Fmt(L"自校验门：{}", g.reason));
+            const cd::GateReport rep = cd::RunSelfCheckGateReported();
+            degraded = rep.result.degraded;
+            degradeReason = rep.result.reason;
+            {   // 逐项报告：name 指向静态字面量，指针复制安全；detail 深拷贝。
+                std::vector<SelfCheckItem> items;
+                items.reserve(rep.items.size());
+                for (const cd::GateItem& gi : rep.items) {
+                    items.push_back(SelfCheckItem{gi.name, gi.ran, gi.passed, gi.detail});
+                }
+                std::lock_guard<std::mutex> lock(mu);
+                lastSelfCheck = std::move(items);
+            }
+            // P1-1：报告可见之后才递增代际（release/acquire 配对），UI 观察到
+            // 新代际时 LastSelfCheckReport() 必然已是本次结果。
+            gateRunGen.fetch_add(1, std::memory_order_release);
+            if (degraded) {
+                STM_LOG_WARN("collect", Fmt(L"自校验门：{}", degradeReason));
+            } else {
+                STM_LOG_INFO("collect", L"自校验门通过，NtQSI 快速路径启用（重跑或首次）");
+            }
         }
 
         auto snap = std::make_shared<Snapshot>();
@@ -305,6 +334,27 @@ void CollectService::SetGpuEnabled(bool on) {
 bool CollectService::GpuEnabled() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
     return impl_->gpuEnabled;
+}
+
+// ---- 兼容模式诊断（维护轮 10，契约见 CollectService.h）--------------------
+
+std::vector<CollectService::SelfCheckItem> CollectService::LastSelfCheckReport() const {
+    // 空向量 = 尚未自检（采集线程第一个 tick 之前）。name 指向
+    // 采集内部的静态字面量，detail 为深拷贝——返回值可安全跨线程持有。
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->lastSelfCheck;
+}
+
+void CollectService::RequestSelfCheckRetry() {
+    // 只置原子标志，绝不在这里跑自检（本调用来自 UI/selftest 线程）；
+    // 采集线程在下一 tick 用 exchange 消费。成功则自动退出兼容模式。
+    impl_->selfCheckRetry.store(true, std::memory_order_release);
+    STM_LOG_INFO("selfcheck", L"收到重新自检请求：下一采集 tick 重跑自检门（多次请求合并）");
+}
+
+uint64_t CollectService::LastSelfCheckGeneration() const {
+    // V24 P1-1：完成检测的单一事实来源——门真跑完（含报告落库）才 +1。
+    return impl_->gateRunGen.load(std::memory_order_acquire);
 }
 
 void CollectService::SetNetEtwEnabled(bool on) {

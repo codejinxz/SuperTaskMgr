@@ -39,7 +39,18 @@
 //                  0x1B1）按设计不可达：需要内核驱动，
 //                  而本应用不带任何驱动（红线）——传感器页
 //                  已注明并提供可选的 LibreHardwareMonitor 桥接。
-//   风扇            一律 NeedDriver。
+//   每核 DTS 温度    （D6，2026-09-20）可选内核通道：本机装有 PawnIO
+//                  （官方签名运行时，用户自行安装）且官方签名模块
+//                  blob 已放置时，经 PawnIO IntelMSR 白名单只读 MSR
+//                  0x19C/0x1A2 取每核 DTS（collect/PawnIoLink.h），
+//                  逐条追加进 cpu 组（label "CPU 核心 N（DTS）"，
+//                  source "PawnIO"）。未安装/模块缺失 -> 如实不出线，
+//                  行为与从前完全一致（NeedDriver 说明见下）。
+//   风扇            默认 NeedDriver；PawnIO LpcIO 通道成功识别已知
+//                  SuperIO 芯片时填真实 RPM（label 带芯片名），失败保持
+//                  NeedDriver。电压经 LpcIO 时进 extra 组。
+//                  本应用仍绝不附带/下载/静默安装任何内核驱动或模块——
+//                  PawnIO 及其模块均由用户从官方渠道自行放置（红线不变）。
 //
 // 阻塞调用：在 ops 任务队列上运行。绝不抛异常；允许部分结果。
 // F3 差值窗口使每次读取多睡约 350 ms（页面刷新间隔 >=10 s）。
@@ -47,6 +58,7 @@
 #include <ws2tcpip.h>  // 引入 ws2ipdef.h -> 为 netioapi 的 MIB_* 声明定义 _WS2IPDEF_
 #include "collect/Sensors.h"
 #include "collect/CollectDetail.h"  // cd:: PDH 通配辅助（同一库）
+#include "collect/PawnIoLink.h"     // D6：PawnIO 可选内核通道（温度/风扇/电压）
 #include "core/HandleGuard.h"
 #include "core/Log.h"
 #include "core/Str.h"
@@ -1553,13 +1565,78 @@ SensorSnapshot ReadSensors(std::wstring* err) {
         ReadMemory(&snap.memory, &notes);
         ReadExtraSensors(&snap.extra);  // G-B：尽力而为；为空 -> 不展示
         snap.uptimeSec = static_cast<double>(::GetTickCount64()) / 1000.0;
-        SensorReading fan;
-        fan.label = L"风扇转速";
-        fan.value = 0.0;
-        fan.unit = L"rpm";
-        fan.state = SensorReading::State::NeedDriver;
-        snap.fans.push_back(fan);
-        notes += L"；风扇转速需要内核驱动（本应用不随包分发驱动，见调研 R6）；CPU 占用率另见性能页；"
+
+        // ---- D6（2026-09-20）：PawnIO 可选内核通道（全部尽力而为、全诚实）----
+        // 每核 DTS 温度：仅在 PawnIO 驱动就绪 + 官方签名模块已放置时出线。
+        // 标签 N 取真实逻辑处理器序号+1（V26 P1-3：被合理域滤掉的核不占
+        // 槽位，但后续核的标签仍与系统核编号对齐，不漂移）。
+        {
+            int dts[64] = {0};
+            int dtsLp[64] = {0};
+            const int n = pawnio::ReadCpuDtsTemps(dts, dtsLp, 64);
+            if (n > 0) {
+                for (int i = 0; i < n; ++i) {
+                    SensorReading r;
+                    r.label = Fmt(L"CPU 核心 {}（DTS）", dtsLp[i] + 1);
+                    r.value = dts[i];
+                    r.unit = L"°C";
+                    r.state = SensorReading::State::Ok;
+                    r.source = L"PawnIO";
+                    snap.cpu.push_back(std::move(r));
+                }
+                notes += L"；每核 DTS 温度来自 PawnIO（官方签名模块，只读寄存器）";
+            } else if (n == -2) {
+                notes += L"；PawnIO 驱动在但官方签名模块未放置（每核 DTS 不可用）";
+            }
+        }
+        // 风扇/电压：LpcIO 通道成功识别已知 SuperIO 芯片时填真实读数；
+        // 无数据（芯片未知/无风扇）不算失败——保持 NeedDriver 诚实态。
+        bool fansReal = false;
+        {
+            int rpms[7] = {0};
+            const int nf = pawnio::ReadLpcIoFans(rpms, 7);
+            if (nf > 0) {
+                fansReal = true;
+                const std::wstring chip = pawnio::LpcIoChipName();
+                for (int i = 0; i < nf; ++i) {
+                    SensorReading r;
+                    r.label = chip.empty() ? Fmt(L"风扇 {}", i + 1)
+                                           : Fmt(L"风扇 {}（{}）", i + 1, chip);
+                    r.value = rpms[i];
+                    r.unit = L"rpm";
+                    r.state = SensorReading::State::Ok;
+                    r.source = L"PawnIO";
+                    snap.fans.push_back(std::move(r));
+                }
+            } else {
+                SensorReading fan;
+                fan.label = L"风扇转速";
+                fan.value = 0.0;
+                fan.unit = L"rpm";
+                fan.state = SensorReading::State::NeedDriver;
+                snap.fans.push_back(fan);
+            }
+            double volts[9] = {0.0};
+            const int nv = pawnio::ReadLpcIoVoltages(volts, 9);
+            if (nv > 0) {
+                const std::wstring chip = pawnio::LpcIoChipName();
+                for (int i = 0; i < nv; ++i) {
+                    SensorReading r;
+                    r.label = chip.empty() ? Fmt(L"主板电压 in{}", i)
+                                           : Fmt(L"主板电压 in{}（{}）", i, chip);
+                    r.value = volts[i];
+                    r.unit = L"V";
+                    r.state = SensorReading::State::Ok;
+                    r.source = L"PawnIO";
+                    snap.extra.push_back(std::move(r));
+                }
+            }
+        }
+
+        if (!fansReal) {
+            notes += L"；风扇转速需要内核驱动（本应用不随包分发驱动，见调研 R6）";
+        }
+        notes += L"；CPU 占用率另见性能页；"
                  L"每核占用率/GPU 引擎与显存来自 PDH、网卡速率来自 GetIfTable2（350ms 增量窗口）；"
                  L"热区/热区计数器/DPTF 温度均为区域级读数而非每核 DTS；"
                  L"每核温度等更多传感器可外接 LibreHardwareMonitor 数据源（默认关闭）";

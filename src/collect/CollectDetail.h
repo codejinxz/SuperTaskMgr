@@ -9,6 +9,7 @@
 #include <pdhmsg.h>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
@@ -16,8 +17,126 @@
 #include <unordered_map>
 #include <vector>
 #include "core/ProcData.h"
+#include "collect/NetMonitor.h"  // ConnEvent/RemoteTraffic/DnsEvent（内部实现复用）
+#include "collect/NetTables.h"   // ConnEntry/ConnProto（差分纯函数签名）
 
 namespace stm {
+
+// ---------------------------------------------------------------------------
+// 第 10 维护轮（NetMonitor，契约 NetMonitor.h）：连接事件差分纯函数 +
+// 远程端点聚合到 UI 行的换算。二者刻意做成纯函数（不触碰成员/全局态），
+// 由 NetMonitor.cpp 的线程与 selftest 共用。
+// ---------------------------------------------------------------------------
+// 差分相邻两次连接表快照中 `proto` 协议族的行，追加产出 ConnEvent
+//（V25 P0-1 追加语义：*不*清空 *events——调用方复用同一 vector 连续做
+// Tcp4/Tcp6 双族差分；需要隔离时调用方自行 clear）：
+// 新出现的 TCP 行=New；消失且原状态非 LISTEN 的行=Closed；
+// 同四元组 state 变化=StateChanged。UDP 族（Udp4/Udp6）不产任何事件。
+// unixTime 写入每条事件；processName 留空由调用方用进程名缓存补齐。
+void DiffConnSnapshots(const std::vector<ConnEntry>& prev,
+                       const std::vector<ConnEntry>& cur, int64_t unixTime,
+                       ConnProto proto, std::vector<ConnEvent>* events);
+
+namespace cd {
+
+// ---------------------------------------------------------------------------
+// 环形事件缓冲（容量固定，满时覆盖最旧并计数——保新弃旧、绝不阻塞写入
+// 线程）。Drain 按时间序取走全部。用于 ConnEvent（kNetEventCap）与
+// DnsEvent（内部上限）两个实例。
+// ---------------------------------------------------------------------------
+template <typename T>
+class EventRing {
+public:
+    explicit EventRing(size_t cap) : slots_(cap == 0 ? 1 : cap) {}
+    EventRing(const EventRing&) = delete;
+    EventRing& operator=(const EventRing&) = delete;
+    void Push(T v) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (count_ < slots_.size()) {
+            slots_[(head_ + count_) % slots_.size()] = std::move(v);
+            ++count_;
+        } else {
+            slots_[head_] = std::move(v);  // 环回：覆盖最旧
+            head_ = (head_ + 1) % slots_.size();
+            ++dropped_;
+        }
+    }
+    void Drain(std::vector<T>* out) {
+        std::lock_guard<std::mutex> lock(mu_);
+        out->clear();
+        out->reserve(count_);
+        for (size_t i = 0; i < count_; ++i) {
+            out->push_back(std::move(slots_[(head_ + i) % slots_.size()]));
+        }
+        head_ = 0;
+        count_ = 0;
+    }
+    uint64_t Dropped() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return dropped_;
+    }
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mu_);
+        head_ = 0;
+        count_ = 0;
+        dropped_ = 0;  // 清空同时重置丢弃计数（“自上次清空以来”的诚实展示）
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<T> slots_;
+    size_t head_ = 0;
+    size_t count_ = 0;
+    uint64_t dropped_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// pid -> 进程名缓存（5s TTL，一次 Toolhelp 全系统快照喂满）。NameOf 查
+// 不到返回空（诚实——进程可能已退出）。
+// ---------------------------------------------------------------------------
+class ProcNameCache {
+public:
+    std::wstring NameOf(uint32_t pid);
+
+private:
+    void RefreshLocked();
+
+    std::mutex mu_;
+    std::unordered_map<uint32_t, std::wstring> byPid_;
+    std::chrono::steady_clock::time_point stamp_{};
+};
+
+// ---------------------------------------------------------------------------
+// ETW 远程端点聚合的键与值（EtwNetCollector 填写，TopRemoteFromEndpoints
+// 换算为 UI 的 RemoteTraffic 行）。family 取 AF_INET/AF_INET6；取不到
+// 远程地址的事件不进此映射（退化为既有仅-pid 路径并计数）。
+// ---------------------------------------------------------------------------
+struct EndpointKey {
+    uint32_t pid = 0;
+    uint16_t family = 0;  // AF_INET / AF_INET6
+    uint16_t port = 0;    // 主机字节序
+    uint8_t proto = 0;    // IPPROTO_TCP/UDP；载荷无 proto 字段时为 0
+    uint8_t ip[16] = {};  // family=AF_INET 时用前 4 字节
+    bool operator==(const EndpointKey& o) const {
+        return pid == o.pid && family == o.family && port == o.port && proto == o.proto &&
+               std::memcmp(ip, o.ip, sizeof ip) == 0;
+    }
+};
+struct EndpointKeyHash {
+    size_t operator()(const EndpointKey& k) const noexcept;
+};
+struct EndpointAgg {
+    uint64_t bytesIn = 0, bytesOut = 0, events = 0;
+};
+using EndpointMap = std::unordered_map<EndpointKey, EndpointAgg, EndpointKeyHash>;
+
+}  // namespace cd
+
+// 端点聚合映射 -> 按 (入+出) 总字节降序排序并截断 topN 的 RemoteTraffic。
+// 纯函数：填 remote/port/service/pid/bytesIn/bytesOut；processName 由调用
+// 方用进程名缓存补齐（保持可单测）。
+std::vector<RemoteTraffic> TopRemoteFromEndpoints(const cd::EndpointMap& src, size_t topN);
+
 namespace cd {
 
 // ---------------------------------------------------------------------------
@@ -204,12 +323,33 @@ public:
     EtwNetCollector(const EtwNetCollector&) = delete;
     EtwNetCollector& operator=(const EtwNetCollector&) = delete;
 
+    // 可选：在 Start 前改写会话名（NetMonitor 用 L"SuperTaskMgr-NetMon-<pid>"
+    // 以免与 CollectService 的 L"SuperTaskMgr-Net-<pid>" 互相挤掉）。
+    void SetSessionName(const std::wstring& name) { sessionName_ = name; }
+
     bool Start();   // 幂等；失败返回 false 并记错误日志（非管理员等）
     void Stop();    // 幂等；停止会话并 join 消费线程
     bool Running(); // ETW 会话存活期间为 true
     // pid -> 自 Start 起的累计收发字节（线程安全拷贝）。
     void CopyCumulative(std::unordered_map<uint32_t, uint64_t>* out) const;
     uint64_t TotalEvents() const;  // 自 Start 起解析的收发事件数
+    // (pid, 远程 ip:port, proto) -> 累计收发字节（第 10 维护轮扩展；线程安全拷贝）。
+    void CopyEndpoints(EndpointMap* out) const;
+    // 远程字段解析统计与一份原始字段样本（自测/实测探针用）。
+    struct FieldStats {
+        uint64_t addrHit = 0, addrMiss = 0;   // saddr/daddr 取到/缺失
+        uint64_t portHit = 0, portMiss = 0;   // sport/dport 取到/缺失
+        uint64_t dirFieldHit = 0;             // "direction" 字段存在
+        uint64_t noRemoteEvents = 0;          // 因缺地址/端口退化为仅-pid 的事件
+    };
+    struct RawFieldSample {                   // 首个解析成功的载荷原样保存
+        bool valid = false;
+        uint16_t saddrFamily = 0, daddrFamily = 0;  // AddrProp 判定；0=未取到
+        uint32_t sport = 0, dport = 0, direction = 0, proto = 0;
+        uint8_t saddr[16] = {}, daddr[16] = {};
+    };
+    FieldStats CopyFieldStats() const;
+    RawFieldSample CopyRawSample() const;
     // 存在同名 ETW 会话时为 true（selftest 清理检查用）。
     static bool SessionExists(const wchar_t* name);
 
@@ -221,13 +361,64 @@ private:
 
     TRACEHANDLE session_ = 0;       // 来自 StartTraceW
     TRACEHANDLE openTrace_ = 0;     // 来自 OpenTraceW（由消费线程关闭）
-    std::wstring sessionName_;      // L"SuperTaskMgr-Net-<pid>"
+    GUID myGuid_{};                 // 本会话实例 GUID（Start 后内核回填；区分同名新会话）
+    std::wstring sessionName_;      // 默认 L"SuperTaskMgr-Net-<pid>"
     std::vector<BYTE> stopProps_;   // ControlTraceW 缓冲（由 mu_ 保护）
     std::thread consumer_;
     mutable std::mutex mu_;  // 保护下方所有成员（回调 + 所属线程）
     std::unordered_map<uint32_t, Agg> bytes_;
+    EndpointMap endpoints_;         // 远程端点级聚合（与仅-pid 路径并存）
+    FieldStats fieldStats_;
+    RawFieldSample rawSample_;
     uint64_t totalEvents_ = 0;
     uint64_t parseFails_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// DnsCollector（第 10 维护轮，实验性）：私有实时 ETW 会话订阅
+// Microsoft-Windows-Dns-Client {1C95126E-7EEA-49A9-A3FE-A378B03DDB4D}，
+// 从 Query/Response 事件解析查询域名 + pid（用户态提供者，事件头即发起
+// 进程）。字段名按候选表尝试（QueryName/Query/DomainName），全部解不出
+// 时 DecodedEvents 保持 0——NetMonitor 据此（或 ConsumerDead）自动禁用。
+// 会话章程与 EtwNetCollector 相同：唯一名带 pid、启动前清残留、RAII 停止。
+// ---------------------------------------------------------------------------
+class DnsCollector {
+public:
+    DnsCollector() = default;
+    ~DnsCollector();  // Stop()
+    DnsCollector(const DnsCollector&) = delete;
+    DnsCollector& operator=(const DnsCollector&) = delete;
+
+    bool Start();   // 幂等；失败（非管理员等）返回 false 并记日志
+    void Stop();    // 幂等
+    bool Running();
+    // 取走已解码的 DNS 事件（时间序；out 先被清空）。
+    void DrainEvents(std::vector<DnsEvent>* out);
+    uint64_t RawEvents() const;     // 到达的 Dns-Client 事件总数（含未解码）
+    uint64_t DecodedEvents() const; // 成功解出域名的数量
+    uint64_t DroppedEvents() const; // 因待取缓冲满而丢弃的已解码事件（诚实计数）
+    bool ConsumerDead() const;      // OpenTraceW 失败：会话在跑但无人消费
+    static bool SessionExists(const wchar_t* name);
+
+private:
+    static void WINAPI OnEvent(PEVENT_RECORD rec);
+    void HandleEvent(PEVENT_RECORD rec);
+    void Consume();
+
+    static constexpr size_t kPendingCap = 4096;  // Drain 之间的待取上限
+
+    TRACEHANDLE session_ = 0;
+    TRACEHANDLE openTrace_ = 0;
+    GUID myGuid_{};                 // 本会话实例 GUID（同 EtwNetCollector，V25 P0-2）
+    std::wstring sessionName_;      // L"SuperTaskMgr-Dns-<pid>"
+    std::vector<BYTE> stopProps_;
+    std::thread consumer_;
+    mutable std::mutex mu_;
+    std::vector<DnsEvent> pending_;
+    uint64_t raw_ = 0;
+    uint64_t decoded_ = 0;
+    uint64_t dropped_ = 0;  // pending_ 满时丢弃的已解码事件（诚实计数）
+    bool consumerDead_ = false;
 };
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,21 @@ public:
     void SetGpuEnabled(bool on);      // 默认开；PDH GPU Engine + DXGI 适配器
     bool GpuEnabled() const;
 
+    // ---- 兼容模式诊断（维护轮 10 新增，架构师契约） -------------------------
+    // 最近一次启动自检门的逐项结果；未跑过自检（启动中）返回空。
+    struct SelfCheckItem {
+        const wchar_t* name = L"";    // 检查项名（如 L"CPU 时间字段"）
+        bool ran = false;             // 本轮是否执行了该项
+        bool passed = false;
+        std::wstring detail;          // 测量值对比/失败原因（中文，诊断报告用）
+    };
+    std::vector<SelfCheckItem> LastSelfCheckReport() const;
+    // 请求在下一个采集 tick 重跑自检门（成功则自动退出兼容模式）。线程安全。
+    void RequestSelfCheckRetry();
+    // 自检门代际：门每真正跑完一次（含报告落库）+1。UI 以"代际变化"判定
+    // 一次重跑确实完成（V24 P1-1：tick 计数会提前，代数不会）。线程安全。
+    uint64_t LastSelfCheckGeneration() const;
+
     // 第 3 阶段扩展点（现在就声明以保持契约冻结）：
     void SetNetEtwEnabled(bool on);   // ETW Kernel-Network 每进程速率；仅管理员
     bool NetEtwEnabled() const;

@@ -16,6 +16,7 @@
 #include "core/Str.h"
 #include <iphlpapi.h>
 #include <tdh.h>
+#include <algorithm>
 #include <cwchar>
 
 namespace stm {
@@ -217,6 +218,60 @@ std::wstring TcpStateLabel(uint32_t state) {
 }
 
 // ===========================================================================
+// 第 10 维护轮：端点聚合 -> UI 行（契约 NetMonitor.h 的 RemoteTraffic）。
+// 复用 A 部分的地址格式化；service 按知名端口表（NetMonitor.cpp）填写。
+// ===========================================================================
+std::vector<RemoteTraffic> TopRemoteFromEndpoints(const cd::EndpointMap& src, size_t topN) {
+    std::vector<std::pair<cd::EndpointKey, RemoteTraffic>> rows;
+    rows.reserve(src.size());
+    for (const auto& kv : src) {
+        const cd::EndpointKey& k = kv.first;
+        const cd::EndpointAgg& a = kv.second;
+        RemoteTraffic r;
+        r.pid = k.pid;
+        r.port = k.port;
+        if (k.family == AF_INET) {
+            IN_ADDR v4{};
+            std::memcpy(&v4, k.ip, 4);
+            r.remote = FmtAddrV4(v4);
+        } else if (k.family == AF_INET6) {
+            IN6_ADDR v6{};
+            std::memcpy(v6.u.Byte, k.ip, 16);
+            r.remote = FmtAddrV6(v6);
+        }  // 其他 family（0=退化桶不会入表）：remote 留空（诚实）
+        r.service = ServiceNameForPort(k.port, k.proto == IPPROTO_UDP);
+        r.bytesIn = static_cast<double>(a.bytesIn);
+        r.bytesOut = static_cast<double>(a.bytesOut);
+        rows.emplace_back(kv.first, std::move(r));
+    }
+    const auto totalOf = [](const RemoteTraffic& r) { return r.bytesIn + r.bytesOut; };
+    // V25 P2 全序：总字节降序；平局按 (remote, port, proto, family, pid) 升序
+    // ——proto/family 进键保证同 ip:port 的 TCP/UDP、v4/v6 行之间也全序
+    //（单测可复现，绝不依赖哈希迭代顺序）。
+    std::sort(rows.begin(), rows.end(),
+              [&totalOf](const auto& x, const auto& y) {
+                  const double tx = totalOf(x.second), ty = totalOf(y.second);
+                  if (tx != ty) return tx > ty;
+                  if (x.second.remote != y.second.remote) {
+                      return x.second.remote < y.second.remote;
+                  }
+                  if (x.second.port != y.second.port) return x.second.port < y.second.port;
+                  if (x.first.proto != y.first.proto) return x.first.proto < y.first.proto;
+                  if (x.first.family != y.first.family) {
+                      return x.first.family < y.first.family;
+                  }
+                  return x.first.pid < y.first.pid;
+              });
+    std::vector<RemoteTraffic> out;
+    out.reserve(rows.size() < topN ? rows.size() : topN);
+    for (auto& row : rows) {
+        if (out.size() >= topN) break;
+        out.push_back(std::move(row.second));
+    }
+    return out;
+}
+
+// ===========================================================================
 // B 部分：EtwNetCollector（内部，CollectDetail.h）。此处仍处于
 // namespace stm；类声明在 stm::cd，因此只重开 cd。
 // ===========================================================================
@@ -277,7 +332,66 @@ size_t PropsSize(const std::wstring& name) {
     return sizeof(EVENT_TRACE_PROPERTIES) + (name.size() + 1) * sizeof(wchar_t);
 }
 
+// 按名称读取地址载荷属性。Kernel-Network 清单的 saddr/daddr 依地址族是
+// win:IPv4/win:IPv6（4/16 字节）；旧式内核日志拼写下可能是完整 sockaddr
+//（16/28 字节，family 在头两字节/地址在 +4/+8）。启发式：16 字节且头两
+// 字节恰为小写 AF_INET(0x0200) 时按 sockaddr_in 解释（裸 in6 恰以
+// 02 00 开头的地址会被误判——概率可忽略，诚实边界内）。
+bool AddrProp(PEVENT_RECORD rec, const wchar_t* name, uint8_t (*out)[16], uint16_t* family) {
+    const TdhFns f = Tdh();
+    if (!f.get || !f.getSize) return false;
+    PROPERTY_DATA_DESCRIPTOR d{};
+    d.PropertyName = reinterpret_cast<ULONGLONG>(name);
+    d.ArrayIndex = ULONG_MAX;
+    ULONG size = 0;
+    if (f.getSize(rec, 0, nullptr, 1, &d, &size) != ERROR_SUCCESS || size == 0 || size > 28) {
+        return false;
+    }
+    uint8_t buf[28] = {};
+    if (f.get(rec, 0, nullptr, 1, &d, size, buf) != ERROR_SUCCESS) return false;
+    if (size == 4) {
+        std::memcpy(*out, buf, 4);
+        *family = AF_INET;
+        return true;
+    }
+    if (size == 16) {
+        if (buf[0] == 0x02 && buf[1] == 0x00) {
+            std::memcpy(*out, buf + 4, 4);
+            *family = AF_INET;
+        } else {
+            std::memcpy(*out, buf, 16);
+            *family = AF_INET6;
+        }
+        return true;
+    }
+    if (size == 28) {  // sockaddr_in6：family(2)+port(2)+flow(4)+addr(16)+scope(4)
+        std::memcpy(*out, buf + 8, 16);
+        *family = AF_INET6;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
+
+// FNV-1a 逐字节混合（ip + 标量字段；无填充读取——逐字段处理）。
+// 注意：外部类的成员函数不能在匿名命名空间内定义（C2888）。
+size_t EndpointKeyHash::operator()(const EndpointKey& k) const noexcept {
+    uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](const void* p, size_t n) {
+        const auto* b = static_cast<const unsigned char*>(p);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(&k.pid, sizeof k.pid);
+    mix(&k.family, sizeof k.family);
+    mix(&k.port, sizeof k.port);
+    mix(&k.proto, sizeof k.proto);
+    mix(k.ip, sizeof k.ip);
+    return static_cast<size_t>(h);
+}
 
 EtwNetCollector::~EtwNetCollector() { Stop(); }
 
@@ -296,8 +410,12 @@ bool EtwNetCollector::Start() {
     if (session_ != 0) return true;
 
     // 唯一会话名（带 pid）避免实例间冲突；前一个崩溃遗留的同名
-    // 残留会话先被停止（防孤儿）。
-    sessionName_ = Fmt(L"SuperTaskMgr-Net-{}", ::GetCurrentProcessId());
+    // 残留会话先被停止（防孤儿）。仅当调用方（如 NetMonitor 用
+    // L"SuperTaskMgr-NetMon-<pid>"，V25 P0-2）未预先指定时才取默认名，
+    // 否则默认名会覆盖定制名，使"启动前清残留"误杀并行实例的同名会话。
+    if (sessionName_.empty()) {
+        sessionName_ = Fmt(L"SuperTaskMgr-Net-{}", ::GetCurrentProcessId());
+    }
 
     stopProps_.assign(PropsSize(sessionName_), 0);
     {
@@ -347,8 +465,12 @@ bool EtwNetCollector::Start() {
     // 保留（内核更新过的）属性缓冲区，供之后 ControlTraceW 停止会话使用；
     // 它必须活得比 Start 久，因此复制为成员。
     stopProps_ = propsBuf;
+    myGuid_ = reinterpret_cast<const EVENT_TRACE_PROPERTIES*>(propsBuf.data())->Wnode.Guid;
     session_ = h;
     bytes_.clear();
+    endpoints_.clear();
+    fieldStats_ = {};
+    rawSample_ = {};
     totalEvents_ = 0;
     parseFails_ = 0;
 
@@ -418,6 +540,20 @@ void EtwNetCollector::HandleEvent(PEVENT_RECORD rec) {
     if (!U32Prop(rec, L"pid", &pid) || pid == 0) pid = rec->EventHeader.ProcessId;
     if (pid == 0) return;  // 无身份：绝不归属给伪造的持有者
 
+    // —— 第 10 维护轮：远程端点字段（尽力解析）。recvdata 的对端是源
+    //（saddr/sport），senddata 的对端是目的（daddr/dport）；proto 字段
+    // 区分 TCP/UDP。任一关键字段取不到就退化为仅-pid 级（既有路径）并
+    // 计数——绝不伪造端点。
+    uint8_t rip[16] = {};
+    uint16_t rfamily = 0;
+    const bool haveAddr = AddrProp(rec, dir == 1 ? L"saddr" : L"daddr", &rip, &rfamily);
+    uint32_t rportRaw = 0;
+    const bool havePort = U32Prop(rec, dir == 1 ? L"sport" : L"dport", &rportRaw);
+    uint32_t protoRaw = 0;
+    const bool haveProto = U32Prop(rec, L"proto", &protoRaw);
+    uint32_t dirRaw = 0;
+    const bool haveDir = U32Prop(rec, L"direction", &dirRaw);
+
     std::lock_guard<std::mutex> lock(mu_);
     Agg& a = bytes_[pid];
     if (dir == 1) {
@@ -426,6 +562,55 @@ void EtwNetCollector::HandleEvent(PEVENT_RECORD rec) {
         a.send += size;
     }
     ++totalEvents_;
+
+    FieldStats& f = fieldStats_;
+    if (haveAddr) {
+        ++f.addrHit;
+    } else {
+        ++f.addrMiss;
+    }
+    if (havePort) {
+        ++f.portHit;
+    } else {
+        ++f.portMiss;
+    }
+    if (haveDir) ++f.dirFieldHit;
+    if (!rawSample_.valid) {  // 首个事件原样留档（实测探针/字节序核对用）
+        uint32_t v = 0;
+        rawSample_.valid = true;
+        if (U32Prop(rec, L"sport", &v)) rawSample_.sport = v;
+        if (U32Prop(rec, L"dport", &v)) rawSample_.dport = v;
+        if (U32Prop(rec, L"direction", &v)) rawSample_.direction = v;
+        if (U32Prop(rec, L"proto", &v)) rawSample_.proto = v;
+        uint8_t ip[16] = {};
+        uint16_t fam = 0;
+        if (AddrProp(rec, L"saddr", &ip, &fam)) {
+            rawSample_.saddrFamily = fam;
+            std::memcpy(rawSample_.saddr, ip, sizeof ip);
+        }
+        if (AddrProp(rec, L"daddr", &ip, &fam)) {
+            rawSample_.daddrFamily = fam;
+            std::memcpy(rawSample_.daddr, ip, sizeof ip);
+        }
+    }
+    if (haveAddr && havePort) {
+        EndpointKey k;
+        k.pid = pid;
+        k.family = rfamily;
+        // V25 P0-3：载荷端口为网络字节序（实测 443 呈 47873），换为主机序。
+        k.port = NetPort(rportRaw);
+        k.proto = static_cast<uint8_t>(haveProto ? (protoRaw & 0xFFu) : 0);
+        std::memcpy(k.ip, rip, sizeof k.ip);
+        EndpointAgg& ea = endpoints_[k];
+        if (dir == 1) {
+            ea.bytesIn += size;
+        } else {
+            ea.bytesOut += size;
+        }
+        ++ea.events;
+    } else {
+        ++f.noRemoteEvents;
+    }
 }
 
 void EtwNetCollector::Stop() {
@@ -443,20 +628,48 @@ void EtwNetCollector::Stop() {
         props = stopProps_;
         stopProps_.clear();
     }
-    if (session == 0) return;
 
     if (!props.empty()) {
         auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(props.data());
         ::ControlTraceW(session, name.c_str(), p, EVENT_TRACE_CONTROL_STOP);
     }
+    // V25 P0-2：无条件 join——Running() 的失效检测会先行作废 session_
+    //（外部同名会话顶替/停止），此时绝不能跳过收尸，否则可 join 的
+    // std::thread 随析构触发 std::terminate（fail-fast 崩溃）。
     if (consumer_.joinable()) consumer_.join();  // ProcessTrace 返回后即退出
-    ::CloseTrace(session);                       // 最后关闭会话句柄
+    if (session != 0) ::CloseTrace(session);     // 最后关闭会话句柄
     STM_LOG_INFO("etw", Fmt(L"ETW 会话 {} 已停止", name));
 }
 
 bool EtwNetCollector::Running() {
+    TRACEHANDLE session = 0;
+    std::wstring name;
+    GUID myGuid{};
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        session = session_;
+        name = sessionName_;
+        myGuid = myGuid_;
+    }
+    if (session == 0) return false;
+    // V25 P0-2 失效检测：句柄仍在但会话已被外部停止（同名"启动前清残留"
+    // 或全局清理）。仅按名字 QUERY 不够——同名新会话会顶替出现，因此
+    // 再比对内核回填的会话实例 GUID：不一致即"我"的会话已不在。
+    std::vector<BYTE> buf(PropsSize(name) + 512);
+    auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
+    p->Wnode.BufferSize = static_cast<ULONG>(buf.size());
+    p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    const ULONG rc = ::ControlTraceW(0, name.c_str(), p, EVENT_TRACE_CONTROL_QUERY);
+    const bool alive = (rc == ERROR_SUCCESS || rc == ERROR_MORE_DATA) &&
+                       (InlineIsEqualGUID(myGuid, GUID{}) ||
+                        InlineIsEqualGUID(p->Wnode.Guid, myGuid));
+    if (alive) return true;
     std::lock_guard<std::mutex> lock(mu_);
-    return session_ != 0;
+    session_ = 0;
+    stopProps_.clear();
+    myGuid_ = GUID{};
+    STM_LOG_WARN("etw", Fmt(L"ETW 会话 {} 已在外部失效（QUERY Win32 {}），标记为停止", name, rc));
+    return false;
 }
 
 void EtwNetCollector::CopyCumulative(std::unordered_map<uint32_t, uint64_t>* out) const {
@@ -471,6 +684,21 @@ void EtwNetCollector::CopyCumulative(std::unordered_map<uint32_t, uint64_t>* out
 uint64_t EtwNetCollector::TotalEvents() const {
     std::lock_guard<std::mutex> lock(mu_);
     return totalEvents_;
+}
+
+void EtwNetCollector::CopyEndpoints(EndpointMap* out) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    *out = endpoints_;
+}
+
+EtwNetCollector::FieldStats EtwNetCollector::CopyFieldStats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return fieldStats_;
+}
+
+EtwNetCollector::RawFieldSample EtwNetCollector::CopyRawSample() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return rawSample_;
 }
 
 }  // namespace cd

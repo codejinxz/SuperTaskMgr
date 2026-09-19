@@ -276,13 +276,16 @@ STM_TEST(sensors_disks_per_disk) {
 // 在并集上两两不同，两个提供程序绝不可能合并成一行。
 // 非管理员机器（实测基线）：没有任何 Ok 时，至少必须存在
 // 一条 NeedAdmin 条目——绝不静默缺位。
+// D6 扩展（2026-09-20）：认可新的只读内核来源前缀——"DTS"/"PawnIO"
+//（每核 DTS 温度经官方 PawnIO 模块，label "CPU 核心 N（DTS）"，见
+// collect/PawnIoLink.h）；不变量本身（来源前缀 + 两两不同）不变。
 // ---------------------------------------------------------------------------
 STM_TEST(sensors_temp_sources_labeled) {
     std::wstring serr;
     const stm::SensorSnapshot snap = stm::ReadSensors(&serr);
 
     auto hasProvenance = [](const std::wstring& label) {
-        for (const wchar_t* mark : {L"ACPI 热区", L"WMI", L"DPTF"}) {
+        for (const wchar_t* mark : {L"ACPI 热区", L"WMI", L"DPTF", L"DTS", L"PawnIO"}) {
             if (label.find(mark) != std::wstring::npos) return true;
         }
         return false;

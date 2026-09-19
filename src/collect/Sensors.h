@@ -34,6 +34,16 @@
 //（MSR 0x19C/0x1A2/0x1B1）仍属 State::NeedDriver 范畴：需要内核驱动，
 // 而本应用绝不附带内核驱动（红线）；传感器页已注明这一点，
 // 并改为提供可选的 LibreHardwareMonitor 桥接。
+//
+// D6 扩展（2026-09-20，仅注释契约说明，不改任何结构语义）：本机装有
+// PawnIO（官方签名运行时，用户自行安装）且官方签名模块 blob 已放置时，
+// ReadSensors 经 collect/PawnIoLink.h 的只读通道追加——
+//   cpu 组   每核 DTS 温度（"CPU 核心 N（DTS）"，source "PawnIO"，Ok）
+//   fans 组  LpcIO 识别已知 SuperIO 芯片时的真实 RPM（label 带芯片名；
+//            无数据时保持 NeedDriver 占位，语义与从前一致）
+//   extra 组 LpcIO 电压（"主板电压 inN（芯片）"）
+// 所有行仍受四态模型约束：通道不可用 -> 不产出任何行，绝不伪造。
+// 红线不变：应用不分发/不下载/不静默安装 PawnIO 或其模块。
 #include <cstdint>
 #include <string>
 #include <vector>

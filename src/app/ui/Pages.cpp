@@ -3,6 +3,7 @@
 // 所有面向用户的文本都是中文；经 ui::U8() 处理，因为 ImGui 是
 // 窄字符（UTF-8）API。UI 线程每帧恰好读取一次快照。
 #include "app/ui/Pages.h"
+#include "app/AboutInfo.h"        // 维护轮 10: 诊断报告带应用版本（kAppVersion 单一来源）
 #include "app/AppContext.h"
 #include "app/Theme.h"            // H-A: 主题三态 + 模式感知强调色
 #include "app/ui/AboutUi.h"       // H-A/A1: 工具条「关于」按钮（OpenAbout）+ 关于模态
@@ -12,6 +13,7 @@
 #include "app/ui/SortKey.h"
 #include "app/ui/UiText.h"
 #include "app/ui/VersionInfo.h"
+#include "app/ui3/CompatDiag.h"   // 维护轮 10: 兼容模式诊断文本（纯函数 + 落盘）
 #include "app/ui3/GcPages.h"      // F4: 崩溃记录/窗口页注册 + 宿主服务模态 + 热键
 #include "app/ui3/JumpState.h"    // F4#3: 跨页跳转槽
 #include "app/ui3/MemCleanup.h"   // P3 任务一: 一键内存优化候选/聚合（纯逻辑）
@@ -100,6 +102,13 @@ struct UiState {
     // 「请求长期有效 + 模态每帧渲染」模式（见 DrawAppearanceModal 注释）。
     bool appearanceOpenRequested = false;
     bool appearanceOpened = false;
+    // 维护轮 10：状态栏「兼容模式：<原因>」可点击 -> 说明模态（同一渲染模式）。
+    bool compatDiagOpenRequested = false;
+    bool compatDiagOpened = false;
+    // 「重新自检」进行中：请求已提交，等门真正跑完（V24 P1-1：以代际变化
+    // 判定，tick 计数会提前于重跑完成，不可作完成信号）。期间按钮禁用。
+    bool compatRetryPending = false;
+    uint64_t compatRetryGenBase = 0;  // 请求时刻的自检门代际（LastSelfCheckGeneration）
 };
 
 UiState& Ui() {
@@ -2515,6 +2524,178 @@ void DrawAppearanceModal(AppContext& ctx) {
     ImGui::EndPopup();
 }
 
+// ===========================================================================
+// 维护轮 10：兼容模式说明模态。
+// 入口 = 状态栏「兼容模式：<原因>」（degraded 时可点击，见 DrawStatusBar）。
+// 内容：① 降级原因摘要 ② 6 项自检逐项结果表（绿勾/红叉/跳过 + 测量对比）
+// ③「为什么会这样」（诚实措辞）④ 降级后受影响的功能 ⑤ 操作按钮：
+// [重新自检]（RequestSelfCheckRetry，期间禁用）/ [复制诊断报告]（剪贴板 +
+// logs\diagnostics_*.txt，绝不自动上传）/ [关闭]。
+// 与 ##confirm/##appearance 同款「请求长期有效 + 模态每帧渲染」模式。
+// ===========================================================================
+
+void RequestOpenCompatDiag() {
+    Ui().compatDiagOpenRequested = true;
+    Ui().compatDiagOpened = false;
+}
+
+void DrawCompatDiagModal(AppContext& ctx) {
+    UiState& s = Ui();
+    if (s.compatDiagOpenRequested) {
+        if (!ImGui::IsPopupOpen("##compatdiag")) {
+            ImGui::OpenPopup("##compatdiag");
+            s.compatDiagOpened = true;
+        }
+        s.compatDiagOpenRequested = false;
+    }
+    if (!s.compatDiagOpened) return;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(560.0f, 0.0f), ImVec2(560.0f, FLT_MAX));
+    if (!ImGui::BeginPopupModal("##compatdiag", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        // 模态之前开着但现在没了：被 Esc 关闭（「关闭」按钮之外的唯一路径），
+        // 复位打开态与重试待定（V24 P2-1：迟到完成不再弹 stale toast）——
+        // 绝不残留隐形模态。重跑请求本身仍会被采集线程消费，只是 UI 不再等它。
+        if (!ImGui::IsPopupOpen("##compatdiag") && !s.compatDiagOpenRequested) {
+            s.compatDiagOpened = false;
+            s.compatRetryPending = false;
+        }
+        return;
+    }
+
+    // V24 P1-1：完成检测前置且以代际为信号。观察到代际变化后再重新拉取
+    // 报告判定 toast，避免同帧 stale items。
+    uint64_t compatGenNow = ctx.collect.LastSelfCheckGeneration();
+    if (s.compatRetryPending && compatGenNow != s.compatRetryGenBase) {
+        s.compatRetryPending = false;
+        const std::vector<CollectService::SelfCheckItem> fresh = ctx.collect.LastSelfCheckReport();
+        bool retryOk = !fresh.empty() && fresh[0].ran;  // 第 1 项（CPU）必须真的跑过
+        for (const CollectService::SelfCheckItem& it : fresh) {
+            if (it.ran && !it.passed) retryOk = false;
+        }
+        PushToast(retryOk ? Notification::Kind::JobDone : Notification::Kind::Warn,
+                  retryOk ? L"重新自检通过，已退出兼容模式"
+                          : L"重新自检仍未通过，保持兼容模式（详见逐项结果）");
+    }
+
+    // 每帧取最新逐项报告（6 项小拷贝，帧预算内）与快照状态。
+    const std::vector<CollectService::SelfCheckItem> items = ctx.collect.LastSelfCheckReport();
+    const bool degraded = s.snap && s.snap->degraded;
+    const std::wstring reason =
+        s.snap ? (s.snap->degradeReason.empty() ? std::wstring(L"采集能力受限")
+                                                : s.snap->degradeReason)
+               : std::wstring();
+
+    ImGui::TextUnformatted(U8(L"兼容模式说明"));
+    ImGui::Separator();
+
+    // ① 降级原因摘要。
+    if (degraded) {
+        ImGui::TextColored(ColWarn(), "%s", U8(L"当前处于兼容模式（Toolhelp+PSAPI 慢路径）"));
+        ImGui::TextWrapped("%s", U8(Fmt(L"降级原因：{}", reason)));
+    } else {
+        ImGui::TextColored(ColDone(), "%s", U8(L"当前为完整模式（自检通过）"));
+    }
+
+    // ② 逐项结果表：状态列（√ 通过 / × 失败 / — 跳过）+ 检查项与测量值对比。
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", U8(L"自检逐项结果（NtQSI 快路径 vs 文档化 API，加固：重试至多 2 次 + 连续 2 轮通过）"));
+    if (items.empty()) {
+        ImGui::TextDisabled("%s", U8(L"尚未自检（采集服务第一个采集周期运行自检门）"));
+    } else if (ImGui::BeginTable("##compatitems", 2,
+                                 ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("res", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("item", ImGuiTableColumnFlags_WidthStretch);
+        for (const CollectService::SelfCheckItem& it : items) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (!it.ran) {
+                ImGui::TextDisabled("%s", U8(L"— 跳过"));
+            } else if (it.passed) {
+                ImGui::TextColored(ColDone(), "%s", U8(L"√ 通过"));
+            } else {
+                ImGui::TextColored(ColFail(), "%s", U8(L"× 失败"));
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(U8(it.name == nullptr ? std::wstring() : std::wstring(it.name)));
+            ImGui::TextDisabled("%s", U8(it.detail));
+        }
+        ImGui::EndTable();
+    }
+
+    // ③ 为什么会这样（诚实措辞：不甩锅、不过度承诺）。
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("%s", U8(L"为什么会这样？"));
+    ImGui::BulletText("%s", U8(L"Windows 更新可能更改 NtQuerySystemInformation 返回的内部结构"
+                               L"布局，使旧布局读数与官方 API 不一致。"));
+    ImGui::BulletText("%s", U8(L"第三方安全软件可能挂钩 NtQuerySystemInformation 并修改其"
+                               L"返回数据。"));
+    ImGui::BulletText("%s", U8(L"系统策略或运行环境（虚拟化、精简系统）可能限制读取进程内部"
+                               L"计数器。"));
+    ImGui::TextWrapped("%s",
+                       U8(L"为了不显示错误数据，应用在无法证实快速路径可靠时会整体切换到 "
+                          L"Toolhelp+PSAPI 兼容路径（较慢、部分列缺失），这是刻意的保护行为，"
+                          L"不代表应用损坏。"));
+
+    // ④ 降级后受影响的功能（哪些列显示「—」）。
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", U8(L"降级后受影响的功能"));
+    ImGui::BulletText("%s", U8(L"进程表「内存」列（私有工作集）显示「—」，也无法按它排序。"));
+    ImGui::BulletText("%s", U8(L"「上下文切换/s」列显示「—」。"));
+    ImGui::BulletText("%s", U8(L"已挂起进程的徽标与详情中的挂起状态不再显示。"));
+    ImGui::BulletText("%s", U8(L"「内存加速」无法按私有工作集挑选候选。"));
+    ImGui::BulletText("%s", U8(L"其余功能（CPU/磁盘/网络速率、进程管理等）不受影响，仅采集稍慢。"));
+
+    // ⑤ 操作按钮：[重新自检]（期间/采集暂停时禁用）[复制诊断报告] [关闭]。
+    ImGui::Spacing();
+    ImGui::Separator();
+    const bool collectPaused = s.paused;  // V24 P2-1：暂停采集时无 tick，重跑无法发生
+    ImGui::BeginDisabled(s.compatRetryPending || collectPaused);
+    if (ImGui::Button(U8(L"重新自检"))) {
+        ctx.collect.RequestSelfCheckRetry();
+        s.compatRetryPending = true;
+        // V24 P1-1：记录当前门代际；代际变化（而非 tick+1）才是"跑完"。
+        s.compatRetryGenBase = ctx.collect.LastSelfCheckGeneration();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", U8(collectPaused
+                                       ? L"采集已暂停：恢复采集后才能重新自检"
+                                       : (s.compatRetryPending
+                                              ? L"自检重跑进行中（含自动重试，约 1-2 秒）"
+                                              : L"重跑自检门（含自动重试）；全部通过将自动退出兼容模式")));
+    }
+    if (collectPaused) {
+        ImGui::TextDisabled("%s", U8(L"采集已暂停：无法重新自检，请先恢复采集（工具条「继续采集」）。"));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"复制诊断报告"))) {
+        const std::wstring text = ui3::CompatDiagReportText(kAppVersion, items, degraded ? reason : L"");
+        ImGui::SetClipboardText(U8(text));
+        const std::wstring path = ui3::SaveDiagnosticsFile(text);
+        PushToast(Notification::Kind::JobDone,
+                  path.empty() ? std::wstring(L"诊断报告已复制到剪贴板（写入日志文件失败）")
+                               : Fmt(L"诊断报告已复制到剪贴板，并保存到 {}", path));
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"纯文本：系统版本 + 应用版本 + 逐项测量对比；仅本机保存，"
+                                   L"不会自动上传"));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"关闭"))) {
+        ImGui::CloseCurrentPopup();
+        s.compatDiagOpened = false;
+        s.compatRetryPending = false;  // V24 P2-1：关模态即不再等待迟到完成
+    }
+
+    // （V24 P1-1）完成检测已前置到模态开头：以 LastSelfCheckGeneration 代际
+    // 变化为信号并重新拉取报告，避免 tick 计数提前与同帧 stale items。
+
+    ImGui::EndPopup();
+}
+
 void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     (void)snap;
     const float barH = ImGui::GetFrameHeight() + 6.0f;
@@ -2620,17 +2801,21 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
         return ui::FlowSegmentFits(ImGui::GetCursorPosX(), contentRightX,
                                    pipeW + sp + ImGui::CalcTextSize(u8Text).x);
     };
-    {   // 锚点段（必显）：采集模式（降级时给原因）。
-        const char* mode =
-            snap.degraded
-                ? U8(Fmt(L"兼容模式：{}",
-                         snap.degradeReason.empty() ? std::wstring(L"采集能力受限")
-                                                    : snap.degradeReason))
-                : U8(L"完整模式");
+    {   // 锚点段（必显）：采集模式（降级时给原因；维护轮 10：可点击打开说明模态）。
         if (snap.degraded) {
+            const char* mode =
+                U8(Fmt(L"兼容模式：{}",
+                       snap.degradeReason.empty() ? std::wstring(L"采集能力受限")
+                                                  : snap.degradeReason));
             ImGui::TextColored(ColWarn(), "%s", mode);
+            // 维护轮 10：可点击 -> 兼容模式说明模态（每帧渲染，见 RequestOpenCompatDiag）。
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s", U8(L"点击查看兼容模式说明与逐项自检结果"));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) RequestOpenCompatDiag();
+            }
         } else {
-            ImGui::TextDisabled("%s", mode);
+            ImGui::TextDisabled("%s", U8(L"完整模式"));
         }
     }
     // P2-3（F2 评审）：暂停采集需要全局指示。
@@ -2889,6 +3074,9 @@ void DrawShell(AppContext& ctx) {
     // 内部，与 DrawConfirmDialogs 同一渲染模式）。
     ui::DrawAboutUi();
     DrawAppearanceModal(ctx);
+    // 维护轮 10：兼容模式说明模态（状态栏「兼容模式：<原因>」点击打开；
+    // 与 ##confirm/##about/##appearance 同层、同一每帧渲染模式）。
+    DrawCompatDiagModal(ctx);
 }
 
 // --- --autotest dialogclick (V14) -------------------------------------------

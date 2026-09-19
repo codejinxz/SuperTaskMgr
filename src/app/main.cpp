@@ -14,6 +14,7 @@
 #include "app/ui3/Pages3.h"
 #include "app/ui3/ThemeCfg.h"     // H-A: 退出时剔除「恢复默认列宽」的软删除残留
 #include "app/ui3/Wallpaper.h"    // Phase-6 接线: AutoRestore/DrawBackground/ClampMask
+#include "collect/PawnIoLink.h"   // V26-P2: PawnIoShutdown 释放模块句柄与缓存
 #include "core/FsUtil.h"
 #include "core/HandleGuard.h"
 #include "core/Log.h"
@@ -603,6 +604,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     // 一切都靠 ctx 的 shared_ptr 存活（见上文注释）。
     ctx->collect.Stop();
     ctx->jobs.Shutdown(2000);
+    pawnio::PawnIoShutdown();  // V26-P2：显式释放 PawnIO 模块句柄与缓存
     // R-Fix Bug2: 退出只释放 GPU 纹理，保留 %LOCALAPPDATA% 持久化副本 ——
     // 旧的 WallpaperClear 在退出时删除副本，使「下次启动自动恢复」成为死代码
     // （选图后重启即回到纯色，属于用户报告的「壁纸不生效」的一半根因）。
