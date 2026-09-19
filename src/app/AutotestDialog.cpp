@@ -179,9 +179,10 @@ void DialogClickDriver::Tick() {
 }
 
 // ---------------------------------------------------------------------------
-// --autotest about（R-Fix Bug3）。镜像 DialogClickDriver 的注入方法，
-// 但受害对象是工具栏「?」按钮：Bug1 的重叠布局曾使它
-// 无法点击，而经真实管线的点击仍必须打开模态框。
+// --autotest about（R-Fix Bug3；A1 适配）。镜像 DialogClickDriver 的注入方法，
+// 但受害对象是工具栏「关于」按钮（A1 统一风格改造取代旧「?」迷你按钮；
+// 矩形改由 Pages.cpp::DrawToolbar 发布到 ui::AboutAutotestState，驱动定位
+// 机制不变）：点击 -> 模态框打开并保持 -> 点击「关闭」。
 // ---------------------------------------------------------------------------
 
 bool AboutClickDriver::Done() const { return phase_ == Phase::Finished; }
@@ -245,13 +246,13 @@ void AboutClickDriver::Tick() {
                 hoverFrames_ = 0;
                 phaseDeadline_ = NowMs() + kPhaseTimeoutMs;
             } else if (NowMs() > phaseDeadline_) {
-                Fail(L"工具条「?」按钮从未提交（未渲染或被布局裁剪/遮挡）");
+                Fail(L"工具条「关于」按钮从未提交（未渲染或被布局裁剪/遮挡）");
             }
             break;
         }
         case Phase::Hover: {
             placeCursor();
-            // R-Fix：不数帧 —— 等 ImGui 真实确认「?」已悬停（最多 15 s），
+            // R-Fix：不数帧 —— 等 ImGui 真实确认「关于」已悬停（最多 15 s），
             // 再注入按下，避免按下落在悬浮光标争夺中的错误控件上。
             if (st.btnHovered && ++hoverFrames_ >= 2) {
                 STM_LOG_INFO("autotest", L"[about] 悬停完成，按下");
@@ -274,7 +275,7 @@ void AboutClickDriver::Tick() {
                 ++hoverFrames_;
             }
             if (NowMs() > phaseDeadline_) {
-                Fail(L"移动真实光标后「?」始终未进入悬停态（后端未上报/被遮挡）");
+                Fail(L"移动真实光标后「关于」始终未进入悬停态（后端未上报/被遮挡）");
             }
             break;
         }
@@ -286,7 +287,7 @@ void AboutClickDriver::Tick() {
         }
         case Phase::Up: {
             // R-Fix 诊断：此刻 mdown 应为 true（上一帧注入的 down 已被处理），
-            // 且按钮应处于悬停态 —— 说明按下确实落在「?」上。
+            // 且按钮应处于悬停态 —— 说明按下确实落在「关于」上。
             STM_LOG_INFO("autotest",
                          Fmt(L"[about] 释放注入前 mdown={} hoverBtn={} pos=({:.0f},{:.0f})",
                              io.MouseDown[0] ? 1 : 0, st.btnHovered ? 1 : 0,
@@ -357,7 +358,7 @@ void AboutClickDriver::Tick() {
         case Phase::WaitClosed: {
             if (!st.modalOpen) {
                 Finish(true,
-                       L"真实管线点击「?」生效：模态打开并保持>=4帧，点击「关闭」后退出");
+                       L"真实管线点击「关于」生效：模态打开并保持>=4帧，点击「关闭」后退出");
             } else if (NowMs() > phaseDeadline_) {
                 Fail(L"点击「关闭」后关于模态未关闭");
             }

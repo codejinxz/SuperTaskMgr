@@ -343,6 +343,15 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         //   0 = 置 pending 标志，由 DrawConfirmDialogs 每帧弹出三选一模态。
         // 注意：--smoke / --autotest 的退出路径走 ctx->wantExit，从不经过 WM_CLOSE，
         // 拦截不影响 headless 退出；托盘菜单「退出」也始终直接置 wantExit 不询问。
+        // V22-P1-1：限制最小窗口宽——工具条为流式布局（窄窗会裁剪「主题…/关于」
+        // 且全应用无替代入口），760px 保证全部一级按钮可点。
+        if (msg == WM_GETMINMAXINFO) {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMinTrackSize.x = 760;
+            mmi->ptMinTrackSize.y = 480;
+            *handled = true;
+            return 0;
+        }
         if (msg == WM_CLOSE) {
             const int action =
                 ui::NormalizeCloseAction(ctx->cfg.GetInt(ui::kCloseActionCfgKey, 0));

@@ -20,34 +20,17 @@ namespace ui {
 
 namespace {
 
-// Windows 版本：HKLM CurrentVersion 的 CurrentBuild（REG_SZ）+ UBR（REG_DWORD），
-// 显示为 "Build 26100.4652"；任一读不到则如实显示"不可用"（不伪造版本号）。
-std::wstring WindowsBuildText() {
-    HKEY key = nullptr;
-    constexpr wchar_t kPath[] = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kPath, 0,
-                      KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
-        return L"不可用";
-    }
-    wchar_t build[32] = {};
-    DWORD buildSize = sizeof(build);
-    const LSTATUS stBuild = RegGetValueW(key, nullptr, L"CurrentBuild", RRF_RT_REG_SZ,
-                                         nullptr, build, &buildSize);
-    DWORD ubr = 0;
-    DWORD ubrSize = sizeof(ubr);
-    const LSTATUS stUbr = RegGetValueW(key, nullptr, L"UBR", RRF_RT_REG_DWORD,
-                                       nullptr, &ubr, &ubrSize);
-    RegCloseKey(key);
-    if (stBuild != ERROR_SUCCESS) return L"不可用";
-    if (stUbr != ERROR_SUCCESS) return std::wstring(L"Build ") + build;
-    return Fmt(L"Build {}.{}", build, ubr);
-}
+// 进程起点（A1 任务二）：CRT 动态初始化阶段捕获（早于 wWinMain），
+// 稳态单调时钟。旧实现把起点放在 UptimeText() 的函数级 static —— 首次
+// 打开关于模态才初始化，运行时长永远从"第一次打开关于"重新计数，
+// 用户看到的是"本次运行时长 0 秒"，读起来像读不到。命名空间作用域
+// 常量在进程加载时初始化一次，此后模态何时打开都不影响计时起点。
+const std::chrono::steady_clock::time_point kProcessStart = std::chrono::steady_clock::now();
 
-// 本次运行时长（首次调用即进程 UI 启动时刻）；复用核心的 FormatDuration 文案。
+// 本次运行时长；复用核心的 FormatDuration 文案。
 std::wstring UptimeText() {
-    static const std::chrono::steady_clock::time_point kStart = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - kStart).count();
+                            std::chrono::steady_clock::now() - kProcessStart).count();
     return FormatDuration(secs);
 }
 
@@ -82,6 +65,10 @@ void* g_logoContext = nullptr;
 ImTextureRef g_logoTexture;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> g_logoSrv;
 bool g_logoTried = false;
+
+// OpenAbout() 置位、DrawAboutUi() 每帧消费的一次性打开标志（UI 线程单帧内
+// 置位-消费，无需原子）。
+bool g_openAboutRequested = false;
 
 void EnsureAboutLogo() {
     if (g_logoTried || !g_logoDevice) return;
@@ -129,30 +116,18 @@ void ShutdownAboutUi() {
     g_logoContext = nullptr;
 }
 
+void OpenAbout() {
+    g_openAboutRequested = true;  // DrawAboutUi 同帧稍后消费（一次性标志）
+}
+
 void DrawAboutUi() {
     AboutAutotestState& at = AboutAutotestStateMut();
-    at.btnValid = false;  // 每帧重置：只有本帧真实提交过按钮才有效
-    at.btnHovered = false;
 
-    // 工具条「?」按钮（定位由调用方 SameLine 决定）。
-    if (ImGui::Button(U8(L"?"))) {
-        ImGui::OpenPopup("##about");
-    }
-    if (ImGui::IsItemVisible()) {  // 已提交且未被裁剪：记录矩形（--autotest about）
-        const ImVec2 mn = ImGui::GetItemRectMin();
-        const ImVec2 mx = ImGui::GetItemRectMax();
-        at.btnValid = true;
-        at.btnMinX = mn.x;
-        at.btnMinY = mn.y;
-        at.btnMaxX = mx.x;
-        at.btnMaxY = mx.y;
-        at.btnHovered = ImGui::IsItemHovered();
-    }
-    if (ImGui::IsItemHovered()) {
-        // tooltip 显示当前版本（AboutInfo.h 单一来源）。
-        ImGui::SetTooltip("%s", U8(kAppVersion[0] ? std::wstring(L"关于（版本 ") +
-                                                       kAppVersion + L"）"
-                                                 : std::wstring(L"关于")));
+    // 外部触发（工具条「关于」按钮经 ui::OpenAbout()，A1 统一风格改造）：
+    // 与确认框相同的「请求长期有效 + 模态每帧渲染」模式。
+    if (g_openAboutRequested) {
+        g_openAboutRequested = false;
+        if (!ImGui::IsPopupOpen("##about")) ImGui::OpenPopup("##about");
     }
 
     // 模态：与确认框相同的每帧 Begin 模式 —— Esc 关闭后 Begin 返回 false 且

@@ -17,6 +17,45 @@ std::wstring TempFile(const wchar_t* name) {
     return std::wstring(temp) + name;
 }
 
+// --- windows_build_text_ok 的注入伪读取器（组合逻辑分支覆盖） ---------------
+struct BuildFake {
+    bool regOk = true;         // CurrentBuild 可读
+    bool ubrOk = true;         // UBR 可读
+    bool rtlOk = false;        // ntdll 兜底可用
+    uint32_t rtlBuild = 26100;
+};
+
+bool FkRegString(void* ud, const wchar_t* name, wchar_t* out, size_t outChars) {
+    auto* f = static_cast<BuildFake*>(ud);
+    (void)name;
+    if (!f->regOk) return false;
+    return wcscpy_s(out, outChars, L"26100") == 0;
+}
+
+bool FkRegDword(void* ud, const wchar_t* name, uint32_t* out) {
+    auto* f = static_cast<BuildFake*>(ud);
+    (void)name;
+    if (!f->ubrOk) return false;
+    *out = 4652;
+    return true;
+}
+
+bool FkRtlBuild(void* ud, uint32_t* out) {
+    auto* f = static_cast<BuildFake*>(ud);
+    if (!f->rtlOk) return false;
+    *out = f->rtlBuild;
+    return true;
+}
+
+stm::ui::WindowsBuildReaders FkReaders(BuildFake* f) {
+    stm::ui::WindowsBuildReaders r;
+    r.regString = &FkRegString;
+    r.regDword = &FkRegDword;
+    r.rtlBuild = &FkRtlBuild;
+    r.ud = f;
+    return r;
+}
+
 }  // namespace
 
 // cfg 键 themeMode 的 0/1/2 读写往返 + 越界值钳制（非法一律回退 Dark）。
@@ -178,6 +217,72 @@ STM_TEST(colw_strip_file) {
     DeleteFileW(bad.c_str());
     if (!badOk) {
         *err = L"格式异常文件被改动（应原样保留并返回 -1）";
+        return false;
+    }
+    return true;
+}
+
+// A1 任务二：关于页「运行环境 → Windows 版本」文本（WindowsBuildText 及其
+// 组合逻辑 WindowsBuildTextWith，头文件内联 = selftest 与生产同一代码路径）。
+//  1) 真机：注册表可读时必须给出 "Build ..."（非"不可用"）；
+//  2) ntdll!RtlGetVersion 动态绑定兜底在真机可解析出 build 号；
+//  3) 注入伪读取器覆盖注册表/UBR/兜底三路组合的全部分支。
+STM_TEST(windows_build_text_ok) {
+    using namespace stm::ui;
+
+    // 1) 生产入口（AboutUi.cpp 每帧渲染调用的同一函数）。
+    const std::wstring real = WindowsBuildText();
+
+    // 本机 HKLM CurrentVersion 是否真的可读（区分注册表被锁的环境）。
+    HKEY probe = nullptr;
+    const bool regReadable =
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0,
+                      KEY_QUERY_VALUE | KEY_WOW64_64KEY, &probe) == ERROR_SUCCESS;
+    if (probe != nullptr) RegCloseKey(probe);
+
+    if (regReadable && real.rfind(L"Build ", 0) != 0) {
+        *err = L"真机注册表可读时 WindowsBuildText 必须显示 'Build ...'（实际：" +
+               real + L"）";
+        return false;
+    }
+    if (real != L"不可用" && real.rfind(L"Build ", 0) != 0) {
+        *err = L"WindowsBuildText 只允许 'Build ...' 或 '不可用' 两种形态";
+        return false;
+    }
+
+    // 2) 兜底读取器真机自证（ntdll 恒已加载，RtlGetVersion 返回真实 build）。
+    uint32_t rtlBuild = 0;
+    if (!WindowsBuildRtlVersion(nullptr, &rtlBuild) || rtlBuild < 9200) {
+        *err = L"ntdll!RtlGetVersion 兜底读取失败或 build 号异常";
+        return false;
+    }
+
+    // 3) 组合逻辑分支（伪读取器注入）。
+    BuildFake fk;
+    if (!(WindowsBuildTextWith(FkReaders(&fk)) == L"Build 26100.4652")) {
+        *err = L"注册表 build+UBR 分支应显示 'Build 26100.4652'";
+        return false;
+    }
+    fk.ubrOk = false;
+    if (!(WindowsBuildTextWith(FkReaders(&fk)) == L"Build 26100")) {
+        *err = L"UBR 读不到时应只显示 'Build 26100'";
+        return false;
+    }
+    fk.regOk = false;
+    fk.rtlOk = true;
+    if (!(WindowsBuildTextWith(FkReaders(&fk)) == L"Build 26100")) {
+        *err = L"注册表失败时 RtlGetVersion 兜底应显示 'Build 26100'";
+        return false;
+    }
+    fk.rtlBuild = 0;  // 兜底返回退化 build 号：不伪造，如实"不可用"
+    if (!(WindowsBuildTextWith(FkReaders(&fk)) == L"不可用")) {
+        *err = L"兜底 build=0 应如实显示'不可用'";
+        return false;
+    }
+    fk.rtlOk = false;
+    if (!(WindowsBuildTextWith(FkReaders(&fk)) == L"不可用")) {
+        *err = L"注册表与兜底全部失败应如实显示'不可用'";
         return false;
     }
     return true;

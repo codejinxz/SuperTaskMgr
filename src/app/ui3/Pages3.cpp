@@ -16,10 +16,12 @@
 #include "app/ui3/AsyncFetch.h"
 #include "app/ui3/GcPages.h"    // F4#3: 宿主服务模态
 #include "app/ui3/JumpState.h"  // F4#3: 跨页跳转槽
+#include "app/ui3/NetAdapterUi.h"  // A2: 适配器区纯逻辑（速度/排序/复制 IP）
 #include "app/ui3/PageHelpers.h"
 #include "app/ui/Pages.h"
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/UiText.h"
+#include "collect/AdapterInfo.h"
 #include "collect/LhmSource.h"
 #include "collect/NetTables.h"
 #include "collect/Sensors.h"
@@ -185,6 +187,9 @@ const ProcInfo* FindPid(const Snapshot& snap, uint32_t pid) {
 // ===========================================================================
 // NetworkPage：TCP/UDP 端点表（只读页，无危险操作）。
 // 数据：经任务队列的 collect::SnapshotConnections，抓取间隔至少 2s。
+// A2：顶部新增「适配器」区（任务管理器风格的 以太网/WLAN 卡片），
+//     独立的 AsyncFetch（EnumAdaptersNet，>=10s 缓存 + 手动刷新），
+//     不与连接表过滤框联动；回环适配器不显示。
 // ===========================================================================
 
 const wchar_t* ProtoLabel(ConnProto p) {
@@ -211,6 +216,8 @@ public:
                 ctx.cfg.SetBool(L"netEtw", etw_);  // 持久化真实状态
             }
         }
+        DrawAdapterSection();  // A2：适配器区（独立抓取，置于页面顶部）
+        ImGui::Separator();
         fetch_.MaybeFetch(Produce, false);
         std::shared_ptr<const Result> res = fetch_.Peek();
 
@@ -239,6 +246,162 @@ private:
     using Result = AsyncFetch<std::vector<ConnEntry>>::Result;
     static std::vector<ConnEntry> Produce(std::wstring* err) {
         return SnapshotConnections(err);
+    }
+
+    // ---- A2：适配器区 -------------------------------------------------------
+    // EnumAdaptersNet 是阻塞调用（毫秒级），只允许在任务工作线程上执行；
+    // 这里经 ui3::AsyncFetch 走共享 jobs 队列（>=10s 最小间隔 + 手动刷新）。
+    using AdapterResult = AsyncFetch<std::vector<stm::AdapterNetInfo>>::Result;
+    static std::vector<stm::AdapterNetInfo> AdapterProduce(std::wstring* err) {
+        return stm::EnumAdaptersNet(err);
+    }
+
+    // 标签 + 数量 + 手动刷新一行；随后是适配器卡片列表。
+    void DrawAdapterSection() {
+        adapters_.MaybeFetch(AdapterProduce, false);
+        std::shared_ptr<const AdapterResult> res = adapters_.Peek();
+
+        ImGui::TextUnformatted(U8(L"适配器"));
+        ImGui::SameLine();
+        if (res != nullptr) {
+            size_t shown = 0, up = 0;
+            for (const stm::AdapterNetInfo& a : res->data) {
+                if (a.isLoopback) continue;  // 回环伪接口不计入
+                ++shown;
+                if (a.up) ++up;
+            }
+            ImGui::TextDisabled("%s", U8(Fmt(L"{} 个（{} 个已连接）", shown, up)));
+        } else {
+            ImGui::TextColored(ColMuted(), "%s", U8(L"统计加载中…"));
+        }
+        // 标签必须区别于工具栏的「刷新」按钮：同一 ImGui 窗口内
+        // 同名按钮会撞 ID（两个按钮同时触发）。
+        ImGui::SameLine();
+        if (ImGui::SmallButton(U8(L"刷新适配器"))) {
+            adapters_.MaybeFetch(AdapterProduce, true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(L"手动刷新：立即重新枚举适配器（可越过 10 秒最小间隔；"
+                                 L"自动刷新受该间隔限制）"));
+        }
+        ImGui::Separator();
+
+        if (res == nullptr) {
+            DrawLoading();
+            return;
+        }
+        if (!res->ok && res->data.empty()) {
+            bool retry = false;
+            DrawLoadError(res->err, &retry);
+            if (retry) adapters_.MaybeFetch(AdapterProduce, true);
+            return;
+        }
+        if (!res->err.empty()) {
+            ImGui::TextColored(ColWarn(), "%s",
+                               U8(Fmt(L"部分数据不可用：{}", res->err)));
+        }
+        // 分区（纯逻辑判定在 NetAdapterUi.h）：已连接的物理适配器直接
+        // 展示；媒体断开/蓝牙/虚拟等折叠进「更多适配器」；回环不显示。
+        std::vector<const stm::AdapterNetInfo*> primary;
+        std::vector<const stm::AdapterNetInfo*> others;
+        for (const stm::AdapterNetInfo& a : res->data) {
+            if (a.isLoopback) continue;
+            if (a.up && IsPhyscialAdapter(a)) {
+                primary.push_back(&a);
+            } else {
+                others.push_back(&a);
+            }
+        }
+        const auto bySortKey = [](const stm::AdapterNetInfo* x,
+                                  const stm::AdapterNetInfo* y) {
+            return AdapterSortKey(*x, *y);
+        };
+        std::sort(primary.begin(), primary.end(), bySortKey);
+        std::sort(others.begin(), others.end(), bySortKey);
+
+        if (primary.empty() && others.empty()) {
+            ImGui::TextColored(ColMuted(), "%s", U8(L"未发现网络适配器"));
+            return;
+        }
+        const double now = ImGui::GetTime();
+        for (const stm::AdapterNetInfo* a : primary) DrawAdapterCard(*a, now);
+        if (!others.empty()) {
+            if (ImGui::CollapsingHeader(U8(Fmt(L"更多适配器（{}）", others.size())))) {
+                for (const stm::AdapterNetInfo* a : others) DrawAdapterCard(*a, now);
+            }
+        }
+    }
+
+    // 单个适配器卡片：首行（友好名/类型徽标/状态/链路速度/复制 IP）+
+    // 明细行（IPv4 含前缀、IPv6 截断、网关、DNS、MAC、DHCP）。
+    void DrawAdapterCard(const stm::AdapterNetInfo& a, double now) {
+        ImGui::PushID(static_cast<int>(a.ifIndex));
+        ImGui::BeginChild("##adcard", ImVec2(0.0f, 0.0f),
+                          ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+        ImGui::TextUnformatted(
+            U8(a.friendlyName.empty() ? std::wstring(L"—") : a.friendlyName));
+        if (!a.description.empty() && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(a.description));  // 硬件描述
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ColInfo(), "[%s]",
+                           U8(a.typeName.empty() ? std::wstring(L"未知") : a.typeName));
+        ImGui::SameLine();
+        if (a.up) {
+            ImGui::TextColored(ColDone(), "%s", U8(AdapterStatusLabel(a)));
+        } else {
+            ImGui::TextColored(ColMuted(), "%s", U8(AdapterStatusLabel(a)));
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(U8(FormatAdapterSpeed(a.linkSpeedMbps)));
+        // 复制 IP：写剪贴板，按钮变「已复制」1 秒（刻意无 toast）。
+        const std::wstring ip = CopyableAdapterIp(a);
+        const auto flash = copyFlash_.find(a.ifIndex);
+        const bool copied = flash != copyFlash_.end() && now < flash->second;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(ip.empty());
+        if (ImGui::SmallButton(copied ? U8(L"已复制") : U8(L"复制 IP"))) {
+            ImGui::SetClipboardText(U8(ip));
+            copyFlash_[a.ifIndex] = now + 1.0;
+        }
+        ImGui::EndDisabled();
+        if (!ip.empty() && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(Fmt(L"复制 {}", ip)));
+        }
+
+        std::vector<std::wstring> v4;
+        std::vector<const stm::AdapterAddressEntry*> v6;
+        for (const stm::AdapterAddressEntry& e : a.addresses) {
+            if (e.family == L"IPv4") {
+                v4.push_back(FormatAdapterAddress(e));
+            } else if (!e.ip.empty()) {
+                v6.push_back(&e);
+            }
+        }
+        DrawDetailLine(L"IPv4", JoinOrDash(v4));
+        for (const stm::AdapterAddressEntry* e : v6) {
+            DrawDetailLine(L"IPv6", DisplayAdapterAddress(e->ip),
+                           AdapterAddressTruncated(e->ip) ? &e->ip : nullptr);
+        }
+        if (v6.empty()) DrawDetailLine(L"IPv6", L"—");
+        DrawDetailLine(L"网关", JoinOrDash(a.gateways));
+        DrawDetailLine(L"DNS", JoinOrDash(a.dnsServers));
+        DrawDetailLine(L"MAC", a.mac.empty() ? std::wstring(L"—") : a.mac);
+        DrawDetailLine(L"DHCP", a.dhcpEnabled ? std::wstring(L"是") : std::wstring(L"否"));
+        ImGui::EndChild();
+        ImGui::PopID();
+    }
+
+    // 明细行：灰色标签 + 值；fullText 非空时悬停显示全量（IPv6 截断）。
+    static void DrawDetailLine(const wchar_t* label, const std::wstring& value,
+                               const std::wstring* fullText = nullptr) {
+        ImGui::TextDisabled("%s", U8(label));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(U8(value));
+        if (fullText != nullptr && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(*fullText));
+        }
     }
 
     void DrawToolbar(AppContext& ctx, const Result* res) {
@@ -462,6 +625,9 @@ private:
     };
 
     AsyncFetch<std::vector<ConnEntry>> fetch_{2.0};
+    // A2：适配器区状态（独立于连接表的缓存与过滤框）。
+    AsyncFetch<std::vector<stm::AdapterNetInfo>> adapters_{10.0};
+    std::map<uint64_t, double> copyFlash_;  // ifIndex -> 「已复制」截止时刻（ImGui 时间）
     std::string filterUtf8_;
     std::wstring filterWide_;
     std::wstring appliedFilter_;

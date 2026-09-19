@@ -60,9 +60,11 @@ private:
     uint64_t phaseDeadline_ = 0;  // 基于 GetTickCount64 的每阶段超时
 };
 
-// --autotest about（R-Fix Bug3）：同样的真实 UI 管线思路，用于工具栏「?」
-// 关于按钮。Bug1 的右侧重叠项曾使它无法点击；本驱动把真实光标
-// 移到真实渲染的按钮上（矩形由 ui::DrawAboutUi 每帧发布），
+// --autotest about（R-Fix Bug3；A1 适配）：同样的真实 UI 管线思路，用于工具栏
+// 「关于」按钮（A1 统一风格改造后取代旧的「?」迷你按钮；矩形仍经
+// ui::AboutAutotestState 发布，改由 Pages.cpp::DrawToolbar 提交按钮）。
+// Bug1 的右侧重叠项曾使它无法点击；本驱动把真实光标
+// 移到真实渲染的按钮上（矩形每帧发布），
 // 等待 ImGui 确认悬停，注入点击，断言关于模态框已打开、
 // the click, then clicks the modal's 关闭 button the same way. Asserts: modal
 // 连续多帧保持提交（单帧模态
@@ -81,7 +83,7 @@ private:
     enum class Phase {
         WaitStart,   // 尚未调用 Start()：Tick 必须是空操作（main 会无条件调
                      // Tick，在门控放行 Start 之前）
-        WaitButton,  // 工具栏「?」矩形可见
+        WaitButton,  // 工具栏「关于」矩形可见
         Hover,       // 移到按钮上，等待 ImGui 悬停确认
         Down,        // 鼠标按下
         Up,          // 鼠标抬起

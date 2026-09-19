@@ -5,9 +5,9 @@
 #include "app/ui/Pages.h"
 #include "app/AppContext.h"
 #include "app/Theme.h"            // H-A: 主题三态 + 模式感知强调色
-#include "app/ui/AboutUi.h"       // H-A: 工具条「?」关于按钮 + 模态
+#include "app/ui/AboutUi.h"       // H-A/A1: 工具条「关于」按钮（OpenAbout）+ 关于模态
 #include "app/ui/ConfirmAction.h"
-#include "app/ui/HeaderLayout.h"  // R-Fix Bug1: 工具条右侧实测宽度布局（纯函数）
+#include "app/ui/HeaderLayout.h"  // R-Fix Bug1: 状态栏右段实测宽度布局（纯函数）
 #include "app/ui/ModulesUi.h"
 #include "app/ui/SortKey.h"
 #include "app/ui/UiText.h"
@@ -16,6 +16,7 @@
 #include "app/ui3/JumpState.h"    // F4#3: 跨页跳转槽
 #include "app/ui3/MemCleanup.h"   // P3 任务一: 一键内存优化候选/聚合（纯逻辑）
 #include "app/ui3/Pages3.h"       // 第 3 阶段扩展标签 + 外壳钩子（增量式）
+#include "app/ui3/PerfChart.h"    // Phase A: 性能历史 Ring/时间窗/RingView 纯函数
 #include "app/ui3/PerfCsv.h"      // F4#7: 性能 CSV 记录
 #include "app/ui3/ProcControlUi.h"  // F4#2: 优先级/亲和性文案与掩码换算
 #include "app/ui3/ProcKind.h"     // F4#1: 系统进程分类
@@ -92,9 +93,13 @@ struct UiState {
     // H-A: 「恢复默认列宽」世代号。递增后：进程页把 widths_ 重置回默认并把表格
     // id 换代（ImGui 内部按 id 记忆列宽，换代才能丢弃旧值、立即回默认宽度）。
     uint64_t colWidthResetGen = 0;
-    // H-A: 壁纸同步加载进行中（外观菜单状态行提示；加载固定 UI 线程同步，见
-    // PickAndLoadWallpaper 注释，几十 ms 阻塞期间菜单保持打开）。
+    // H-A: 壁纸同步加载进行中（外观状态行提示；加载固定 UI 线程同步，见
+    // PickAndLoadWallpaper 注释，几十 ms 阻塞期间模态保持打开）。
     bool wallpaperBusy = false;
+    // A1 统一风格改造：工具条「主题…」按钮 -> 外观设置模态。与确认框相同的
+    // 「请求长期有效 + 模态每帧渲染」模式（见 DrawAppearanceModal 注释）。
+    bool appearanceOpenRequested = false;
+    bool appearanceOpened = false;
 };
 
 UiState& Ui() {
@@ -604,38 +609,16 @@ void DrawConfirmDialogs() {
 }
 
 // ===========================================================================
-// 性能历史：最近 120 个采集 tick 的环形缓冲，在 tick id 变化时
-// 于外壳中追加（单一摄取点）。
+// 性能历史：最近 kHistCap（600，Phase A 自 120 扩容以支撑 60/120/300/600s
+// 时间窗）个采集 tick 的环形缓冲，在 tick id 变化时于外壳中追加（单一
+// 摄取点，仍每 tick 一次 O(procs)）。Ring/PerfHistory/kHistCap 已迁入
+// app/ui3/PerfChart.h（header-only 纯函数，selftest 共用同一份定义）；
+// 渲染侧经 RingView 取尾窗零拷贝视图，切换时间窗只改显示、不清历史。
 // ===========================================================================
 
-constexpr int kHistCap = 120;
-
-struct Ring {
-    std::vector<float> v;
-    int head = 0;
-    // P3 任务二：至少收到过一个有效（非 NaN）样本 —— 不可用计数器（如硬故障/s
-    // 在部分机器上 kUnavail）据此渲染诚实空态，而不是一条看不见的空线。
-    bool hasData = false;
-    void Push(float x) {
-        if (x == x) hasData = true;
-        if (static_cast<int>(v.size()) < kHistCap) {
-            v.push_back(x);
-            return;
-        }
-        v[static_cast<size_t>(head)] = x;
-        head = (head + 1) % kHistCap;
-    }
-    int Count() const { return static_cast<int>(v.size()); }
-    int Offset() const { return Count() < kHistCap ? 0 : head; }
-};
-
-struct PerfHistory {
-    uint64_t lastTick = 0;
-    Ring cpuTotal, physAvail, commit, diskRead, diskWrite, netRecv, netSend;
-    // P3 任务二：新增系统级硬故障/s 与上下文切换/s（聚合口径见 AppendHistory）。
-    Ring hardFaults, ctxSwitch;
-    std::vector<Ring> cores;
-};
+using ui3::kHistCap;
+using ui3::PerfHistory;
+using ui3::Ring;
 
 PerfHistory& Hist() {
     static PerfHistory h;
@@ -1869,7 +1852,8 @@ private:
 };
 
 // ===========================================================================
-// PerfPage：四个 ImPlot 象限（CPU/内存/磁盘/网络），120 个 tick。
+// PerfPage：四个 ImPlot 象限（CPU/内存/磁盘/网络），时间窗 60/120/300/600s
+// （Phase A：历史容量 600、RingView 尾窗、字节类 Y 轴 AutoFit）。
 // ===========================================================================
 
 int FmtBytesAxis(double value, char* buff, int size, void* /*user_data*/) {
@@ -1880,13 +1864,18 @@ int FmtBytesAxis(double value, char* buff, int size, void* /*user_data*/) {
     return snprintf(buff, static_cast<size_t>(size), "%s", s.c_str());
 }
 
-void PlotRing(const char* label, const Ring& r, bool noLegend) {
-    if (r.Count() <= 0) return;
+// Phase A：经 RingView 取尾窗（window 秒）零拷贝渲染 —— ImPlot
+// values-only + spec.Offset 直接支持环形跨度，x = 窗内序号（秒）。
+void PlotRing(const char* label, const Ring& r, int window, bool noLegend, double tickSec) {
+    // V21-P0：ImPlot 的 spec.Offset 以"绘制点数"取模而非环容量——环形 offset 直传
+    // 会整窗画错段。线性化到线程局部缓冲后以 Offset=0 绘制；x 轴经 xscale 换算为
+    // 真实秒（tickSec = 当前刷新间隔）。
+    static thread_local std::vector<float> buf(kHistCap);
+    const int n = ui3::CopyRingTail(r, window, buf.data(), static_cast<int>(buf.size()));
+    if (n <= 0) return;
     ImPlotSpec spec;
-    spec.Offset = r.Offset();
     if (noLegend) spec.Flags = ImPlotItemFlags_NoLegend;
-    // 仅数值重载：x = i * xscale，环形偏移把最新样本映射到右侧。
-    ImPlot::PlotLine(label, r.v.data(), r.Count(), 1.0, 0.0, spec);
+    ImPlot::PlotLine(label, buf.data(), n, tickSec, 0.0, spec);
 }
 
 class PerfPage final : public IPage {
@@ -1894,19 +1883,42 @@ public:
     const wchar_t* Id() const override { return L"perf"; }
     const wchar_t* Title() const override { return L"性能"; }
 
+    static inline double tickSec_ = 1.0;  // V21-P0：图表 x 轴秒换算（Draw 与 static 块函数共用）
+
     void Draw(AppContext& ctx) override {
         // V19: 顶部固定操作行（图表区上方）——「内存加速…」+ 内存占用速览。
         // 用户报告「内存加速的我目前也没看到」：原入口绘制在全部图表块之后，
         // 位于首屏折叠区以下、需滚动才能看到，且受图表显隐复选框影响布局。
         // 该行不受 lastTick 早退与图表显隐影响，切到「性能」页首屏即可见。
         DrawMemQuickActionRow(Ui().snap ? Ui().snap->sys : SystemInfo{});
+        // V21-P0：图表 x 轴按真实采集间隔换算为秒（PlotRing 的 xscale）。
+        tickSec_ = static_cast<double>(std::max<int64_t>(200, ctx.cfg.GetInt(L"intervalMs", 1000))) / 1000.0;
         const PerfHistory& h = Hist();
         if (h.lastTick == 0) {
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"等待采集数据…"));
             return;
         }
 
-        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        // Phase A：时间窗（cfg perfWindowSec，60/120/300/600，非法回落 120）。
+        // 窗口只影响显示（RingView 尾窗）不改摄取 —— 切换不清空历史，
+        // perfShow* 显隐复选框语义不变（零迁移）。
+        int windowSec = ui3::ClampWindowSec(ctx.cfg.GetInt(L"perfWindowSec", 120));
+        int windowIdx = ui3::WindowSecIndex(windowSec);
+        ImGui::TextDisabled("%s", U8(L"时间窗"));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        if (ImGui::Combo("##perfwindow", &windowIdx,
+                         "60 秒\0"
+                         "120 秒\0"
+                         "300 秒\0"
+                         "600 秒\0")) {
+            windowIdx = std::max(0, std::min(3, windowIdx));
+            windowSec = ui3::kWindowSecChoices[windowIdx];
+            ctx.cfg.SetInt(L"perfWindowSec", windowSec);
+        }
+        const int window = windowSec;
+
+        const ImVec2 avail = ImGui::GetContentRegionAvail();  // 时间窗行之下
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
         // P3 任务二：页面区宽度 > 1200 时两列网格，否则单列铺满（块按序流入）。
         const bool twoCol = ImGui::GetWindowWidth() > 1200.0f;
@@ -1929,25 +1941,28 @@ public:
         };
 
         beginCell(0);
-        if (visible(L"perfShowCpu", true, L"CPU")) DrawCpu(cellW, plotH, h);
+        if (visible(L"perfShowCpu", true, L"CPU")) DrawCpu(ctx, cellW, plotH, h, window);
         endCell();
         beginCell(1);
-        if (visible(L"perfShowPerCore", true, L"CPU 每核")) DrawPerCore(cellW, plotH, h);
+        if (visible(L"perfShowPerCore", true, L"CPU 每核"))
+            DrawPerCore(cellW, plotH, h, window);
         endCell();
         beginCell(2);
-        if (visible(L"perfShowMem", true, L"内存")) DrawMemory(cellW, plotH, h);
+        if (visible(L"perfShowMem", true, L"内存")) DrawMemory(cellW, plotH, h, window);
         endCell();
         beginCell(3);
-        if (visible(L"perfShowDisk", true, L"磁盘")) DrawDisk(cellW, plotH, h);
+        if (visible(L"perfShowDisk", true, L"磁盘")) DrawDisk(cellW, plotH, h, window);
         endCell();
         beginCell(4);
-        if (visible(L"perfShowNet", true, L"网络")) DrawNet(cellW, plotH, h);
+        if (visible(L"perfShowNet", true, L"网络")) DrawNet(cellW, plotH, h, window);
         endCell();
         beginCell(5);
-        if (visible(L"perfShowHardFaults", true, L"硬故障/s")) DrawHardFaults(cellW, plotH, h);
+        if (visible(L"perfShowHardFaults", true, L"硬故障/s"))
+            DrawHardFaults(cellW, plotH, h, window);
         endCell();
         beginCell(6);
-        if (visible(L"perfShowCtxSwitch", false, L"上下文切换/s")) DrawCtxSwitch(cellW, plotH, h);
+        if (visible(L"perfShowCtxSwitch", false, L"上下文切换/s"))
+            DrawCtxSwitch(cellW, plotH, h, window);
         endCell();
         beginCell(7);
         if (visible(L"perfShowGpu", true, L"GPU")) DrawGpuBlockBody(*Ui().snap);
@@ -1964,56 +1979,76 @@ private:
         return ImPlot::BeginPlot(id, size);
     }
 
-    static void DrawCpu(float w, float plotH, const PerfHistory& hist) {
+    static void DrawCpu(AppContext& ctx, float w, float plotH,
+                        const PerfHistory& hist, int window) {
         if (!BeginPlotBox("##cpu", ImVec2(w, plotH))) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"CPU"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 100.0, ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g%%");
         ImPlot::SetupFinish();
-        PlotRing(U8(L"总量"), hist.cpuTotal, false);
-        for (const Ring& core : hist.cores) PlotRing("##core", core, true);
+        // Phase A：告警阈值线（alertOn 开启时）——可拖拽 DragLineY，
+        // 拖拽结果双向同步回 cfg alertCpu（钳 1..100、取整百分比）。
+        if (ctx.cfg.GetBool(L"alertOn", false)) {
+            int stored = static_cast<int>(ctx.cfg.GetInt(L"alertCpu", 90));
+            stored = std::max(1, std::min(100, stored));
+            double thr = static_cast<double>(stored);
+            if (ImPlot::DragLineY(0, &thr, ImVec4(0.90f, 0.35f, 0.30f, 0.90f))) {
+                const int dragged =
+                    std::max(1, std::min(100, static_cast<int>(thr + 0.5)));
+                if (dragged != stored) ctx.cfg.SetInt(L"alertCpu", dragged);
+            }
+        }
+        PlotRing(U8(L"总量"), hist.cpuTotal, window, false, tickSec_);
+        for (const Ring& core : hist.cores) PlotRing("##core", core, window, true, tickSec_);
         ImPlot::EndPlot();
     }
 
-    static void DrawMemory(float w, float plotH, const PerfHistory& hist) {
+    // 字节类（内存/磁盘/网络）Y 轴：ImPlotAxisFlags_AutoFit 每 tick 跟随
+    // 数据（Phase A 修复「首帧 fit 后永不调整导致削顶」）；CPU/每核保持恒定
+    // 0-100，保证扫视可比性（设计 §2.4）。
+    static void DrawMemory(float w, float plotH, const PerfHistory& hist, int window) {
         if (!BeginPlotBox("##mem", ImVec2(w, plotH))) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"内存"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"内存"), ImPlotAxisFlags_AutoFit);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, &FmtBytesAxis);
         ImPlot::SetupFinish();
-        PlotRing(U8(L"可用物理"), hist.physAvail, false);
-        PlotRing(U8(L"提交"), hist.commit, false);
+        PlotRing(U8(L"可用物理"), hist.physAvail, window, false, tickSec_);
+        PlotRing(U8(L"提交"), hist.commit, window, false, tickSec_);
         ImPlot::EndPlot();
     }
 
-    static void DrawDisk(float w, float plotH, const PerfHistory& hist) {
+    static void DrawDisk(float w, float plotH, const PerfHistory& hist, int window) {
         if (!BeginPlotBox("##disk", ImVec2(w, plotH))) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"磁盘"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"磁盘"), ImPlotAxisFlags_AutoFit);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, &FmtBytesAxis);
         ImPlot::SetupFinish();
-        PlotRing(U8(L"读取"), hist.diskRead, false);
-        PlotRing(U8(L"写入"), hist.diskWrite, false);
+        PlotRing(U8(L"读取"), hist.diskRead, window, false, tickSec_);
+        PlotRing(U8(L"写入"), hist.diskWrite, window, false, tickSec_);
         ImPlot::EndPlot();
     }
 
-    static void DrawNet(float w, float plotH, const PerfHistory& hist) {
+    static void DrawNet(float w, float plotH, const PerfHistory& hist, int window) {
         if (!BeginPlotBox("##net", ImVec2(w, plotH))) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"网络"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"网络"), ImPlotAxisFlags_AutoFit);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, &FmtBytesAxis);
         ImPlot::SetupFinish();
-        PlotRing(U8(L"接收"), hist.netRecv, false);
-        PlotRing(U8(L"发送"), hist.netSend, false);
+        PlotRing(U8(L"接收"), hist.netRecv, window, false, tickSec_);
+        PlotRing(U8(L"发送"), hist.netSend, window, false, tickSec_);
         ImPlot::EndPlot();
     }
 
@@ -2024,20 +2059,21 @@ private:
         ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"本机此计数器不可用"));
     }
 
-    static void DrawPerCore(float w, float plotH, const PerfHistory& hist) {
+    static void DrawPerCore(float w, float plotH, const PerfHistory& hist, int window) {
         if (!BeginPlotBox("##percore", ImVec2(w, plotH))) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"CPU 每核"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 100.0, ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g%%");
         ImPlot::SetupFinish();
-        for (const Ring& core : hist.cores) PlotRing("##core", core, true);
+        for (const Ring& core : hist.cores) PlotRing("##core", core, window, true, tickSec_);
         ImPlot::EndPlot();
     }
 
-    static void DrawHardFaults(float w, float plotH, const PerfHistory& hist) {
+    static void DrawHardFaults(float w, float plotH, const PerfHistory& hist, int window) {
         if (!hist.hardFaults.hasData) {  // 从未收到有效样本：诚实空态而非空图
             DrawCounterUnavailable();
             return;
@@ -2046,14 +2082,15 @@ private:
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"硬故障/s"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g");
         ImPlot::SetupFinish();
-        PlotRing(U8(L"硬故障"), hist.hardFaults, false);
+        PlotRing(U8(L"硬故障"), hist.hardFaults, window, false, tickSec_);
         ImPlot::EndPlot();
     }
 
-    static void DrawCtxSwitch(float w, float plotH, const PerfHistory& hist) {
+    static void DrawCtxSwitch(float w, float plotH, const PerfHistory& hist, int window) {
         if (!hist.ctxSwitch.hasData) {
             DrawCounterUnavailable();
             return;
@@ -2062,10 +2099,11 @@ private:
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"上下文切换/s"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(kHistCap - 1), ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g");
         ImPlot::SetupFinish();
-        PlotRing(U8(L"切换"), hist.ctxSwitch, false);
+        PlotRing(U8(L"切换"), hist.ctxSwitch, window, false, tickSec_);
         ImPlot::EndPlot();
     }
 
@@ -2395,24 +2433,46 @@ void ApplyHotkeyEnabled(AppContext& ctx, bool on) {
     }
 }
 
-// R-Fix Bug1: 「外观」菜单体（主题三态 + 恢复默认列宽 + 自定义壁纸控件组）。
-// 抽成函数是因为窄窗（<900px）下它折叠进「⋮」溢出菜单、宽窗直接叫「外观」——
-// 两种形态共用同一菜单体，只差入口标签与（仅窄窗时）置顶的全局热键开关项。
-void DrawAppearanceMenuBody(AppContext& ctx, bool narrow) {
-    if (narrow) {
-        // 窄窗下状态栏的全局热键复选框会被 LayoutHeaderRight 优先级隐藏
-        // （次要项先藏），「⋮」里保留等价开关项保证功能仍可达。
-        bool hotkey = ctx.cfg.GetBool(L"hotkeyEnabled", false);
-        if (ImGui::MenuItem(U8(L"全局热键 Ctrl+Alt+M"), nullptr, hotkey)) {
-            ApplyHotkeyEnabled(ctx, !hotkey);
+// A1 统一风格改造：「外观设置」模态（独立 ##appearance 模态 id）。
+// 旧「外观/⋮」菜单壳与窄窗折叠分支删除，菜单体内容（主题三态 + 恢复默认
+// 列宽 + 自定义壁纸控件组）整体迁移进本模态——用户找不到主题/壁纸入口的
+// 直接修复：入口变成与「暂停采集」同款的工具条按钮「主题…」。
+// 模态走 DrawConfirmDialogs 同款每帧渲染模式：请求长期有效，
+// OpenPopup 只发一次，BeginPopupModal 每帧执行（Esc/「关闭」均可退出）。
+void RequestOpenAppearance() {
+    Ui().appearanceOpenRequested = true;
+    Ui().appearanceOpened = false;
+}
+
+void DrawAppearanceModal(AppContext& ctx) {
+    if (Ui().appearanceOpenRequested) {
+        if (!ImGui::IsPopupOpen("##appearance")) {
+            ImGui::OpenPopup("##appearance");
+            Ui().appearanceOpened = true;
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s",
-                              U8(L"注册 Ctrl+Alt+M 全局热键：任意前台应用下呼出/隐藏本工具"
-                                 L"（仅运行期有效，不写注册表）"));
-        }
-        ImGui::Separator();
+        Ui().appearanceOpenRequested = false;
     }
+    if (!Ui().appearanceOpened) return;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f, 0.0f), ImVec2(460.0f, FLT_MAX));
+    if (!ImGui::BeginPopupModal("##appearance", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        // 模态之前开着但现在没了：被 Esc 关闭（「关闭」按钮之外的唯一路径），
+        // 复位打开态——绝不残留隐形模态。
+        if (!ImGui::IsPopupOpen("##appearance") && !Ui().appearanceOpenRequested) {
+            Ui().appearanceOpened = false;
+        }
+        return;
+    }
+
+    // 标题在模态体内绘制（与 ##confirm/##about 同款：##id 窗口、正文自带标题）。
+    ImGui::TextUnformatted(U8(L"外观设置"));
+    ImGui::Separator();
+
+    // 主题三态单选：点击即时生效（写 cfg + Theme::Apply，与启动应用同一入口；
+    // System 模式的实时广播由 main 的 WM_SETTINGCHANGE 钩子处理）。
     const ThemeMode cur = ThemeModeFromInt(ctx.cfg.GetInt(L"themeMode", 0));
     struct ModeItem { ThemeMode mode; const wchar_t* label; };
     static const ModeItem kModes[] = {
@@ -2420,15 +2480,25 @@ void DrawAppearanceMenuBody(AppContext& ctx, bool narrow) {
         {ThemeMode::Light,  L"浅色"},
         {ThemeMode::System, L"跟随系统"},
     };
+    ImGui::TextDisabled("%s", U8(L"主题"));
     for (const ModeItem& m : kModes) {
-        if (ImGui::MenuItem(U8(m.label), nullptr, m.mode == cur)) {
-            ctx.cfg.SetInt(L"themeMode", static_cast<int64_t>(m.mode));
-            Theme::Apply(m.mode);
-            PushToast(Notification::Kind::Info, Fmt(L"主题已切换：{}", m.label));
+        if (m.mode != kModes[0].mode) ImGui::SameLine();
+        if (ImGui::RadioButton(U8(m.label), m.mode == cur)) {
+            // V21-P2-3：点击已选中的主题不再重复 Apply + toast（避免误导性"已切换"）。
+            if (m.mode != cur) {
+                ctx.cfg.SetInt(L"themeMode", static_cast<int64_t>(m.mode));
+                Theme::Apply(m.mode);
+                PushToast(Notification::Kind::Info, Fmt(L"主题已切换：{}", m.label));
+            }
         }
     }
     ImGui::Separator();
-    if (ImGui::MenuItem(U8(L"恢复默认列宽"))) {
+
+    ImGui::TextDisabled("%s", U8(L"自定义壁纸"));
+    DrawAppearancePanel(ctx);  // H-A(Phase-6): 选图/关闭/遮罩（实时生效）/性能提示
+
+    ImGui::Separator();
+    if (ImGui::Button(U8(L"恢复默认列宽"))) {
         // 键清单登记见 ui3::ColWidthCfgKeys()（app/ui3/ThemeCfg.h，与
         // ProcessesPage::PersistWidths 写入一一对应）。
         ui3::SoftDeleteColWidthKeys(ctx.cfg);
@@ -2438,9 +2508,11 @@ void DrawAppearanceMenuBody(AppContext& ctx, bool narrow) {
                   removed < 0 ? Fmt(L"已恢复默认列宽（配置文件格式异常，重启后生效）")
                               : Fmt(L"已恢复默认列宽（清除 {} 项自定义列宽）", removed));
     }
-    ImGui::Separator();
-    ImGui::TextDisabled("%s", U8(L"自定义壁纸"));
-    DrawAppearancePanel(ctx);  // H-A(Phase-6): 选图/关闭/遮罩/性能提示
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"关闭"), ImVec2(120.0f, 0.0f))) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
@@ -2448,28 +2520,13 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     const float barH = ImGui::GetFrameHeight() + 6.0f;
     ImGui::BeginChild("##toolbar", ImVec2(0.0f, barH), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar);
-    // R-Fix Bug1 结构化重构：工具条只保留动作项，自然流式排列（每项都是实测
-    // 宽度，无一处 SameLine(绝对偏移)）。「全局热键」开关、「管理员」徽标移到
-    // 底部状态栏（见 DrawStatusBar 右段）；「?」关于按钮仍在本条最右侧，用
-    // LayoutHeaderRight 纯函数按实测宽度定位（CalcTextSize+FramePadding 求和，
-    // 不写死像素）。窄窗（<900px）下次要项折叠：「外观」入口换成「⋮」溢出菜单
-    // （内含等价的全局热键开关项），主按钮保留。
-    const bool narrow = ImGui::GetWindowWidth() < 900.0f;
+    // A1 统一风格改造：工具条全部条目与「暂停采集」同款普通控件，自然流式
+    // SameLine 排列（每项实测宽度，无一处绝对偏移、无右缘布局、无下拉菜单
+    // ——旧「外观/⋮」菜单与「?」迷你按钮已删除，用户找不到主题/壁纸入口、
+    // 不认识「?」的问题由此修复）。窗口级信息（全局热键/权限/统计）保持
+    // 在底部状态栏（DrawStatusBar），本条右侧不再放任何东西。
     int interval = static_cast<int>(ctx.cfg.GetInt(L"intervalMs", 1000));
-    ImGui::SetNextItemWidth(160.0f);
-    if (ImGui::SliderInt(U8(L"刷新间隔"), &interval, 500, 5000, "%d ms")) {
-        ctx.cfg.SetInt(L"intervalMs", interval);
-        if (!Ui().paused) ctx.collect.SetInterval(static_cast<uint32_t>(interval));
-    }
-    if (!Ui().paused) {
-        ImGui::SameLine();
-        if (ImGui::Button(U8(L"暂停采集"))) {
-            ctx.collect.Stop();
-            Ui().paused = true;
-            PushToast(Notification::Kind::Info, L"已暂停采集");
-        }
-    } else {
-        ImGui::SameLine();
+    if (Ui().paused) {
         if (ImGui::Button(U8(L"继续采集"))) {
             if (ctx.collect.Start(static_cast<uint32_t>(interval))) {
                 Ui().paused = false;
@@ -2478,6 +2535,18 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
                 PushToast(Notification::Kind::JobFailed, L"恢复采集失败");
             }
         }
+    } else {
+        if (ImGui::Button(U8(L"暂停采集"))) {
+            ctx.collect.Stop();
+            Ui().paused = true;
+            PushToast(Notification::Kind::Info, L"已暂停采集");
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::SliderInt(U8(L"刷新间隔"), &interval, 500, 5000, "%d ms")) {
+        ctx.cfg.SetInt(L"intervalMs", interval);
+        if (!Ui().paused) ctx.collect.SetInterval(static_cast<uint32_t>(interval));
     }
     if (!ctx.elevated && ops::CanElevate()) {
         ImGui::SameLine();
@@ -2505,46 +2574,31 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     // 打开同一 MemCleanup 模态（用户报告性能页内入口不可见的兜底入口）。
     ImGui::SameLine();
     if (ImGui::Button(U8(L"内存加速…"))) RequestConfirmMemCleanup();
-
-    // --- 右缘「?」关于按钮 + 菜单（R-Fix Bug1/Bug3 关键次序） -----------------
-    // 旧实现用 SameLine(GetWindowWidth()-NNN) 绝对偏移摆放右侧各项，各项实际
-    // 宽度未计入 → 窄窗下互相压盖、「?」点不到（Bug3）。重构后「全局热键」
-    // 开关、「管理员」徽标与运行统计移入底部状态栏（DrawStatusBar 右段），工具
-    // 条右缘只剩「?」，用 ui::LayoutHeaderRight 纯函数按实测宽度
-    // （CalcTextSize+FramePadding 求和，不写死像素）定位，priority 0 永不隐藏。
-    //
-    // 提交次序是本修复的关键（ImGui 悬停竞争）：BeginMenu 在竖排窗口里走
-    // Selectable 的 SpanAvailWidth —— 菜单的悬停/点击矩形从其标签一直延伸到
-    // 窗口右缘，恰好把「?」整块盖住；ImGui 把悬停判给先提交的控件，所以「?」
-    // 必须先于菜单提交才能赢回自己区域的悬停与点击（菜单可见标签区域不受
-    // 影响，依旧可点；这正是旧版「?」永远点不到的最终根因）。
+    // A1: 「主题…」按钮 -> 外观设置模态（主题三态/恢复默认列宽/自定义壁纸
+    // 全部收进模态，见 DrawAppearanceModal）。
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"主题…"))) RequestOpenAppearance();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"主题（深色/浅色/跟随系统）、表格列宽与自定义壁纸"));
+    }
+    // A1: 「关于」按钮 -> 关于模态（ui::OpenAbout 一次性标志，DrawAboutUi 消费）。
+    // 按钮矩形发布进 AboutAutotestState（--autotest about 驱动瞄准真实渲染
+    // 的按钮）；每帧重置，只有本帧真实提交过才有效（V19-P2-2 同规则）。
+    ImGui::SameLine();
     {
-        const ImGuiStyle& st = ImGui::GetStyle();
-        const float winW = ImGui::GetWindowWidth();
-        const float menuX = ImGui::GetCursorPosX();    // 菜单自然位置（动作流之后）
-        // 左侧动作流程结束 = 菜单"终点"（起点 + 标签实测宽 + 内边距），否则窄窗下
-        // 右对齐的「?」会压住菜单标签（V19-P1-1）。
-        const float leftEnd =
-            menuX + ImGui::CalcTextSize(narrow ? U8(L"⋮") : U8(L"外观")).x +
-            st.FramePadding.x * 2.0f;
-        const float aboutW =
-            ImGui::CalcTextSize(U8(L"?")).x + st.FramePadding.x * 2.0f;  // 实测按钮宽
-        const ui::HeaderItem kRightItems[1] = {{aboutW, 0}};
-        ui::HeaderPlacement place[1];
-        ui::LayoutHeaderRight(winW - st.WindowPadding.x, leftEnd, st.ItemSpacing.x,
-                              kRightItems, 1, place);
-        // H-A: 工具条「?」关于按钮 + 模态（tooltip 显示当前版本）。先提交。
-        ImGui::SameLine(place[0].x);
-        ui::DrawAboutUi();
-        // H-A: 「外观」菜单（R-Fix Bug1：窄窗折叠为「⋮」溢出菜单）——主题三态、
-        // 「恢复默认列宽」、自定义壁纸控件组，菜单体见 DrawAppearanceMenuBody。
-        ImGui::SameLine(menuX);
-        if (ImGui::BeginMenu(narrow ? U8(L"⋮") : U8(L"外观"))) {
-            DrawAppearanceMenuBody(ctx, narrow);
-            ImGui::EndMenu();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", U8(L"主题（深色/浅色/跟随系统）、表格列宽与自定义壁纸"));
+        ui::AboutAutotestState& at = ui::AboutAutotestStateMut();
+        at.btnValid = false;
+        at.btnHovered = false;
+        if (ImGui::Button(U8(L"关于"))) ui::OpenAbout();
+        if (ImGui::IsItemVisible()) {
+            const ImVec2 mn = ImGui::GetItemRectMin();
+            const ImVec2 mx = ImGui::GetItemRectMax();
+            at.btnValid = true;
+            at.btnMinX = mn.x;
+            at.btnMinY = mn.y;
+            at.btnMaxX = mx.x;
+            at.btnMaxY = mx.y;
+            at.btnHovered = ImGui::IsItemHovered();
         }
     }
     ImGui::EndChild();
@@ -2669,7 +2723,7 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%s",
                                   U8(L"注册 Ctrl+Alt+M 全局热键：任意前台应用下呼出/隐藏本工具"
-                                     L"（仅运行期有效，不写注册表；窄窗时折叠进工具条「⋮」菜单）"));
+                                     L"（仅运行期有效，不写注册表）"));
             }
         }
         if (place[1].visible) {
@@ -2810,8 +2864,7 @@ void DrawShell(AppContext& ctx) {
     ImGui::PopStyleVar();
 
     ui3::DrawSmokeAllPages(ctx);  // 第 3 阶段：--smoke 在屏外执行每个页面
-    ui3::DrawGcModals(ctx);       // F4#3: 宿主服务共享模态
-    // H-A(Phase-6): --smoke 离屏绘制「自定义壁纸」控件组（滑条/状态行/性能提示
+    ui3::DrawGcModals(ctx);       // F4#3: 宿主服务共享模态    // H-A(Phase-6): --smoke 离屏绘制「自定义壁纸」控件组（滑条/状态行/性能提示
     // 的渲染路径）。选图对话框是模态 Shell 交互，headless 无法驱动 —— 选图与
     // 加载/清除按钮的点击路径留人工验收；smoke 下按钮无输入事件不会触发。
     if (AppearanceSmokePreview()) {
@@ -2831,6 +2884,11 @@ void DrawShell(AppContext& ctx) {
     }
     DrawToasts();
     DrawConfirmDialogs();
+    // A1 统一风格改造：关于模态与外观设置模态与确认框同层（隐式窗口级，
+    // OpenPopup/BeginPopupModal 成对出现在 DrawAboutUi / DrawAppearanceModal
+    // 内部，与 DrawConfirmDialogs 同一渲染模式）。
+    ui::DrawAboutUi();
+    DrawAppearanceModal(ctx);
 }
 
 // --- --autotest dialogclick (V14) -------------------------------------------
