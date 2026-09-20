@@ -27,4 +27,9 @@ std::vector<ConnEntry> SnapshotConnections(std::wstring* err);
 // MIB_TCP_STATE_* -> Chinese short label ("监听"/"已建立"/...); unknown -> hex.
 std::wstring TcpStateLabel(uint32_t state);
 
+// V32-P2-1：启动清扫属主已死的本应用 ETW 会话（崩溃残留，每个约 4MB 非分页池）。
+// 按当前进程列表逐 pid 尝试停止三个已知命名模式；存活属主的会话不碰（多实例
+// 互不影响）。返回成功停止的残留会话数。在主窗口创建前调用一次即可。
+int SweepStaleEtwSessions();
+
 }  // namespace stm

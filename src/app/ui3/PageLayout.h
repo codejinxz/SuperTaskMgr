@@ -92,6 +92,34 @@ inline float FixedRegionShrinkToContent(float regionH, float contentH) {
     return contentH < regionH ? contentH : regionH;
 }
 
+// ---- P-A（2026-09）：页头固定的「精确填满」滚动区高度 -----------------------
+// 用户报告：①性能/网络页下滑后页面顶部控制行随内容滚走；②传感器页底部
+// 有一块随主题变黑/变白的空白。根因与修复契约（三页共用）：
+//   - 性能/网络页内容总高超视口 → 此前父级（##pagearea）整体滚动，页头
+//     随滚动偏移离开视野；传感器页 ##sensorgroups 的 [240,600] 钳制在
+//     页面可用高 > 606px 时留下「页尾空隙」（ChildBg 随主题变黑/变白，
+//     即用户所指空白块；P1⑤ 的内容收缩同样收缩不掉这段空隙）。
+//   - 修复：页头（恒定行数）绘制完成后，其余内容包进高度 = 本函数结果
+//     的滚动 Child。Child 在页头**之下**恰好填满页面剩余高度 → 页头 y
+//     恒定（缩放窗口是唯一合法变化）；内容增减只改变区内滚动量。
+//   - 扣减 ItemSpacing.y：EndChild 后 ImGui 按子高 + 条目间距推进父级
+//     光标，不扣减则父级恰好超高一个间距 → 出现 ~6px 微滚动条（页头
+//     随之抖动）；扣减后恰好贴合，父级永不出现滚动条。
+//   - 入参只有实测可用高度与条目间距（运行时值，已含布局缩放）——
+//     内容高度绝不是输入。退化：availY ≤ 0/NaN（离屏 smoke 顺序绘制
+//     耗尽空间）→ 1px；间距 ≥ 可用高 → 放弃扣减保正。
+//   - 取代口径：传感器页不再走 SensorGroupsRegionHeight*（[240,600]
+//     钳制）与 FixedRegionShrinkToContent（内容不足收缩）——纯函数与其
+//     selftest 契约保留不动；内容不足时 Child 空底与本页背景同为
+//     ChildBg（含壁纸模式的透明推送），不再形成可辨区块。
+inline float FillScrollRegionHeight(float availY, float itemSpacingY) {
+    if (!(availY > 0.0f)) return 1.0f;  // 0/负/NaN 防御（离屏绘制）
+    float h = availY;
+    if (itemSpacingY > 0.0f) h -= itemSpacingY;
+    if (!(h > 0.0f)) h = availY;  // 间距 ≥ 可用高：放弃扣减，保正
+    return h;
+}
+
 // ---- 网络页：适配器卡区 ----------------------------------------------------
 
 // 适配器定高卡区的默认高度（约 200px；窗口极矮时退化为可用高度，

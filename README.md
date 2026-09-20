@@ -1,6 +1,6 @@
 # SuperTaskMgr（Windows 超级任务管理器）
 
-面向系统管理员的本地进程/系统监控与维护工具。参考 Process Explorer / Process Hacker 的能力集，使用纯 Win32 + Dear ImGui + D3D11 + ImPlot 自绘 UI 与纯 C++ 采集层，构建产物为**单文件、零第三方 DLL、静态 CRT** 的便携 exe（约 1.7MB）。
+面向系统管理员的本地进程/系统监控与维护工具。参考 Process Explorer / Process Hacker 的能力集，使用纯 Win32 + Dear ImGui + D3D11 + ImPlot 自绘 UI 与纯 C++ 采集层，构建产物为**单文件、零第三方 DLL、静态 CRT** 的便携 exe（约 2.9MB）。
 
 > 定位声明：本工具面向管理员自用。UI 为 ImGui 自绘（非原生控件观感，无屏幕阅读器/无障碍支持）；所有"拿不到的数据"如实显示 `—` 或"需提权/需驱动"，**绝不显示假数据**。
 
@@ -31,7 +31,7 @@
 scripts\build.bat            :: Release（默认）
 scripts\build.bat Debug      :: Debug
 build\Release\SuperTaskMgr.exe        :: 主程序（单文件便携）
-build\Release\stm_selftest.exe        :: 自测（40 项，--json 输出）
+build\Release\stm_selftest.exe        :: 自测（173 项，--json 输出）
 ```
 
 CI 冒烟与自动化回归：`SuperTaskMgr.exe --smoke N`（无交互渲染 N 帧退出，覆盖全部页签）；`--autotest kill|tree|startup`（程序化走完整终止/禁用链路）；`--autotest dialogclick`（**真实 ImGui 输入管线**注入鼠标点击确认按钮并断言生效，含"模态单帧化"旧缺陷哨兵）。全部 exit 0 为通过。
@@ -52,7 +52,7 @@ CI 冒烟与自动化回归：`SuperTaskMgr.exe --smoke N`（无交互渲染 N �
 - StartupApproved / UWP StartupTask 的注册表语义为社区考证+本机实测（非官方文档化），禁用操作有备份可逆兜底，标记为"实验性"（日志 WARN）。
 - PDH 部分计数器（如 `\Memory\Hard Faults/sec`）在个别系统缺失，显示 `—`。
 - ImGui 自绘 UI 的 IME/无障碍限制；中文列排序为码点序。
-- 空载内存 ≈124MB（D3D11 运行时+驱动+字体图集基线，30 秒零增长；预算与证据见 `docs/phase/01_架构设计文档.md` §10）。
+- 空载内存 ≈128MB（D3D11 运行时+驱动+字体图集基线，30 秒零增长；预算与证据见 `docs/phase/01_架构设计文档.md` §10）。
 
 ## 发布说明（如何填版本号/仓库地址）
 

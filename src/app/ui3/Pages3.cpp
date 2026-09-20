@@ -280,10 +280,9 @@ const wchar_t* ProtoLabel(ConnProto p) {
 // ---- D5：实时监视数据层实例 -------------------------------------------------
 // 文件级生命周期（晚于 main 返回析构）：析构会 join 差分轮询线程并停止
 // 全部 ETW 会话（无孤儿会话）；UI 线程之外只有 NetMonitor 自己的线程访问。
-stm::NetMonitor& NetMonInst() {
-    static std::unique_ptr<stm::NetMonitor> mon = std::make_unique<stm::NetMonitor>();
-    return *mon;
-}
+// unique_ptr 提升到文件作用域：ShutdownNetMon（V32-P2-4）需要显式置空释放。
+std::unique_ptr<stm::NetMonitor> g_netmon = std::make_unique<stm::NetMonitor>();
+stm::NetMonitor& NetMonInst() { return *g_netmon; }
 
 // C2：深度抓包会话（单实例）。析构停消费线程并 pcap_close（晚于 main 返回，
 // 与 NetMonitor 同生命周期口径）；wpcap.dll 只在首次使用时动态加载。
@@ -306,7 +305,20 @@ public:
                 ctx.cfg.SetBool(L"netEtw", etw_);  // 持久化真实状态
             }
         }
-        DrawAdapterSection();  // A2：适配器区（独立抓取，置于页面顶部）
+        // P-A（用户报告①）：「适配器」头行（标题+计数+刷新按钮+行内溢出
+        // 提示+分隔线）保持页顶固定；其后全部区段（适配器卡定高区、实时
+        // 监视折叠区、深度抓包折叠区、工具栏、连接表）包进填满剩余高度的
+        // 滚动 Child —— 内容超出视口时只在此 Child 内滚动，头行 y 恒定。
+        // 高度经 PageLayout.h::FillScrollRegionHeight 扣除一行条目间距，
+        // 防止父级（##pagearea）因「子高+间距」超高而出现微滚动条。区内
+        // 既有嵌套滚动（200px 卡区 / 340px 定高段 / 连接表 ScrollY）不变。
+        DrawAdapterHeader();
+        ImGui::BeginChild("##netscroll",
+                          ImVec2(0.0f, ui3::FillScrollRegionHeight(
+                                            ImGui::GetContentRegionAvail().y,
+                                            ImGui::GetStyle().ItemSpacing.y)),
+                          ImGuiChildFlags_None);
+        DrawAdapterRegion();  // M2：200px 定高卡区（嵌套滚动）
         ImGui::Separator();
         DrawNetMon(ctx);  // D5：实时监视区（适配器区与连接表之间）
         ImGui::Separator();
@@ -320,12 +332,14 @@ public:
 
         if (res == nullptr) {
             DrawLoading();
+            ImGui::EndChild();
             return;
         }
         if (!res->ok && res->data.empty()) {
             bool retry = false;
             DrawLoadError(res->err, &retry);
             if (retry) fetch_.MaybeFetch(Produce, true);
+            ImGui::EndChild();
             return;
         }
         if (!res->err.empty()) {
@@ -334,6 +348,7 @@ public:
         }
         UpdateRows(*res);
         DrawTable(ctx, *res);
+        ImGui::EndChild();  // ##netscroll（P-A：头行固定的滚动内容区）
     }
 
 private:
@@ -1360,9 +1375,10 @@ private:
         return stm::EnumAdaptersNet(err);
     }
 
-    // 标签 + 数量 + 手动刷新一行（定高行：溢出提示用 SameLine，行数恒定）；
-    // 随后是 M2 定高滚动卡区。
-    void DrawAdapterSection() {
+    // P-A：头行（标签 + 数量 + 手动刷新一行；定高行：溢出提示用 SameLine，
+    // 行数恒定）+ 分隔线 —— 绘制在 ##netscroll 滚动区**之外**，y 恒定是
+    // 「头行不随内容滚走」契约的固定段。
+    void DrawAdapterHeader() {
         adapters_.MaybeFetch(AdapterProduce, false);
         std::shared_ptr<const AdapterResult> res = adapters_.Peek();
 
@@ -1398,12 +1414,15 @@ private:
             ImGui::TextDisabled("%s", U8(L"卡片较多，在列表框内滚动查看"));
         }
         ImGui::Separator();
+    }
 
-        // M2（顶栏位置固定）：卡区包进定高（约 200px，PageLayout.h::
-        // AdapterRegionHeight）滚动区 —— 适配器数量增减、「更多适配器」
-        // 展开/折叠、加载/错误态都只改变区内滚动量，绝不改变区外任何
-        // 元素的 y 坐标，下方的实时监视/深度抓包/连接表不再被顶动。
-        // P1④：定高按运行时布局缩放（缩放=1 时与原常量逐位一致）。
+    // P-A：适配器卡区（原 DrawAdapterSection 的定高段）—— 现绘制在
+    // ##netscroll 滚动区**内部**。M2（顶栏位置固定）：卡区仍为定高
+    //（约 200px，PageLayout.h::AdapterRegionHeight）滚动区 —— 适配器数量
+    // 增减、「更多适配器」展开/折叠、加载/错误态都只改变区内滚动量。
+    // P1④：定高按运行时布局缩放（缩放=1 时与原常量逐位一致）。
+    void DrawAdapterRegion() {
+        std::shared_ptr<const AdapterResult> res = adapters_.Peek();
         ImGui::BeginChild(
             "##adapters",
             ImVec2(0.0f, AdapterRegionHeightScaled(ImGui::GetContentRegionAvail().y,
@@ -2668,31 +2687,21 @@ public:
         ImGui::Separator();
 
         // M2（顶栏位置固定）：工具行/显隐行/LHM 区/分隔线均为恒定行数，
-        // 其下把分组展示区整体放进定高滚动区。高度实现选「页高减顶栏」
-        //（avail 在顶栏绘制完成后测取，钳制到 [240, 600]，见 PageLayout.h::
-        // SensorGroupsRegionHeight）：窗口够大时恒为 600，小窗口恰好填满
-        // 页高 → 父级永不出现滚动条。分组内容增减（温度条目出现/消失、
-        // LHM 行合入、组显隐切换、加载/错误/说明行）只改变区内滚动量，
-        // 绝不改变区外任何元素的 y 坐标 → 页头不再随内容上下移动。
-        // P1④：定高按运行时布局缩放。
-        // P1⑤（用户报告「传感器页底部有一个白色块」）：本区位于页尾、其下
-        // 无内容 —— 过去内容不足时定高区（上限 600px）露出大片空白底（各
-        // 主题/壁纸组合下都可能被读作一块无意义的「白色残块」）。现按上一帧
-        // 实测内容高收缩（FixedRegionShrinkToContent，纯函数）：内容不足时
-        // 区高 = 内容高（空白消失，且不影响区外任何元素的 y 坐标 —— 顶栏
-        // 固定契约不破）；内容超出时仍为定高滚动（M2 语义不变）。首帧内容
-        // 未知时用定高（下一帧即收缩，仅一次性）。
-        const float regionH = SensorGroupsRegionHeightScaled(
-            ImGui::GetContentRegionAvail().y, ui3::LayoutScale());
-        const float contentH =
-            sensorBodyContentY_ > 0.0f
-                ? sensorBodyContentY_ + ImGui::GetStyle().WindowPadding.y
-                : 0.0f;  // 首帧未知 → 用定高
+        // 其下把分组展示区整体放进定高滚动区。P-A（用户报告②）起高度改用
+        //「页高减顶栏」**精确填满**口径（PageLayout.h::FillScrollRegionHeight，
+        // 扣一行条目间距防父级微滚动条）：取代 M2/P1⑤ 的 [240,600] 钳制 +
+        // 内容收缩 —— 过去 600px 上限在页面可用高 > 606px 时留下的「页尾
+        // 空隙」正是随主题变黑/变白的空白块（内容收缩后同样留隙）。现区高
+        // 只由页高决定：页尾空隙消失；内容不足时空底与本页背景同为 ChildBg
+        //（壁纸模式下同受透明推送），不再形成可辨区块；内容超出时区内滚动
+        //（分组内容增减只改变区内滚动量，绝不改变区外任何元素的 y 坐标 →
+        // 页头不随内容上下移动；极矮窗口也不再触发父级滚动条）。
         ImGui::BeginChild("##sensorgroups",
-                          ImVec2(0.0f, FixedRegionShrinkToContent(regionH, contentH)),
+                          ImVec2(0.0f, ui3::FillScrollRegionHeight(
+                                            ImGui::GetContentRegionAvail().y,
+                                            ImGui::GetStyle().ItemSpacing.y)),
                           ImGuiChildFlags_None);
         DrawSensorBody(ctx, res);
-        sensorBodyContentY_ = ImGui::GetCursorPosY();  // 内容底（含滚动偏移）
         ImGui::EndChild();
     }
 
@@ -3269,9 +3278,6 @@ private:
     bool lhmOn_ = false;       // 已校验状态（探测通过），持久化于 cfg
     uint16_t lhmPort_ = 8085;
     uint64_t lastFrame_ = kNeverDrawn;
-    // P1⑤：##sensorgroups 上一帧的内容底 y（含滚动偏移的内容空间实测）；
-    // 0 = 尚未测得（首帧用定高）。
-    float sensorBodyContentY_ = 0.0f;
 };
 
 // ===========================================================================
@@ -3441,3 +3447,6 @@ void DrawSmokeAllPages(AppContext& ctx) {
 
 }  // namespace ui3
 }  // namespace stm
+
+// V32-P2-4：显式释放网络监视器（停差分线程与全部 ETW 会话）。
+void stm::ui3::ShutdownNetMon() { g_netmon.reset(); }

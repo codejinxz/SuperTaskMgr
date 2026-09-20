@@ -37,5 +37,9 @@ void DrawSmokeAllPages(AppContext& ctx);
 using BalloonSink = std::function<void(const std::wstring& title, const std::wstring& text)>;
 void SetBalloonSink(BalloonSink sink);
 
+// V32-P2-4：显式释放网络页持有的 NetMonitor（停差分线程与全部 ETW 会话）。
+// main 退出序列在 LogShutdown 之前调用一次；未创建实例时为空操作。
+void ShutdownNetMon();
+
 }  // namespace ui3
 }  // namespace stm

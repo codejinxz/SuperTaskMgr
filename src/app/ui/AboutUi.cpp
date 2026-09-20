@@ -61,7 +61,6 @@ void EnvField(const wchar_t* label, const std::wstring& value) {
 // 关于页徽标（Logo agent 交付的资源接线）：RC 内嵌 logo_256.png → stb 解码 →
 // D3D11 纹理。进程级缓存一次加载；设备/资源缺失时静默不显示（headless 安全）。
 void* g_logoDevice = nullptr;
-void* g_logoContext = nullptr;
 ImTextureRef g_logoTexture;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> g_logoSrv;
 bool g_logoTried = false;
@@ -103,9 +102,8 @@ void EnsureAboutLogo() {
 
 }  // namespace
 
-void SetAboutGraphics(void* device, void* context) {
-    g_logoDevice = device;
-    g_logoContext = context;
+void SetAboutGraphics(void* device, void* /*context*/) {
+    g_logoDevice = device;  // context 仅历史方案使用；当前纹理创建只需设备
 }
 
 void ShutdownAboutUi() {
@@ -113,7 +111,6 @@ void ShutdownAboutUi() {
     g_logoTexture = ImTextureRef();
     g_logoTried = false;     // 允许设备复活后重新加载
     g_logoDevice = nullptr;
-    g_logoContext = nullptr;
 }
 
 void OpenAbout() {

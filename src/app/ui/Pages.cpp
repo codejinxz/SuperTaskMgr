@@ -14,6 +14,7 @@
 #include "app/ui/UiText.h"
 #include "app/ui/VersionInfo.h"
 #include "app/ui3/CompatDiag.h"   // 维护轮 10: 兼容模式诊断文本（纯函数 + 落盘）
+#include "app/ui3/LogViewer.h"    // P-C: 日志查看器纯逻辑（过滤/行文本/统计/报告拼接）
 #include "app/ui3/GcPages.h"      // F4: 崩溃记录/窗口页注册 + 宿主服务模态 + 热键
 #include "app/ui3/JumpState.h"    // F4#3: 跨页跳转槽
 #include "app/ui3/MemCleanup.h"   // P3 任务一: 一键内存优化候选/聚合（纯逻辑）
@@ -70,6 +71,20 @@ struct Toast {
     double expireTime = 0.0;  // 基于 ImGui::GetTime()
 };
 
+// P-C：日志查看器模态的持久状态（模态关闭后保留过滤/勾选与上次读取结果）。
+struct LogViewerUi {
+    stm::LogTail tail;                     // 最近一次 ReadLogTail 结果（打开/刷新时更新）
+    bool loaded = false;                   // 本次打开是否已读取（打开请求消费时清零）
+    int filterMode = ui3::kLogFilterAll;   // 级别过滤（ui3::LogFilterModeLabel）
+    bool autoRefresh = false;              // 自动刷新（默认关；勾选后 1s 周期重读）
+    bool followNewest = false;             // 跟随最新：刷新后自动滚到表尾
+    double lastReadTime = 0.0;             // 上次读取时刻（ImGui::GetTime 基准）
+    std::vector<ui3::LogDisplayRow> rows;  // 过滤后的显示行（改过滤/重读时重建）
+    bool reportOpen = false;               // 「生成诊断报告」二级展示
+    std::wstring reportText;               // 报告全文（复制/保存共用同一文本）
+    bool scrollBottomPending = false;      // 本帧滚底请求（消费后清零）
+};
+
 // ConfirmKind/ConfirmRequest 已移至 app/ui/ConfirmAction.h（bug F1 修复）：
 // 确认动作执行与第 3 阶段启动对话框共享，
 // 并由 stm_selftest 在无 GUI 下单元测试。
@@ -113,6 +128,14 @@ struct UiState {
     // 判定，tick 计数会提前于重跑完成，不可作完成信号）。期间按钮禁用。
     bool compatRetryPending = false;
     uint64_t compatRetryGenBase = 0;  // 请求时刻的自检门代际（LastSelfCheckGeneration）
+    // P-C：日志查看器模态（工具条「日志」按钮）。读取策略：打开时与手动刷新时
+    // 在 UI 线程同步读取——ReadLogTail 只读尾部 512KB 窗口（kLogTailWindowBytes）、
+    // 至多 500 行，毫秒级、远低于一帧预算，与壁纸同步加载先例一致；走 ops job
+    // 反而引入 LogTail 跨线程拷贝与完成通知的额外复杂度。打开期间不自动刷新；
+    // 自动刷新复选框默认关，勾选后按 1s 周期重读。
+    bool logViewerOpenRequested = false;
+    bool logViewerOpened = false;
+    LogViewerUi logViewer;
 };
 
 UiState& Ui() {
@@ -2078,11 +2101,23 @@ public:
         }
         const int window = windowSec;
 
+        // P-A（用户报告①）：「内存加速+速览」行与「时间窗」行组成固定页头，
+        // 其下全部内容（等待数据早退、放大态/热图、8 块网格、内存条、告警与
+        // CSV 控件）包进填满剩余高度的滚动 Child —— 内容超出视口时只在此
+        // Child 内滚动，页头 y 恒定（与网络/传感器页「顶栏固定」同契约）。
+        // 高度经 PageLayout.h::FillScrollRegionHeight 扣除一行条目间距，
+        // 防止父级（##pagearea）因「子高+间距」恰好超高而出现微滚动条。
+        ImGui::BeginChild("##perfscroll",
+                          ImVec2(0.0f, ui3::FillScrollRegionHeight(
+                                            ImGui::GetContentRegionAvail().y,
+                                            ImGui::GetStyle().ItemSpacing.y)),
+                          ImGuiChildFlags_None);
         const PerfHistory& h = Hist();
         if (h.lastTick == 0) {
             // L1：早退分支现在画在固定顶栏之下（原来它出现在顶栏位置，
             // 首个 tick 到达时顶栏会被顶下去一行）。
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"等待采集数据…"));
+            ImGui::EndChild();
             return;
         }
 
@@ -2239,6 +2274,7 @@ public:
         DrawMemoryBars(sys);
         ui3::DrawAlertControls(ctx);  // 第 3 阶段：阈值告警控件（增量行）
         DrawCsvControls(ctx, sys);    // F4#7: 性能 CSV 记录开关
+        ImGui::EndChild();  // ##perfscroll（P-A：页头固定的滚动内容区）
     }
 
 private:
@@ -3029,6 +3065,9 @@ void DrawAppearanceModal(AppContext& ctx) {
         // 键清单登记见 ui3::ColWidthCfgKeys()（app/ui3/ThemeCfg.h，与
         // ProcessesPage::PersistWidths 写入一一对应）。
         ui3::SoftDeleteColWidthKeys(ctx.cfg);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(L"恢复进程表为默认列宽与列顺序；主题/壁纸设置不受影响"));
+        }
         ctx.cfg.SetString(L"colOrder", L"");  // P1②：恢复默认列宽同时重置列顺序
         const int removed = ui3::StripColWidthKeysFromFile(ConfigPath(), false);
         ++Ui().colWidthResetGen;  // 进程页下一帧重置 widths_ 并换代表格 id
@@ -3216,6 +3255,259 @@ void DrawCompatDiagModal(AppContext& ctx) {
 }
 
 // ===========================================================================
+// P-C：日志查看器模态（工具条「日志」按钮）。
+// 内容：控制行（级别过滤[全部/仅警告+错误] / 刷新 / 自动刷新(默认关,1s) /
+// 生成诊断报告 / 打开日志目录）+ 日志表格（时间/级别/模块/消息，ListClipper，
+// 最新在表尾；ERROR 红/WARN 黄着色）+ 底部统计行（跟随最新 + 共 N 条）。
+// 「生成诊断报告」：FormatForReport(tail, 50, SystemVersionLine())，兼容模式
+// 降级时附加 CompatDiagReportText（未降级只含日志部分）→ 模态内二级展示全文，
+// [复制到剪贴板] + [保存到 logs 目录]（复用 SaveDiagnosticsFile，绝不自动上传）。
+// 读取策略：UI 线程同步读（512KB 尾窗 + 500 行上限为毫秒级，理由见 UiState
+// 注释）；打开首帧与手动/自动刷新时读取，其余帧不碰文件。
+// 与 ##confirm/##appearance/##compatdiag 同款「请求长期有效 + 模态每帧渲染」
+// 模式（Esc/「关闭」均可退出，绝不残留隐形模态）。
+// ===========================================================================
+void RequestOpenLogViewer() {
+    Ui().logViewerOpenRequested = true;
+    Ui().logViewerOpened = false;
+}
+
+void DrawLogViewer(AppContext& ctx) {
+    UiState& s = Ui();
+    LogViewerUi& lv = s.logViewer;
+    if (s.logViewerOpenRequested) {
+        if (!ImGui::IsPopupOpen("##logviewer")) {
+            ImGui::OpenPopup("##logviewer");
+            s.logViewerOpened = true;
+            lv.loaded = false;      // 每次打开都重读（打开时读取，见上策略注释）
+            lv.reportOpen = false;  // 不残留上次的报告二级视图
+        }
+        s.logViewerOpenRequested = false;
+    }
+    if (!s.logViewerOpened) return;
+
+    // 尺寸：目标 860x600，受工作区 80% 钳制（小窗口仍可用），下限 560x380。
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    const float w = std::min(860.0f, std::max(560.0f, vp->WorkSize.x * 0.8f));
+    const float h = std::min(600.0f, std::max(380.0f, vp->WorkSize.y * 0.8f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(560.0f, 380.0f), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("##logviewer", nullptr, 0)) {
+        // 模态之前开着但现在没了：被 Esc 关闭（「关闭」按钮之外的唯一路径），
+        // 复位打开态——绝不残留隐形模态。
+        if (!ImGui::IsPopupOpen("##logviewer") && !s.logViewerOpenRequested) {
+            s.logViewerOpened = false;
+            lv.reportOpen = false;
+        }
+        return;
+    }
+
+    const std::wstring logPath = LogDir() + L"\\stm.log";
+    auto readNow = [&lv, &logPath] {
+        lv.tail = stm::ReadLogTail(logPath, ui3::kLogViewerMaxLines);
+        lv.rows = ui3::BuildDisplayRows(lv.tail, lv.filterMode);
+        lv.lastReadTime = ImGui::GetTime();
+        lv.loaded = true;
+        if (lv.followNewest) lv.scrollBottomPending = true;
+    };
+    // 打开首帧（!loaded）/ 勾选自动刷新后的 1s 周期：UI 线程同步重读。
+    if (!lv.loaded || (lv.autoRefresh && ImGui::GetTime() - lv.lastReadTime >= 1.0)) {
+        readNow();
+    }
+
+    ImGui::TextUnformatted(U8(L"应用日志"));
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", U8(Fmt(L"（来源：{}）", logPath)));
+    ImGui::Separator();
+
+    // 控制行：级别过滤 / 刷新 / 自动刷新 / 生成诊断报告 / 打开日志目录。
+    ImGui::SetNextItemWidth(150.0f);
+    if (ImGui::BeginCombo("##logfilter", U8(ui3::LogFilterModeLabel(lv.filterMode)))) {
+        for (int m = ui3::kLogFilterAll; m <= ui3::kLogFilterWarnAndAbove; ++m) {
+            if (ImGui::Selectable(U8(ui3::LogFilterModeLabel(m)), m == lv.filterMode)) {
+                lv.filterMode = m;
+                lv.rows = ui3::BuildDisplayRows(lv.tail, lv.filterMode);  // 纯过滤，不重读文件
+                if (lv.followNewest) lv.scrollBottomPending = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"「仅警告+错误」只显示 WARN/ERROR 级别的日志行"));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"刷新"))) readNow();
+    ImGui::SameLine();
+    ImGui::Checkbox(U8(L"自动刷新"), &lv.autoRefresh);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"勾选后每 1 秒重读一次日志尾部（默认关）"));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"生成诊断报告"))) {
+        // 日志报告（系统信息行与兼容诊断同源：ui3::SystemVersionLine()）+
+        // 仅在采集降级时附加兼容模式诊断全文（未降级只含日志部分）。
+        const std::wstring logPart =
+            stm::FormatForReport(lv.tail, 50, ui3::SystemVersionLine());
+        const bool degraded = s.snap != nullptr && s.snap->degraded;
+        std::wstring compatPart;
+        if (degraded) {
+            const std::wstring reason = s.snap->degradeReason.empty()
+                                            ? std::wstring(L"采集能力受限")
+                                            : s.snap->degradeReason;
+            compatPart =
+                ui3::CompatDiagReportText(kAppVersion, ctx.collect.LastSelfCheckReport(), reason);
+        }
+        lv.reportText = ui3::AssembleDiagnosticReport(logPart, compatPart, degraded);
+        lv.reportOpen = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"生成可上报的文本：系统信息 + 最近 50 条错误/警告"
+                                   L"（兼容模式时附加自检结果）；仅复制/保存到本机，"
+                                   L"不会自动上传"));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"打开日志目录"))) {
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", LogDir().c_str(), nullptr, SW_SHOWNORMAL);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"在资源管理器中打开日志目录（stm.log 所在位置）"));
+    }
+
+    // 读取失败：诚实展示原因与确切路径，绝不显示伪造行。
+    if (!lv.tail.error.empty()) {
+        ImGui::Spacing();
+        ImGui::TextColored(ColWarn(), "%s", U8(L"无法读取日志"));
+        ImGui::TextWrapped("%s", U8(ui3::LogReadFailureText(lv.tail, logPath)));
+        ImGui::Spacing();
+        if (ImGui::Button(U8(L"关闭"), ImVec2(120.0f, 0.0f))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    // 布局：日志表占大头；报告二级展示打开时预览区约占模态高度 32%，
+    // 日志表相应收缩；底部留「跟随最新 + 统计 + 关闭」一行。
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    const float frameH = ImGui::GetFrameHeight();
+    const float spY = ImGui::GetStyle().ItemSpacing.y;
+    const float reportChildH =
+        lv.reportOpen ? std::max(lineH * 4.0f, ImGui::GetWindowHeight() * 0.32f) : 0.0f;
+    const float reserved =
+        frameH + spY * 2.0f + (lv.reportOpen ? lineH + spY * 3.0f + reportChildH : 0.0f);
+    const float tableH = std::max(ImGui::GetContentRegionAvail().y - reserved, lineH * 4.0f);
+
+    ImGui::BeginChild("##logrows", ImVec2(0.0f, tableH), ImGuiChildFlags_Borders);
+    if (ImGui::BeginTable("##logtbl", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                              ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, 104.0f);
+        ImGui::TableSetupColumn(U8(L"级别"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn(U8(L"模块"), ImGuiTableColumnFlags_WidthFixed, 132.0f);
+        ImGui::TableSetupColumn(U8(L"消息"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(lv.rows.size()));
+        while (clipper.Step()) {
+            for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+                const ui3::LogDisplayRow& row = lv.rows[static_cast<size_t>(r)];
+                const ui3::LogRowCells cells =
+                    row.unparsed
+                        ? ui3::UnparsedRowCellTexts(
+                              lv.tail.unparsedLines[static_cast<size_t>(row.index)])
+                        : ui3::LogRowCellTexts(lv.tail.entries[static_cast<size_t>(row.index)]);
+                // 每行着色：ERROR 红 / WARN 黄 / 其他默认（未解析行不猜测）。
+                ImVec4 toneCol(-1.0f, -1.0f, -1.0f, -1.0f);
+                if (!row.unparsed) {
+                    const ui3::LogRowTone tone = ui3::LogRowToneOf(cells.level);
+                    if (tone == ui3::LogRowTone::Error) {
+                        toneCol = ColFail();
+                    } else if (tone == ui3::LogRowTone::Warn) {
+                        toneCol = ColWarn();
+                    }
+                }
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(cells.time));
+                ImGui::TableNextColumn();
+                if (toneCol.w >= 0.0f) ImGui::PushStyleColor(ImGuiCol_Text, toneCol);
+                ImGui::TextUnformatted(U8(cells.level));
+                if (toneCol.w >= 0.0f) ImGui::PopStyleColor();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(U8(cells.module));
+                ImGui::TableNextColumn();
+                if (toneCol.w >= 0.0f) ImGui::PushStyleColor(ImGuiCol_Text, toneCol);
+                ImGui::TextUnformatted(U8(cells.message));
+                if (row.unparsed && ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "%s", U8(L"该行不符合日志格式，按原文显示；它与解析行的原始"
+                                 L"交错顺序未保留，故统一排在表尾"));
+                }
+                if (toneCol.w >= 0.0f) ImGui::PopStyleColor();
+            }
+        }
+        ImGui::EndTable();
+    }
+    if (lv.scrollBottomPending) {
+        ImGui::SetScrollY(ImGui::GetScrollMaxY());
+        lv.scrollBottomPending = false;
+    }
+    ImGui::EndChild();
+
+    // 「生成诊断报告」二级展示：全文预览 + 复制/保存（与兼容诊断同款落盘）。
+    if (lv.reportOpen) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted(U8(L"诊断报告预览（提交 issue 时粘贴；应用不会自动上传）"));
+        ImGui::BeginChild("##logreport", ImVec2(0.0f, reportChildH), ImGuiChildFlags_Borders);
+        ImGui::TextWrapped("%s", U8(lv.reportText));
+        ImGui::EndChild();
+        if (ImGui::Button(U8(L"复制到剪贴板"))) {
+            ImGui::SetClipboardText(U8(lv.reportText));
+            PushToast(Notification::Kind::JobDone, L"诊断报告已复制到剪贴板");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(L"全文以纯文本复制，可直接粘贴到 issue"));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(U8(L"保存到 logs 目录"))) {
+            const std::wstring path = ui3::SaveDiagnosticsFile(lv.reportText);
+            PushToast(path.empty() ? Notification::Kind::JobFailed : Notification::Kind::JobDone,
+                      path.empty() ? std::wstring(L"保存失败（日志目录不可写）")
+                                   : Fmt(L"诊断报告已保存到 {}", path));
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(L"保存为 logs\\diagnostics_时间.txt（本机文件）"));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(U8(L"收起"))) lv.reportOpen = false;
+    }
+
+    // 底部行：跟随最新 + 统计（诚实标注截断/未解析/坏编码）+ 右对齐关闭。
+    ImGui::Spacing();
+    {
+        bool follow = lv.followNewest;
+        if (ImGui::Checkbox(U8(L"跟随最新"), &follow)) {
+            lv.followNewest = follow;
+            if (follow) lv.scrollBottomPending = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(L"勾选后每次刷新自动滚动到最新一条（表尾）"));
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", U8(ui3::LogStatsLine(lv.tail)));
+    ImGui::SameLine();
+    {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float closeW = ImGui::CalcTextSize(U8(L"关闭")).x + st.FramePadding.x * 2.0f;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                      ImGui::GetWindowWidth() - closeW - st.WindowPadding.x));
+        if (ImGui::Button(U8(L"关闭"))) ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
+// ===========================================================================
 // P1④：一键优化布局 / 重置布局。
 // 「一键优化布局」：读主视口 WorkSize（工作区高度）与窗口 DPI（Win32
 // GetDpiForWindow；vendored ImGui 1.92.9 无 PlatformMonitorDpi 等 DPI API，
@@ -3325,6 +3617,13 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s", U8(L"按当前分辨率与系统 DPI 自动缩放布局：区域高度、"
                                    L"表格行高、间距与图表高度"));
+    }
+    // P-C: 「日志」按钮 -> 日志查看器模态（查看应用日志 Error/Warn + 生成
+    // 诊断报告；DrawLogViewer 消费一次性标志，与「关于」同款模式）。
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"日志"))) RequestOpenLogViewer();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"查看应用运行日志（重点：错误/警告），可生成诊断报告"));
     }
     // A1: 「关于」按钮 -> 关于模态（ui::OpenAbout 一次性标志，DrawAboutUi 消费）。
     // 按钮矩形发布进 AboutAutotestState（--autotest about 驱动瞄准真实渲染
@@ -3733,6 +4032,8 @@ void DrawShell(AppContext& ctx) {
     // 维护轮 10：兼容模式说明模态（状态栏「兼容模式：<原因>」点击打开；
     // 与 ##confirm/##about/##appearance 同层、同一每帧渲染模式）。
     DrawCompatDiagModal(ctx);
+    // P-C：日志查看器模态（工具条「日志」按钮；同一每帧渲染模式与层级）。
+    DrawLogViewer(ctx);
 }
 
 // --- --autotest dialogclick (V14) -------------------------------------------

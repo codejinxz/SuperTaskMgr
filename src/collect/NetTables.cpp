@@ -15,6 +15,8 @@
 #include "core/Log.h"
 #include "core/Str.h"
 #include <iphlpapi.h>
+#include <tlhelp32.h>
+#include <unordered_set>
 #include <tdh.h>
 #include <algorithm>
 #include <cwchar>
@@ -703,3 +705,40 @@ EtwNetCollector::RawFieldSample EtwNetCollector::CopyRawSample() const {
 
 }  // namespace cd
 }  // namespace stm
+
+// ---- V32-P2-1：启动清扫属主已死的本应用 ETW 会话（契约 NetTables.h） ----
+int stm::SweepStaleEtwSessions() {
+    // 收集当前存活 pid：属主仍存活的会话绝不触碰（多实例互不影响）。
+    std::unordered_set<uint32_t> live;
+    {
+        HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return 0;
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (::Process32FirstW(snap, &pe)) {
+            do {
+                live.insert(pe.th32ProcessID);
+            } while (::Process32NextW(snap, &pe));
+        }
+        ::CloseHandle(snap);
+    }
+
+    // 以会话名停止一个 ETW 会话：属性缓冲区仅作收尾输出用（1KB 足够）。
+    auto tryStop = [](const std::wstring& name) {
+        std::vector<uint8_t> buf(sizeof(EVENT_TRACE_PROPERTIES) + 1024, 0);
+        auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
+        p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        return ::ControlTraceW(0, name.c_str(), p, EVENT_TRACE_CONTROL_STOP) == ERROR_SUCCESS;
+    };
+
+    int stopped = 0;
+    for (uint32_t pid = 0; pid < 0x10000; ++pid) {
+        if (live.count(pid) != 0) continue;  // 属主存活：不是残留
+        for (const wchar_t* pattern : {L"SuperTaskMgr-Net-%u",
+                                       L"SuperTaskMgr-NetMon-%u",
+                                       L"SuperTaskMgr-Dns-%u"}) {
+            if (tryStop(Fmt(pattern, pid))) ++stopped;
+        }
+    }
+    return stopped;
+}

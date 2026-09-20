@@ -15,6 +15,7 @@
 #include "app/ui3/ThemeCfg.h"     // H-A: 退出时剔除「恢复默认列宽」的软删除残留
 #include "app/ui3/Wallpaper.h"    // Phase-6 接线: AutoRestore/DrawBackground/ClampMask
 #include "collect/PawnIoLink.h"   // V26-P2: PawnIoShutdown 释放模块句柄与缓存
+#include "collect/NetTables.h"    // V32-P2-1: SweepStaleEtwSessions 清扫崩溃残留会话
 #include "core/FsUtil.h"
 #include "core/HandleGuard.h"
 #include "core/Log.h"
@@ -33,34 +34,34 @@
 namespace stm {
 namespace {
 
-int ParseSmokeFrames() {
-    int nArgs = 0;
-    int smoke = 0;
-    LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &nArgs);
-    if (args) {
-        for (int i = 1; i + 1 < nArgs; ++i) {
-            if (wcscmp(args[i], L"--smoke") == 0) smoke = _wtoi(args[i + 1]);
-        }
-        LocalFree(args);
-    }
-    return smoke;
-}
+struct LaunchArgs {
+    int smokeFrames = 0;         // --smoke N
+    std::wstring autotestMode;   // --autotest kill|tree|startup|about|wallpaper|dialogclick
+    bool malformed = false;      // 旗标缺参数/参数非法（V31-P2-1：不得静默变 GUI 启动）
+};
 
-// --autotest kill|tree|startup（bug F1 验证辅助）：UI 起来之后，帧循环
-// 执行与确认按钮相同的 ui::ExecuteConfirmedAction() 调用，在应用日志旁
-// 写一条 PASS/FAIL 日志并退出。用于在没有 selftest 二进制的机器上
-// 快速人工复核。
-std::wstring ParseAutotestMode() {
+// --smoke N 与 --autotest kill|tree|startup|...（CI/人工复核辅助）：UI 起来之后
+// 执行与确认按钮相同的 ui::ExecuteConfirmedAction() 调用，写 PASS/FAIL 日志并退出。
+LaunchArgs ParseLaunchArgs() {
+    LaunchArgs la;
     int nArgs = 0;
     LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &nArgs);
-    std::wstring mode;
     if (args) {
-        for (int i = 1; i + 1 < nArgs; ++i) {
-            if (wcscmp(args[i], L"--autotest") == 0) mode = args[i + 1];
+        for (int i = 1; i < nArgs; ++i) {
+            if (wcscmp(args[i], L"--smoke") == 0) {
+                if (i + 1 >= nArgs) { la.malformed = true; break; }
+                la.smokeFrames = _wtoi(args[i + 1]);
+                if (la.smokeFrames <= 0) { la.malformed = true; break; }
+                ++i;
+            } else if (wcscmp(args[i], L"--autotest") == 0) {
+                if (i + 1 >= nArgs) { la.malformed = true; break; }
+                la.autotestMode = args[i + 1];
+                ++i;
+            }
         }
         LocalFree(args);
     }
-    return mode;
+    return la;
 }
 
 uint32_t ClampInterval(int64_t v) {
@@ -276,12 +277,18 @@ void WriteAutotestLine(const std::wstring& mode, const std::wstring& result,
 
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     using namespace stm;
-    const int smokeFrames = ParseSmokeFrames();
-    const std::wstring autotestMode = ParseAutotestMode();
+    const LaunchArgs la = ParseLaunchArgs();
+    const int smokeFrames = la.smokeFrames;
+    const std::wstring autotestMode = la.autotestMode;
     const bool headless = smokeFrames > 0 || !autotestMode.empty();
 
     LogInit(LogDir());
-    STM_LOG_INFO("app", L"启动（phase2 UI, elevated={}, smoke={}, autotest={}）",
+    // V31-P2-1：旗标缺参/非法必须按错误退出，绝不静默变成普通 GUI 启动。
+    if (la.malformed) {
+        STM_LOG_WARN("app", L"命令行参数不完整或非法（--smoke N / --autotest <mode>）");
+        return 2;
+    }
+    STM_LOG_INFO("app", L"启动（elevated={}, smoke={}, autotest={}）",
                  IsProcessElevated() ? L"1" : L"0", smokeFrames,
                  autotestMode.empty() ? L"-" : autotestMode);
 
@@ -292,6 +299,12 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
         if (headless) return 1;  // CI：绝不被 MessageBox 阻塞（V11-P2-7）
         MessageBoxW(nullptr, L"超级任务管理器已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
         return 0;
+    }
+
+    // V32-P2-1：清扫属主已死的本应用 ETW 会话（崩溃残留，每个约 4MB 非分页池）。
+    // 仅在本实例取得互斥体后执行，不会影响其他存活实例的会话。
+    if (const int swept = stm::SweepStaleEtwSessions(); swept > 0) {
+        STM_LOG_INFO("app", L"已清扫 {} 个残留 ETW 会话", swept);
     }
 
     ops::SessionState session;
@@ -632,6 +645,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     ui.Shutdown();
     renderer.Shutdown();
     win.Destroy();
+    ui3::ShutdownNetMon();  // V32-P2-4：显式停差分线程与全部 ETW 会话
     LogShutdown();
     return autotestResult;
 }
