@@ -180,6 +180,102 @@ inline bool AdapterCardsOverflow(float regionH, float cardsTotalH) {
     return cardsTotalH > regionH;
 }
 
+// ---- U1（2026-09）：网络页纵向可拖拽分栏 ------------------------------------
+// 需求：网络页三个纵向区块之间（适配器卡区 | 实时监视段 | 连接表）各有一条
+// 6px 的可拖拽分隔条，拖动手柄实时调整上方区块高度（抓包段不参与：折叠/
+// 展开是唯一形态，展开态维持 kPcapSectionHeight 定高，其下方内容照旧由
+// ##netscroll 滚动消化）。契约（本头文件纯函数 + SplitterUi.h 手柄 +
+// Pages3.cpp 调用方共同遵守，selftest ui_m2_test.cpp 断言）：
+//   - cfg 持久化 netAdapterH / netmonH（真实像素值；拖动中只改内存，
+//     松手才写 cfg —— 落盘节流；启动时一次性读回，与 netEtw 同口径）；
+//   - ClampRegionH：高度钳制（0/负/NaN 一律回下限，杜绝退化值进布局）；
+//   - NetRegionHeights：三区高度分配（适配器 / 监视段 / 连接表=剩余）。
+//     入参只有（cfg 两值、可用高）—— 数据/展开状态绝不是输入，故无拖拽
+//     的帧三区高度逐位恒定（V28：「连接表」标题起始 y 恒定；拖动中连接表
+//     随动是用户主动行为，松手后稳定）。
+//   - 最小和守恒：适配器下限 100 + 分隔条 6 + 监视段下限 160 + 分隔条 6 +
+//     连接表保底 120 = kNetRegionsMinSumH = 392px，远小于常见视口
+//    （1280×800 工作区扣除页框/页头后可用仍 > 600px）—— 三区均能保住
+//     下限。仅当可用高 < kNetRegionsMinSumH（极矮窗口 / 离屏 smoke 顺序
+//     绘制耗尽空间）时降级：两拖拽区等比压缩（保持用户拖出的比例）给
+//     连接表让出保底高；再小则连接表/两区依次退化为 1px/下限。
+inline constexpr float kNetAdapterRegionMinH = 100.0f;
+inline constexpr float kNetAdapterRegionMaxH = 480.0f;
+// 默认高与既有常量一致（适配器卡区 = kAdapterRegionHeight；监视段 =
+// NetMonUi.h::kNetMonSectionHeight，不改其契约故不引入头依赖）。
+inline constexpr float kNetAdapterRegionDefH = kAdapterRegionHeight;
+inline constexpr float kNetMonRegionDefH = 340.0f;
+inline constexpr float kNetMonRegionMinH = 160.0f;
+inline constexpr float kNetMonRegionMaxH = 640.0f;
+// 分隔条交互带厚度（SplitterUi.h 的手柄高度；经 Scaled 随布局缩放）。
+inline constexpr float kNetSplitterThickness = 6.0f;
+// 连接表保底高：工具栏一行 + 表头 + 数行的保守值（视口紧张时的最后让步）。
+inline constexpr float kNetConnTableMinH = 120.0f;
+// 三区最小高度之和（含两条分隔条占位）：见上方守恒注释。
+inline constexpr float kNetRegionsMinSumH = kNetAdapterRegionMinH +
+                                            kNetMonRegionMinH +
+                                            kNetConnTableMinH +
+                                            2.0f * kNetSplitterThickness;
+static_assert(kNetRegionsMinSumH == 392.0f, "最小和注释必须与常量同步");
+
+// 高度钳制（纯）：区间内逐位原样返回；低于下限/0/负/NaN → 下限；
+// 高于上限 → 上限。cfg 读回与拖动增量的唯一入口（保证非法值进不了布局）。
+inline float ClampRegionH(float h, float minH, float maxH) {
+    if (!(h > 0.0f)) return minH;  // 0/负/NaN 防御（NaN 比较恒 false）
+    if (h < minH) return minH;
+    if (h > maxH) return maxH;
+    return h;
+}
+
+// 三区高度元组：适配器卡区 / 实时监视段（可拖拽）+ 连接表（= 剩余）。
+struct NetRegionTriple {
+    float adapter;
+    float netmon;
+    float connTable;
+};
+
+// 三区高度分配（纯）。adapterH/netmonH 为 cfg 读出的期望高（内部再钳制，
+// 调用方可以不预钳）；availY 为两拖拽区 + 两条分隔条 + 连接表共享的可用高
+// （调用方在滚动区顶部实测；深度抓包展开段不参与本分配，见节首注释）。
+//   - 充裕（availY ≥ 最小和且两区期望放得下）：两区 = 期望值，
+//     connTable = 剩余（≥ kNetConnTableMinH），总和严格守恒；
+//   - 紧张：两区等比压缩（保持用户拖出的比例，压缩后仍随拖动单调），
+//     connTable 恒为保底 kNetConnTableMinH；
+//   - 极小（保底都放不下）：两区取下限、connTable 收缩到 ≥1px；
+//   - availY 0/负/NaN（离屏绘制）：两区取钳制值、connTable=1px（不传播
+//     非正值给 BeginChild）。
+inline NetRegionTriple NetRegionHeights(float adapterH, float netmonH,
+                                        float availY) {
+    NetRegionTriple t;
+    t.adapter =
+        ClampRegionH(adapterH, kNetAdapterRegionMinH, kNetAdapterRegionMaxH);
+    t.netmon = ClampRegionH(netmonH, kNetMonRegionMinH, kNetMonRegionMaxH);
+    if (!(availY > 0.0f)) {  // 离屏 smoke / 退化输入
+        t.connTable = 1.0f;
+        return t;
+    }
+    const float usable = availY - 2.0f * kNetSplitterThickness;  // 分隔条占位
+    const float pool = usable - kNetConnTableMinH;  // 分给两拖拽区的空间
+    const float want = t.adapter + t.netmon;
+    if (pool >= want) {  // 充裕：连接表吃剩余，总和 = availY 严格守恒
+        t.connTable = usable - want;
+        return t;
+    }
+    if (pool <= 0.0f) {  // 极小：连接表保底放不下，两区退下限、剩余给表
+        t.adapter = kNetAdapterRegionMinH;
+        t.netmon = kNetMonRegionMinH;
+        t.connTable = usable - kNetAdapterRegionMinH - kNetMonRegionMinH;
+        if (!(t.connTable > 1.0f)) t.connTable = 1.0f;
+        return t;
+    }
+    // 紧张：等比压缩给连接表让出保底（比例随期望高单调，拖动预览不回跳）。
+    const float ratio = pool / want;
+    t.adapter *= ratio;
+    t.netmon *= ratio;
+    t.connTable = kNetConnTableMinH;
+    return t;
+}
+
 // ---- 传感器页：分组展示定高区 ----------------------------------------------
 
 // 分组展示区高度上限：约 600px —— 大窗口下页面总高 = 顶栏 + 600，

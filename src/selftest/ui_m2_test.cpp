@@ -256,6 +256,141 @@ STM_TEST(ui_m2_sensor_group_mask) {
     return true;
 }
 
+// 契约 5（U1 纵向分栏）：ClampRegionH 钳制 —— 下限/上限/越界/退化输入
+// 全部收敛到 [minH, maxH]；区间内逐位原样返回（拖拽值未经必要不得漂移）。
+STM_TEST(ui_m2_net_clamp_region_h) {
+    constexpr float kMin = kNetAdapterRegionMinH;  // 100
+    constexpr float kMax = kNetAdapterRegionMaxH;  // 480
+    // 区间内逐位恒等（含边界）。
+    if (ClampRegionH(200.0f, kMin, kMax) != 200.0f ||
+        ClampRegionH(kMin, kMin, kMax) != kMin ||
+        ClampRegionH(kMax, kMin, kMax) != kMax) {
+        *err = L"区间内（含边界）的高度应逐位原样返回";
+        return false;
+    }
+    // 越界收敛到边界。
+    if (ClampRegionH(99.9f, kMin, kMax) != kMin ||
+        ClampRegionH(480.1f, kMin, kMax) != kMax ||
+        ClampRegionH(1.0e9f, kMin, kMax) != kMax) {
+        *err = L"低于下限/高于上限的高度应收敛到边界";
+        return false;
+    }
+    // 退化输入（0/负/NaN）一律回下限 —— 非法值绝不能进布局。
+    if (ClampRegionH(0.0f, kMin, kMax) != kMin ||
+        ClampRegionH(-3.0f, kMin, kMax) != kMin ||
+        ClampRegionH(std::numeric_limits<float>::quiet_NaN(), kMin, kMax) !=
+            kMin) {
+        *err = L"0/负/NaN 高度应回退到下限";
+        return false;
+    }
+    // 非对称区间（监视段 [160, 640]）同样成立。
+    if (ClampRegionH(0.0f, kNetMonRegionMinH, kNetMonRegionMaxH) !=
+            kNetMonRegionMinH ||
+        ClampRegionH(1.0e9f, kNetMonRegionMinH, kNetMonRegionMaxH) !=
+            kNetMonRegionMaxH) {
+        *err = L"非对称区间的钳制语义应一致";
+        return false;
+    }
+    return true;
+}
+
+// 契约 6（U1 纵向分栏）：视口充裕时的三区分配 —— 两拖拽区 = 钳制后的
+// 期望值、连接表 = 剩余（≥ 保底）、总和严格守恒；期望值随拖动单调传导。
+STM_TEST(ui_m2_net_region_heights_amply) {
+    const float a = 200.0f, n = 340.0f;
+    const NetRegionTriple t = NetRegionHeights(a, n, 900.0f);
+    if (t.adapter != a || t.netmon != n) {
+        *err = L"充裕视口下两拖拽区应等于期望值";
+        return false;
+    }
+    const float kSplit = 2.0f * kNetSplitterThickness;
+    if (t.connTable != 900.0f - kSplit - a - n) {
+        *err = L"充裕视口下连接表应恰为剩余高度";
+        return false;
+    }
+    if (t.connTable < kNetConnTableMinH) {
+        *err = L"充裕视口下连接表不得低于保底高";
+        return false;
+    }
+    // 总和守恒：三区 + 两条分隔条 = 可用高（逐位）。
+    if (t.adapter + t.netmon + t.connTable + kSplit != 900.0f) {
+        *err = L"三区高度 + 分隔条占位应严格等于可用高";
+        return false;
+    }
+    // 期望值经 ClampRegionH：超上限收敛到上限（cfg 可能存入任意旧值）。
+    const NetRegionTriple tc = NetRegionHeights(1.0e9f, -50.0f, 1200.0f);
+    if (tc.adapter != kNetAdapterRegionMaxH ||
+        tc.netmon != kNetMonRegionMinH) {
+        *err = L"分配前应先对期望高做钳制";
+        return false;
+    }
+    // 拖动传导单调：期望高变大 → 生效高不减（拖拽预览不回跳）。
+    float prevA = 0.0f;
+    for (float h = kNetAdapterRegionMinH; h <= kNetAdapterRegionMaxH + 0.5f;
+         h += 10.0f) {
+        const NetRegionTriple s = NetRegionHeights(h, n, 900.0f);
+        if (s.adapter < prevA) {
+            *err = L"增大期望高后适配器区生效高不得减少";
+            return false;
+        }
+        prevA = s.adapter;
+    }
+    return true;
+}
+
+// 契约 7（U1 纵向分栏）：视口紧张/退化 —— 两拖拽区等比压缩给连接表让出
+// 保底、压缩后仍守恒；极小/离屏可用高不产生非正或 NaN 高度。最小和常量
+// 392px（100+6+160+6+120）必须 ≤ 常见视口可用高（守恒注释的编译期钉死）。
+STM_TEST(ui_m2_net_region_heights_tight) {
+    static_assert(kNetRegionsMinSumH == 392.0f,
+                  "最小和 = 100+6+160+6+120，注释与常量必须同步");
+    static_assert(kNetRegionsMinSumH <= 600.0f,
+                  "三区最小和必须 ≤ 常见视口（720p 级工作区）可用高");
+    const float a = 200.0f, n = 340.0f, kSplit = 2.0f * kNetSplitterThickness;
+    // 紧张（avail = 最小和）：连接表恒为保底，两区等比压缩后总和仍守恒。
+    const NetRegionTriple t = NetRegionHeights(a, n, kNetRegionsMinSumH);
+    if (t.connTable != kNetConnTableMinH) {
+        *err = L"紧张视口下连接表应恰为保底高";
+        return false;
+    }
+    const float sum = t.adapter + t.netmon + t.connTable + kSplit;
+    if (std::fabs(sum - kNetRegionsMinSumH) > 0.01f) {
+        *err = L"紧张视口下三区 + 分隔条仍应等于可用高（守恒）";
+        return false;
+    }
+    // 等比性：压缩保持两区期望比例（200:340）。
+    const float ra = t.adapter / a, rn = t.netmon / n;
+    if (std::fabs(ra - rn) > 0.001f) {
+        *err = L"紧张视口下两拖拽区应等比压缩";
+        return false;
+    }
+    // 拖动仍单调（压缩系数只随期望和变化，本区期望增大 → 生效高不减）。
+    const NetRegionTriple t2 = NetRegionHeights(a + 60.0f, n, kNetRegionsMinSumH);
+    if (t2.adapter <= t.adapter) {
+        *err = L"紧张视口下增大期望高仍应单调传导";
+        return false;
+    }
+    // 极小可用高：连接表收缩但为正，两区退下限。
+    const NetRegionTriple tm = NetRegionHeights(a, n, 130.0f);
+    if (tm.adapter != kNetAdapterRegionMinH ||
+        tm.netmon != kNetMonRegionMinH || !(tm.connTable >= 1.0f)) {
+        *err = L"极小视口下两区应退下限、连接表保持正值";
+        return false;
+    }
+    // 退化可用高（0/负/NaN，离屏 smoke 顺序绘制耗尽空间）：不传播非正/NaN。
+    const float kBad[] = {0.0f, -50.0f, std::numeric_limits<float>::quiet_NaN()};
+    for (float avail : kBad) {
+        const NetRegionTriple d = NetRegionHeights(a, n, avail);
+        if (!(d.adapter > 0.0f) || !(d.netmon > 0.0f) || !(d.connTable > 0.0f) ||
+            std::isnan(d.adapter) || std::isnan(d.netmon) ||
+            std::isnan(d.connTable)) {
+            *err = L"退化可用高必须产出全正且非 NaN 的三区高度";
+            return false;
+        }
+    }
+    return true;
+}
+
 // 契约 4（补充）：溢出提示对输入单调确定 —— 卡片增多/地址行增多只会
 // 让估算总高单调不减，从而提示出现与否逐帧确定（不抖动）。
 STM_TEST(ui_m2_adapter_overflow_monotonic) {

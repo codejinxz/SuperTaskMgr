@@ -31,7 +31,7 @@
 scripts\build.bat            :: Release（默认）
 scripts\build.bat Debug      :: Debug
 build\Release\SuperTaskMgr.exe        :: 主程序（单文件便携）
-build\Release\stm_selftest.exe        :: 自测（173 项，--json 输出）
+build\Release\stm_selftest.exe        :: 自测（176 项，--json 输出）
 ```
 
 CI 冒烟与自动化回归：`SuperTaskMgr.exe --smoke N`（无交互渲染 N 帧退出，覆盖全部页签）；`--autotest kill|tree|startup`（程序化走完整终止/禁用链路）；`--autotest dialogclick`（**真实 ImGui 输入管线**注入鼠标点击确认按钮并断言生效，含"模态单帧化"旧缺陷哨兵）。全部 exit 0 为通过。
@@ -79,3 +79,7 @@ CI 冒烟与自动化回归：`SuperTaskMgr.exe --smoke N`（无交互渲染 N �
 - `docs/phase/01_架构设计文档.md` — 模块/线程/契约/提权模型
 - `docs/phase/02、03_阶段报告.md` — 各阶段交付与交叉审查修复记录
 - `docs/research/R1-R6` — 采集层 API 矩阵与传感器可达性调研（含官方引用）
+
+## redist/ 目录说明
+
+`redist/npcap-1.89.exe` 为官方 Npcap 安装包（Nmap Software LLC 签名，已验证；SHA256 见 `docs/phase/16_review_V34.md`），供「网络页 → 深度抓包」功能使用——本应用**不捆绑、不自动安装**，需你手动运行安装（默认勾选含回环抓包）。不使用抓包功能可删除此文件。

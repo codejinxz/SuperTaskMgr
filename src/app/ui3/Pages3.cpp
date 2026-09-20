@@ -21,6 +21,7 @@
 #include "app/ui3/PcapUi.h"  // C2: 深度抓包区纯逻辑（HexDump/BPF 提示/行摘要/CSV）
 #include "app/ui3/PageHelpers.h"
 #include "app/ui3/PageLayout.h"  // M2: 顶栏位置固定的定高区/可见集合纯函数
+#include "app/ui3/SplitterUi.h"  // U1: 网络页纵向可拖拽分隔条（手柄薄组件）
 #include "app/ui3/ThemeCfg.h"    // P1③: netcol_* 列宽键登记/软删除（纯函数）
 #include "app/ui/Pages.h"
 #include "app/ui/ConfirmAction.h"
@@ -305,23 +306,61 @@ public:
                 ctx.cfg.SetBool(L"netEtw", etw_);  // 持久化真实状态
             }
         }
+        // U1：纵向分栏高度一次性从 cfg 读回（netAdapterH / netmonH，存的是
+        // 真实像素值 —— 拖动手柄按屏幕像素移动；缺键时默认值经 P1④ 布局
+        // 缩放，与改版前 Scaled(200)/Scaled(340) 的显示一致）。写侧同 netEtw
+        // 口径：松手才 SetDouble（内存写），文件由 main 退出时统一 Save。
+        if (!heightsLoaded_ ||
+            heightsLoadedGen_ != ui3::LayoutResetGeneration()) {
+            // V34-P1-N1：订阅布局重置代际——「重置布局」后分栏高度回到默认。
+            heightsLoaded_ = true;
+            heightsLoadedGen_ = ui3::LayoutResetGeneration();
+            netAdapterH_ = ui3::ClampRegionH(
+                static_cast<float>(ctx.cfg.GetDouble(
+                    L"netAdapterH", static_cast<double>(ui3::Scaled(
+                                        ui3::kNetAdapterRegionDefH)))),
+                ui3::kNetAdapterRegionMinH, ui3::kNetAdapterRegionMaxH);
+            netmonH_ = ui3::ClampRegionH(
+                static_cast<float>(ctx.cfg.GetDouble(
+                    L"netmonH",
+                    static_cast<double>(ui3::Scaled(ui3::kNetMonRegionDefH)))),
+                ui3::kNetMonRegionMinH, ui3::kNetMonRegionMaxH);
+        }
         // P-A（用户报告①）：「适配器」头行（标题+计数+刷新按钮+行内溢出
         // 提示+分隔线）保持页顶固定；其后全部区段（适配器卡定高区、实时
         // 监视折叠区、深度抓包折叠区、工具栏、连接表）包进填满剩余高度的
         // 滚动 Child —— 内容超出视口时只在此 Child 内滚动，头行 y 恒定。
         // 高度经 PageLayout.h::FillScrollRegionHeight 扣除一行条目间距，
         // 防止父级（##pagearea）因「子高+间距」超高而出现微滚动条。区内
-        // 既有嵌套滚动（200px 卡区 / 340px 定高段 / 连接表 ScrollY）不变。
+        // 嵌套滚动（可拖拽卡区 / 可拖拽监视段 / 连接表 ScrollY）不变。
         DrawAdapterHeader();
         ImGui::BeginChild("##netscroll",
                           ImVec2(0.0f, ui3::FillScrollRegionHeight(
                                             ImGui::GetContentRegionAvail().y,
                                             ImGui::GetStyle().ItemSpacing.y)),
                           ImGuiChildFlags_None);
-        DrawAdapterRegion();  // M2：200px 定高卡区（嵌套滚动）
-        ImGui::Separator();
-        DrawNetMon(ctx);  // D5：实时监视区（适配器区与连接表之间）
-        ImGui::Separator();
+        // U1：本帧三区高度分配（纯函数 NetRegionHeights）。入参只有 cfg 高度
+        // 与本滚动区可见高 —— 适配器数量/事件/包数等数据绝不是输入；无拖拽
+        // 的帧三区高度逐位恒定（V28：「连接表」标题起始 y 稳定的前提；拖动
+        // 中连接表随动是用户主动行为，松手后稳定）。深度抓包段不参与分配：
+        // 折叠/展开是唯一形态（用户主动切换，V28 口径容忍该次位移），展开态
+        // 维持 kPcapSectionHeight 定高、照旧由本滚动区消化。连接表 = 剩余
+        // （BeginTable(0,0) 自动填满；元组的 connTable 用于分配决策与头部
+        // 溢出提示）。两条分隔条在此处与监视段尾各一条，拖动分别调整
+        // 适配器区 / 监视段高度。
+        const ui3::NetRegionTriple netRegions =
+            ui3::NetRegionHeights(netAdapterH_, netmonH_,
+                                  ImGui::GetContentRegionAvail().y);
+        adapterRegionHintH_ = netRegions.adapter;  // 头部溢出提示用（本帧值）
+        DrawAdapterRegion(netRegions.adapter);
+        // U1：分隔条①（适配器卡区 | 实时监视段）。拖动中只改 netAdapterH_
+        // 内存值（下一帧经 NetRegionHeights 生效 = 实时预览）；松手才写 cfg。
+        if (ui3::RegionSplitterY("##netadapterspl", &netAdapterH_,
+                                 ui3::kNetAdapterRegionMinH,
+                                 ui3::kNetAdapterRegionMaxH)) {
+            ctx.cfg.SetDouble(L"netAdapterH", static_cast<double>(netAdapterH_));
+        }
+        DrawNetMon(ctx, netRegions.netmon);  // D5：实时监视区（段尾含分隔条②）
         DrawPcap(ctx);  // C2：深度抓包区（默认折叠；未装 Npcap 时只展示指引）
         ImGui::Separator();
         fetch_.MaybeFetch(Produce, false);
@@ -387,7 +426,7 @@ private:
         return NetMonInst().TopRemoteTraffic(20);
     }
 
-    void DrawNetMon(AppContext& ctx) {
+    void DrawNetMon(AppContext& ctx, float sectionH) {
         stm::NetMonitor& mon = NetMonInst();
         // 每帧取走新事件（顺序翻转为最新在前）；溢出按容量弃旧。
         std::vector<stm::ConnEvent> fresh;
@@ -441,22 +480,26 @@ private:
             viewDnsGen_ = dnsGen_;
         }
 
-        // M2 审计（顶栏位置固定）：本头部行的 y 只取决于上方的适配器定高
-        // 卡区（M2 起恒高）与分隔线。Drain/DNS/开关读回只改写本地容器
-        //（evAll_/dnsAll_/视图向量），全部渲染在头部行**之下**，且
-        // CollapsingHeader 标签为常量文本 —— 头部行不受 Drain 内容影响。
-        // 折叠 = 用户主动行为（可接受）；展开时头部行以下的 y 恒定。
-        if (!ImGui::CollapsingHeader(U8(L"实时监视"), ImGuiTreeNodeFlags_DefaultOpen)) return;
+        // M2 审计（顶栏位置固定）：本头部行的 y 只取决于上方的适配器卡区
+        //（U1 起为可拖拽定高，无拖拽的帧恒定）与分隔条。Drain/DNS/开关读回
+        // 只改写本地容器（evAll_/dnsAll_/视图向量），全部渲染在头部行**之下**，
+        // 且 CollapsingHeader 标签为常量文本 —— 头部行不受 Drain 内容影响。
+        // 折叠/展开 = 用户主动行为（可接受）；展开时头部行以下的 y 恒定。
+        if (!ImGui::CollapsingHeader(U8(L"实时监视"), ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Separator();  // U1：监视段折叠时保留与抓包段之间的分隔线
+            return;
+        }
 
         // V28-P1-1（布局稳定化）：折叠头以下整段包进定高滚动段
-        //（高度 = kNetMonSectionHeight 经 P1④ 运行时缩放，选型理由见
+        //（高度 = U1 可拖拽值 sectionH：cfg netmonH 经 NetRegionHeights
+        // 分配/压缩，未拖拽且视口充裕时恒等于加载默认 Scaled(340)，选型理由见
         // NetMonUi.h）—— 诚实边界行、「已丢弃 N 条」/「DNS 自动禁用」警告行
         //（原画在定高区外，随数据出现/消失增减页面行数）、开关/过滤行、连接事件表
         //（空态单行↔300px 定高表互斥切换）、Top 远程目标表（原无定高，
         // ETW 聚合 0→20 行逐行下推 DNS 区）、DNS 表全部画进段内：任何
         // 数据变化只改变段内滚动量，绝不改变段外（深度抓包标题/工具栏/
         // 连接表标题）的 y 坐标。段内结构不变，「暂停显示」语义不变。
-        ImGui::BeginChild("##netmonsection", ImVec2(0.0f, Scaled(kNetMonSectionHeight)),
+        ImGui::BeginChild("##netmonsection", ImVec2(0.0f, sectionH),
                           ImGuiChildFlags_None);
         // 诚实边界 + 丢弃警告。
         ImGui::TextWrapped("%s", U8(L"连接级监视：不捕获通信内容；远程聚合与 DNS 记录需要"
@@ -478,6 +521,13 @@ private:
         DrawNetMonTop();
         DrawNetMonDns();
         ImGui::EndChild();
+        // U1：分隔条②（实时监视段 | 深度抓包段，段尾、展开态专属）。拖动中
+        // 只改 netmonH_ 内存值（下一帧经 NetRegionHeights 生效）；松手才写
+        // cfg —— 落盘节流，与分隔条①同一模式。
+        if (ui3::RegionSplitterY("##netmonspl", &netmonH_, ui3::kNetMonRegionMinH,
+                                 ui3::kNetMonRegionMaxH)) {
+            ctx.cfg.SetDouble(L"netmonH", static_cast<double>(netmonH_));
+        }
     }
 
     void DrawNetMonControls(AppContext& ctx, stm::NetMonitor& mon) {
@@ -1408,8 +1458,8 @@ private:
         }
         // M2：卡片可能超出下方定高区 —— 行内提示（SameLine：出现/消失
         // 不增减行数，头部行高恒定是「顶栏不移动」契约的一部分）。
-        // P1④：定高上限按运行时布局缩放（可用高度退化语义不变）。
-        if (res != nullptr && AdapterCardsOverflowHint(*res)) {
+        // U1：比较基准 = 实际生效的卡区高（拖拽值；首帧回退原口径）。
+        if (res != nullptr && AdapterCardsOverflowHint(*res, AdapterHintRegionH())) {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", U8(L"卡片较多，在列表框内滚动查看"));
         }
@@ -1418,16 +1468,14 @@ private:
 
     // P-A：适配器卡区（原 DrawAdapterSection 的定高段）—— 现绘制在
     // ##netscroll 滚动区**内部**。M2（顶栏位置固定）：卡区仍为定高
-    //（约 200px，PageLayout.h::AdapterRegionHeight）滚动区 —— 适配器数量
-    // 增减、「更多适配器」展开/折叠、加载/错误态都只改变区内滚动量。
-    // P1④：定高按运行时布局缩放（缩放=1 时与原常量逐位一致）。
-    void DrawAdapterRegion() {
+    // 滚动区 —— 适配器数量增减、「更多适配器」展开/折叠、加载/错误态都
+    // 只改变区内滚动量。U1：高度 = regionH（cfg netAdapterH 拖拽值经
+    // NetRegionHeights 分配/压缩；调用方每帧在滚动区顶部一次性算好，
+    // 无拖拽的帧逐位恒定）。
+    void DrawAdapterRegion(float regionH) {
         std::shared_ptr<const AdapterResult> res = adapters_.Peek();
-        ImGui::BeginChild(
-            "##adapters",
-            ImVec2(0.0f, AdapterRegionHeightScaled(ImGui::GetContentRegionAvail().y,
-                                                   ui3::LayoutScale())),
-            ImGuiChildFlags_Borders);
+        ImGui::BeginChild("##adapters", ImVec2(0.0f, regionH),
+                          ImGuiChildFlags_Borders);
         if (res == nullptr) {
             DrawLoading();
         } else if (!res->ok && res->data.empty()) {
@@ -1443,8 +1491,8 @@ private:
     // 卡区溢出行内提示的估算（公式在 PageLayout.h，ui_m2_test 覆盖）：
     // 每张非回环卡片 = 1 标题行 + 6 基线明细行 + 超出基线的额外 IPv6 行；
     // 总高含卡片间条目间距。仅决定提示文字是否出现，不参与真实布局。
-    // P1④：定高与缩放后的真实卡区保持一致。
-    bool AdapterCardsOverflowHint(const AdapterResult& res) const {
+    // U1：regionH = 实际生效的卡区高（拖拽值；见 AdapterHintRegionH）。
+    bool AdapterCardsOverflowHint(const AdapterResult& res, float regionH) const {
         const float rowH = ImGui::GetTextLineHeightWithSpacing();
         std::vector<int> extraRows;
         extraRows.reserve(res.data.size());
@@ -1458,10 +1506,17 @@ private:
         }
         const float totalH = AdapterCardsTotalHeight(
             rowH, extraRows.data(), static_cast<int>(extraRows.size()));
-        return AdapterCardsOverflow(
-            AdapterRegionHeightScaled(ImGui::GetContentRegionAvail().y,
-                                      ui3::LayoutScale()),
-            totalH);
+        return AdapterCardsOverflow(regionH, totalH);
+    }
+
+    // U1：头部溢出提示用的卡区高 = 最近一帧 Draw() 算好的生效高
+    //（adapterRegionHintH_；头行绘制先于三区分配，滞后一帧无感知）；
+    // 首帧（尚未算过）回退原口径 —— 默认定高按运行时布局缩放、极矮窗口
+    // 退化为可用高（语义与改版前一致）。
+    float AdapterHintRegionH() const {
+        if (adapterRegionHintH_ > 0.0f) return adapterRegionHintH_;
+        return AdapterRegionHeightScaled(ImGui::GetContentRegionAvail().y,
+                                         ui3::LayoutScale());
     }
 
     // 定高卡区内部：部分失败警告 + 主/更多适配器分区（纯逻辑判定在
@@ -1813,6 +1868,14 @@ private:
     bool etwDesired_ = false;
     bool etw_ = false;
     bool etwLoaded_ = false;
+    // U1：纵向可拖拽分栏（净高持久化 netAdapterH / netmonH）。拖动中只改
+    // 两个 float 内存值（下一帧经 NetRegionHeights 生效 = 实时预览），松手
+    // 才 SetDouble；文件由 main 退出时统一 cfg.Save（与 netcol_* 同口径）。
+    bool heightsLoaded_ = false;  // cfg 一次性读回（与 etwLoaded_ 同模式）
+    uint64_t heightsLoadedGen_ = 0;  // V34-P1-N1：布局重置代际失效
+    float netAdapterH_ = ui3::kNetAdapterRegionDefH;  // 适配器卡区期望高（像素）
+    float netmonH_ = ui3::kNetMonRegionDefH;          // 实时监视段期望高（像素）
+    float adapterRegionHintH_ = 0.0f;  // 最近一帧适配器区生效高（溢出提示用）
 };
 
 // ===========================================================================

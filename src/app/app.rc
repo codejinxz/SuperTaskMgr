@@ -1,4 +1,28 @@
-// SuperTaskMgr 资源脚本：应用图标（资源管理器/任务栏/标题栏/托盘）与关于页徽标。
-// 相对路径以本文件（src/app/）为基准。
+// SuperTaskMgr resources: app icon (explorer/taskbar/titlebar/tray), the
+// about-page logo and version info. ASCII-only on purpose: the RC compiler
+// interprets this file in the active codepage, and all user-visible Chinese
+// text lives in the binary (AboutInfo.h / window title), not here.
 1 ICON "../../assets/app.ico"
 200 RCDATA "../../assets/logo_256.png"
+
+1 VERSIONINFO
+FILEVERSION    1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "SuperTaskMgr - advanced task manager for Windows"
+      VALUE "ProductName",     "SuperTaskMgr"
+      VALUE "FileVersion",     "1.0.0.0"
+      VALUE "ProductVersion",  "1.0.0.0"
+      VALUE "OriginalFilename","SuperTaskMgr.exe"
+      VALUE "LegalCopyright",  "MIT License"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

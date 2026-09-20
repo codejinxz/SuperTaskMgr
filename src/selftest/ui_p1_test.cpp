@@ -463,22 +463,25 @@ STM_TEST(p1_fixed_region_shrink_to_content) {
 STM_TEST(p1_layout_reset_keys_registry) {
     const std::vector<std::wstring> exact = ui3::LayoutResetExactKeys();
     bool hasScale = false, hasOrder = false, hasZoom = false;
+    bool hasAdapterH = false, hasNetmonH = false;
     for (const std::wstring& k : exact) {
         if (k == L"layoutScale") hasScale = true;
         if (k == L"colOrder") hasOrder = true;
         if (k == L"perfZoom") hasZoom = true;
+        if (k == L"netAdapterH") hasAdapterH = true;   // V34-P1-N1：拖拽分栏高度
+        if (k == L"netmonH") hasNetmonH = true;
     }
-    if (!hasScale || !hasOrder || !hasZoom) {
-        *err = L"布局重置精确键清单缺少 layoutScale/colOrder/perfZoom";
+    if (!hasScale || !hasOrder || !hasZoom || !hasAdapterH || !hasNetmonH) {
+        *err = L"布局重置精确键清单缺少 layoutScale/colOrder/perfZoom/netAdapterH/netmonH";
         return false;
     }
-    // 清单数量校验防漏登记：colW_*（Count+2）+ netcol_* + 3 个精确键。
+    // 清单数量校验防漏登记：colW_*（Count+2）+ netcol_* + 5 个精确键。
     const size_t expect = static_cast<size_t>(SortColumn::Count) + 2 +
-                          ui3::NetColCfgKeys().size() + 3;
+                          ui3::NetColCfgKeys().size() + 5;
     Config c;
     ui3::SoftDeleteLayoutKeys(c);  // 冒烟：空 cfg 上软删除不得崩溃
     const std::vector<std::wstring> colW = ui3::ColWidthCfgKeys();
-    if (colW.size() + ui3::NetColCfgKeys().size() + 3 != expect) {
+    if (colW.size() + ui3::NetColCfgKeys().size() + 5 != expect) {
         *err = L"布局键清单数量不符（可能重复/漏登记）";
         return false;
     }

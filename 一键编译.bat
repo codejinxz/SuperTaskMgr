@@ -13,7 +13,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo [2/3] 运行自测（173 项）...
+echo [2/3] 运行自测（176 项）...
 "%~dp0build\Release\stm_selftest.exe" | findstr /C:"[" 
 "%~dp0build\Release\stm_selftest.exe" --json >nul
 if errorlevel 1 (

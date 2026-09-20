@@ -21,6 +21,10 @@
 namespace stm {
 namespace ui3 {
 
+// 布局重置代际（定义见文件末尾；SoftDeleteLayoutKeys 触发递增）。
+uint64_t LayoutResetGeneration();
+void NotifyLayoutReset();
+
 // ----------------------------------------------------------------------------
 // 登记的 colW_* 键清单（与 app/ui/Pages.cpp ProcessesPage::PersistWidths 的
 // 写入一一对应：SortColumn 0..10 = "colW_"+SortColumnId，另加徽标/描述两列）。
@@ -104,8 +108,10 @@ inline std::vector<std::wstring> NetColCfgKeys() {
 // 列宽/性能页放大块。全部软删除 + 从 config.json 剔除。
 // ----------------------------------------------------------------------------
 inline std::vector<std::wstring> LayoutResetExactKeys() {
+    // V34-P1-N1：网络页拖拽分栏高度一并重置。
     return {std::wstring(L"layoutScale"), std::wstring(L"colOrder"),
-            std::wstring(L"perfZoom")};
+            std::wstring(L"perfZoom"),    std::wstring(L"netAdapterH"),
+            std::wstring(L"netmonH")};
 }
 
 inline void SoftDeleteLayoutKeys(Config& cfg) {
@@ -116,6 +122,7 @@ inline void SoftDeleteLayoutKeys(Config& cfg) {
     for (const std::wstring& k : LayoutResetExactKeys()) {
         cfg.SetString(k, L"");
     }
+    NotifyLayoutReset();  // V34-P1-N1：布局重置代际递增（分栏/列宽缓存失效）
 }
 
 // 从 config.json 剔除键：键名等于 exactKeys 之一，或以 prefixes 之一开头。
