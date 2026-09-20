@@ -43,7 +43,7 @@ STM_TEST(ui3_service_starttype_labels) {
     return true;
 }
 
-// Startup item source -> Chinese label (table column 来源).
+// 启动项来源 → 中文标签（表格"来源"列）。
 STM_TEST(ui3_startup_source_labels) {
     if (stm::ui3::StartupSourceLabel(StartupSource::RegRun) != L"注册表") {
         *err = L"RegRun 应映射为 注册表";

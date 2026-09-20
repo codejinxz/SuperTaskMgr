@@ -255,6 +255,13 @@ private:
             filterUtf8_ = buf;
         }
         ImGui::SameLine();
+        // L1 防抖（用户报告②同类·水平推挤）：「N / M 个可见窗口」的计数宽度
+        // 随枚举结果变化，会把其后的动作按钮左右推挤 —— 按上限样本
+        //（6 位计数）预留固定槽宽，按钮绝对定位，计数文本在槽内左对齐。
+        const float countSlotW =
+            ImGui::CalcTextSize(U8(L"888888 / 888888 个可见窗口")).x +
+            ImGui::GetStyle().ItemSpacing.x;
+        const float actionsX = ImGui::GetCursorPosX() + countSlotW;
         if (res != nullptr) {
             ImGui::TextDisabled("%s", U8(Fmt(L"{} / {} 个可见窗口", rows_.size(), res->data.size())));
         } else {
@@ -262,7 +269,7 @@ private:
         }
         // 行内右键 + 工具条按钮双入口；关闭走确认对话框。
         const WindowEntry* sel = res != nullptr ? Selected(*res) : nullptr;
-        ImGui::SameLine();
+        ImGui::SameLine(actionsX);
         if (ImGui::Button(U8(L"前置")) && sel != nullptr) {
             std::wstring e;
             if (ForegroundWindowSafe(sel->hwnd, &e)) {

@@ -23,6 +23,7 @@
 #include "app/ui3/ProcControlUi.h"  // F4#2: 优先级/亲和性文案与掩码换算
 #include "app/ui3/ProcKind.h"     // F4#1: 系统进程分类
 #include "app/ui3/ProcTree.h"     // F4#4: 进程树行序
+#include "app/ui3/StatusLayout.h"  // L1 防抖: 状态栏定宽槽位（纯函数 + selftest 共用）
 #include "app/ui3/ThemeCfg.h"     // H-A: colW_* 键清单登记 + 配置文件剔除
 #include "app/ui3/Wallpaper.h"    // Phase-6: 自定义壁纸（Load/Clear/状态/提示）
 #include "core/FsUtil.h"          // H-A: 外观菜单「恢复默认列宽」需要 ConfigPath()
@@ -38,6 +39,7 @@
 #include "implot.h"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <commdlg.h>  // H-A: 外观菜单「选择图片…」GetOpenFileNameW（comdlg32 已链接）
 #include <cstdint>
 #include <cwctype>
@@ -667,6 +669,60 @@ void AppendHistory(const Snapshot& s) {
     }
     h.ctxSwitch.Push(ctxAny ? static_cast<float>(ctxSum)
                             : std::numeric_limits<float>::quiet_NaN());
+
+    // Phase C：磁盘队列深度（本机无计数器 -> NaN 照推 -> hasData 诚实空态，
+    // 与硬故障/s 同模式）与提交占比%（内存块 Y2 副轴；commitLimit<=0 -> NaN）。
+    h.diskQueue.Push(static_cast<float>(s.sys.diskQueueDepth));
+    h.commitPct.Push(static_cast<float>(
+        ui3::CommitPercent(s.sys.commitTotal, s.sys.commitLimit)));
+    // GPU 利用率合计%（2s 节拍；缺席 tick 由采集端复用上次值 -> 阶梯无锯齿）。
+    // sys.gpus 为空（GPU 未启用/尚无数据）-> 不推，环保持空 -> hasData 空态。
+    if (!s.sys.gpus.empty()) {
+        std::vector<double> utils;
+        utils.reserve(s.sys.gpus.size());
+        for (const GpuAdapterInfo& g : s.sys.gpus) utils.push_back(g.utilPercent);
+        h.gpuUtil.Push(static_cast<float>(ui3::GpuUtilClampSum(utils.data(), utils.size())));
+    }
+
+    // Phase D：每适配器吞吐序列。契约：sys.netAdapters 仅含 Up 非回环。
+    // 空表（GetIfTable2 失败/无接口）-> 本 tick 不推不重建（序列暂停，诚实）。
+    // 接口集变化 -> BuildAdapterSeries 重建（流量 Top8 截断 + 名称表），
+    // 历史重启 —— 与 cores 核心数变化同口径。
+    if (!s.sys.netAdapters.empty()) {
+        std::vector<uint64_t> idsCur;
+        idsCur.reserve(s.sys.netAdapters.size());
+        std::vector<ui3::AdapterSeriesIn> seriesIn;
+        seriesIn.reserve(s.sys.netAdapters.size());
+        for (const SystemInfo::AdapterThroughput& a : s.sys.netAdapters) {
+            idsCur.push_back(a.ifIndex);
+            seriesIn.push_back(ui3::AdapterSeriesIn{a.ifIndex, a.name, a.recvBps,
+                                                    a.sendBps, true, false});
+        }
+        std::vector<uint64_t> idsPrev = h.netAdapterIds;
+        std::sort(idsCur.begin(), idsCur.end());
+        std::sort(idsPrev.begin(), idsPrev.end());
+        if (idsCur != idsPrev) {
+            const std::vector<ui3::AdapterSeriesIn> picked = ui3::BuildAdapterSeries(seriesIn);
+            h.netAdapters.assign(picked.size(), Ring{});
+            h.netAdapterIds.clear();
+            h.netAdapterNames.clear();
+            for (const ui3::AdapterSeriesIn& p : picked) {
+                h.netAdapterIds.push_back(p.ifIndex);
+                h.netAdapterNames.push_back(p.name);
+            }
+        }
+        h.netAdapterTotal = static_cast<int>(s.sys.netAdapters.size());
+        for (size_t i = 0; i < h.netAdapterIds.size(); ++i) {
+            double total = std::numeric_limits<double>::quiet_NaN();
+            for (const ui3::AdapterSeriesIn& a : seriesIn) {
+                if (a.ifIndex == h.netAdapterIds[i]) {
+                    total = a.TotalBps();
+                    break;
+                }
+            }
+            h.netAdapters[i].Push(static_cast<float>(total));
+        }
+    }
 
     const size_t n = s.sys.perCorePercent.size();
     if (n > 0 && h.cores.size() != n) {
@@ -1861,8 +1917,11 @@ private:
 };
 
 // ===========================================================================
-// PerfPage：四个 ImPlot 象限（CPU/内存/磁盘/网络），时间窗 60/120/300/600s
-// （Phase A：历史容量 600、RingView 尾窗、字节类 Y 轴 AutoFit）。
+// PerfPage：8 块两列网格（CPU/每核/内存/磁盘/网络/硬故障/上下文切换/GPU），
+// 时间窗 60/120/300/600s。Phase A：历史容量 600、CopyRingTail 线性化 +
+// tickSec xscale、字节类 Y 轴 AutoFit、拖拽阈值线。Phase B：块放大
+//（cfg perfZoom）+ 放大态跟随/检视状态机 + 悬停精确读数。Phase C：内存/磁盘
+// Y2 副轴、GPU 利用率历史、每核热图。Phase D：每适配器吞吐多序列。
 // ===========================================================================
 
 int FmtBytesAxis(double value, char* buff, int size, void* /*user_data*/) {
@@ -1873,8 +1932,8 @@ int FmtBytesAxis(double value, char* buff, int size, void* /*user_data*/) {
     return snprintf(buff, static_cast<size_t>(size), "%s", s.c_str());
 }
 
-// Phase A：经 RingView 取尾窗（window 秒）零拷贝渲染 —— ImPlot
-// values-only + spec.Offset 直接支持环形跨度，x = 窗内序号（秒）。
+// Phase A：经 CopyRingTail 取尾窗（window 秒）线性化渲染 —— ImPlot
+// values-only，x = 窗内序号（秒）。
 void PlotRing(const char* label, const Ring& r, int window, bool noLegend, double tickSec) {
     // V21-P0：ImPlot 的 spec.Offset 以"绘制点数"取模而非环容量——环形 offset 直传
     // 会整窗画错段。线性化到线程局部缓冲后以 Offset=0 绘制；x 轴经 xscale 换算为
@@ -1893,23 +1952,25 @@ public:
     const wchar_t* Title() const override { return L"性能"; }
 
     static inline double tickSec_ = 1.0;  // V21-P0：图表 x 轴秒换算（Draw 与 static 块函数共用）
+    // Phase B：放大视图运行态（页对象唯一，静态成员与 tickSec_ 同风格）。
+    static inline int zoomApplied_ = -1;  // 已应用的放大块；变化 -> 跟随复位
+    static inline bool follow_ = true;    // 放大态跟随（true）/检视（false）
+    static inline double lastXMin_ = 0.0, lastXMax_ = 0.0;  // 本帧提交的 X 设定值
 
     void Draw(AppContext& ctx) override {
         // V19: 顶部固定操作行（图表区上方）——「内存加速…」+ 内存占用速览。
         // 用户报告「内存加速的我目前也没看到」：原入口绘制在全部图表块之后，
         // 位于首屏折叠区以下、需滚动才能看到，且受图表显隐复选框影响布局。
         // 该行不受 lastTick 早退与图表显隐影响，切到「性能」页首屏即可见。
+        // L1（用户报告②）：本行 + 下方「时间窗」行组成固定的顶部控制带 ——
+        // 两行都绘制在一切可变内容（含「等待采集数据…」早退分支）之前，
+        // 高度与位置不随数据变化。
         DrawMemQuickActionRow(Ui().snap ? Ui().snap->sys : SystemInfo{});
         // V21-P0：图表 x 轴按真实采集间隔换算为秒（PlotRing 的 xscale）。
         tickSec_ = static_cast<double>(std::max<int64_t>(200, ctx.cfg.GetInt(L"intervalMs", 1000))) / 1000.0;
-        const PerfHistory& h = Hist();
-        if (h.lastTick == 0) {
-            ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"等待采集数据…"));
-            return;
-        }
 
         // Phase A：时间窗（cfg perfWindowSec，60/120/300/600，非法回落 120）。
-        // 窗口只影响显示（RingView 尾窗）不改摄取 —— 切换不清空历史，
+        // 窗口只影响显示（尾窗）不改摄取 —— 切换不清空历史，
         // perfShow* 显隐复选框语义不变（零迁移）。
         int windowSec = ui3::ClampWindowSec(ctx.cfg.GetInt(L"perfWindowSec", 120));
         int windowIdx = ui3::WindowSecIndex(windowSec);
@@ -1927,55 +1988,160 @@ public:
         }
         const int window = windowSec;
 
-        const ImVec2 avail = ImGui::GetContentRegionAvail();  // 时间窗行之下
+        const PerfHistory& h = Hist();
+        if (h.lastTick == 0) {
+            // L1：早退分支现在画在固定顶栏之下（原来它出现在顶栏位置，
+            // 首个 tick 到达时顶栏会被顶下去一行）。
+            ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"等待采集数据…"));
+            return;
+        }
+
+        // Phase B：块放大（cfg perfZoom，-1=无，越界回落 -1）。放大目标
+        // 变化（含首次进入放大）时复位为自动跟随最新。
+        int zoomBlock = ui3::ClampZoomBlock(ctx.cfg.GetInt(L"perfZoom", -1));
+        if (zoomBlock != zoomApplied_) {
+            zoomApplied_ = zoomBlock;
+            follow_ = ui3::FollowTick(follow_, false, true);
+        }
+
+        const ImVec2 avail = ImGui::GetContentRegionAvail();  // 顶部控制带之下
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
         // P3 任务二：页面区宽度 > 1200 时两列网格，否则单列铺满（块按序流入）。
         const bool twoCol = ImGui::GetWindowWidth() > 1200.0f;
         const float cellW = twoCol ? (avail.x - spacing) * 0.5f : avail.x;
         const float barsH = ImGui::GetFrameHeightWithSpacing() * 2.0f + 8.0f;
         const float plotH = std::max(120.0f, (avail.y - barsH - spacing) * 0.5f);
+        const float plotHz = std::max(200.0f, plotH * 1.8f);  // 放大 = 全宽双高
 
-        // 每块 = BeginGroup{标题栏复选框 + 内容}：组边界取块内最大 y，两列并排时
-        // 行高随较高块推进，另一列较矮也不会与下一行重叠。
-        // 显隐 cfg（perfShow*，默认除 CtxSwitch 外全开）：勾选即写 cfg，随退出持久化。
-        auto beginCell = [&](int i) {
-            if (twoCol && (i & 1) != 0) ImGui::SameLine();
-            ImGui::BeginGroup();
-        };
-        auto endCell = [] { ImGui::EndGroup(); };
-        auto visible = [&](const wchar_t* key, bool def, const wchar_t* title) {
+        // 块标题行：显隐复选框 + 放大/还原按钮；放大态追加「跟随最新」
+        // 复选与「回到最新」按钮（Phase B §2.3 状态机的 UI 侧）。
+        auto header = [&](const wchar_t* key, bool def, const wchar_t* title, int blockIdx) {
             bool show = ctx.cfg.GetBool(key, def);
             if (ImGui::Checkbox(U8(title), &show)) ctx.cfg.SetBool(key, show);
+            ImGui::SameLine();
+            const bool zoomed = zoomBlock == blockIdx;
+            if (ImGui::SmallButton(
+                    U8(Fmt(L"{}##zoom{}", zoomed ? L"还原" : L"放大", blockIdx)))) {
+                zoomBlock = zoomed ? -1 : blockIdx;
+                ctx.cfg.SetInt(L"perfZoom", zoomBlock);
+                if (!zoomed) follow_ = ui3::FollowTick(follow_, false, true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", U8(zoomed ? L"还原网格布局"
+                                                  : L"放大为全宽详查视图（可框选缩放/拖拽平移/悬停读数）"));
+            }
+            if (zoomed) {
+                ImGui::SameLine();
+                if (ImGui::Checkbox(U8(L"跟随最新"), &follow_)) {
+                    follow_ = ui3::FollowTick(follow_, false, follow_);
+                }
+                ImGui::SameLine();
+                ImGui::BeginDisabled(follow_);
+                if (ImGui::SmallButton(U8(L"回到最新##perfresume"))) {
+                    follow_ = ui3::FollowTick(follow_, false, true);
+                }
+                ImGui::EndDisabled();
+            }
             return show;
         };
 
-        beginCell(0);
-        if (visible(L"perfShowCpu", true, L"CPU")) DrawCpu(ctx, cellW, plotH, h, window);
-        endCell();
-        beginCell(1);
-        if (visible(L"perfShowPerCore", true, L"CPU 每核"))
-            DrawPerCore(cellW, plotH, h, window);
-        endCell();
-        beginCell(2);
-        if (visible(L"perfShowMem", true, L"内存")) DrawMemory(cellW, plotH, h, window);
-        endCell();
-        beginCell(3);
-        if (visible(L"perfShowDisk", true, L"磁盘")) DrawDisk(cellW, plotH, h, window);
-        endCell();
-        beginCell(4);
-        if (visible(L"perfShowNet", true, L"网络")) DrawNet(cellW, plotH, h, window);
-        endCell();
-        beginCell(5);
-        if (visible(L"perfShowHardFaults", true, L"硬故障/s"))
-            DrawHardFaults(cellW, plotH, h, window);
-        endCell();
-        beginCell(6);
-        if (visible(L"perfShowCtxSwitch", false, L"上下文切换/s"))
-            DrawCtxSwitch(cellW, plotH, h, window);
-        endCell();
-        beginCell(7);
-        if (visible(L"perfShowGpu", true, L"GPU")) DrawGpuBlockBody(*Ui().snap);
-        endCell();
+        // 块体分发（标题行之后的内容）。i 与 ui3::PerfBlockId 一致。
+        auto block = [&](int i, float w, float hgt, bool enlarge) {
+            switch (i) {
+            case ui3::kPerfBlockCpu:
+                if (header(L"perfShowCpu", true, L"CPU", i)) {
+                    DrawCpu(ctx, w, hgt, h, window, enlarge);
+                }
+                break;
+            case ui3::kPerfBlockPerCore: {
+                if (!header(L"perfShowPerCore", true, L"CPU 每核", i)) break;
+                // Phase C：每核热图切换（cfg perfPerCoreHeatmap，默认关=曲线；
+                // 互斥渲染）。
+                bool heatmap = ctx.cfg.GetBool(L"perfPerCoreHeatmap", false);
+                ImGui::SameLine();
+                if (ImGui::Checkbox(U8(L"热图"), &heatmap)) {
+                    ctx.cfg.SetBool(L"perfPerCoreHeatmap", heatmap);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", U8(L"每核利用率热图（行=核心、列=时间，"
+                                              L"0-100 固定色标；最多 120 列）。取消勾选回到曲线。"));
+                }
+                DrawPerCore(w, hgt, h, window, enlarge, heatmap);
+                break;
+            }
+            case ui3::kPerfBlockMem:
+                if (header(L"perfShowMem", true, L"内存", i)) {
+                    DrawMemory(w, hgt, h, window, enlarge);
+                }
+                break;
+            case ui3::kPerfBlockDisk:
+                if (header(L"perfShowDisk", true, L"磁盘", i)) {
+                    DrawDisk(w, hgt, h, window, enlarge);
+                }
+                break;
+            case ui3::kPerfBlockNet: {
+                if (!header(L"perfShowNet", true, L"网络", i)) break;
+                // Phase D：每适配器吞吐开关（cfg perfShowNetAdapters，默认关；
+                // 总收/发线保留）。
+                bool adaptersOn = ctx.cfg.GetBool(L"perfShowNetAdapters", false);
+                ImGui::SameLine();
+                if (ImGui::Checkbox(U8(L"每适配器"), &adaptersOn)) {
+                    ctx.cfg.SetBool(L"perfShowNetAdapters", adaptersOn);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", U8(L"叠加每适配器吞吐曲线（收+发合计，序列名=适配器"
+                                              L"友好名）。适配器超过 8 个时只显示流量 Top 8。"));
+                }
+                if (adaptersOn &&
+                    h.netAdapterTotal > static_cast<int>(h.netAdapters.size())) {
+                    // Phase D「Top8 注明」：被截断时如实告知总数。
+                    ImGui::TextDisabled(
+                        "%s",
+                        U8(Fmt(L"适配器共 {} 个，仅显示流量 Top {}", h.netAdapterTotal,
+                               h.netAdapters.size())));
+                }
+                DrawNet(w, hgt, h, window, enlarge, adaptersOn);
+                break;
+            }
+            case ui3::kPerfBlockHardFaults:
+                if (header(L"perfShowHardFaults", true, L"硬故障/s", i)) {
+                    DrawHardFaults(w, hgt, h, window, enlarge);
+                }
+                break;
+            case ui3::kPerfBlockCtxSwitch:
+                if (header(L"perfShowCtxSwitch", false, L"上下文切换/s", i)) {
+                    DrawCtxSwitch(w, hgt, h, window, enlarge);
+                }
+                break;
+            case ui3::kPerfBlockGpu:
+                if (header(L"perfShowGpu", true, L"GPU", i)) {
+                    DrawGpuBlock(*Ui().snap, h, w, hgt, enlarge);
+                }
+                break;
+            default:
+                break;
+            }
+        };
+
+        if (zoomBlock >= 0) {
+            // 放大：该块独占全宽双高，其余块隐藏（任务书 §B1）。
+            ImGui::BeginGroup();
+            block(zoomBlock, avail.x, plotHz, true);
+            ImGui::EndGroup();
+        } else {
+            // 每块 = BeginGroup{标题栏复选框 + 内容}：组边界取块内最大 y，
+            // 两列并排时行高随较高块推进，另一列较矮也不会与下一行重叠。
+            auto beginCell = [&](int i) {
+                if (twoCol && (i & 1) != 0) ImGui::SameLine();
+                ImGui::BeginGroup();
+            };
+            auto endCell = [] { ImGui::EndGroup(); };
+            for (int i = 0; i < ui3::kPerfBlockCount; ++i) {
+                beginCell(i);
+                block(i, cellW, plotH, false);
+                endCell();
+            }
+        }
 
         const SystemInfo& sys = Ui().snap ? Ui().snap->sys : SystemInfo{};
         DrawMemoryBars(sys);
@@ -1984,21 +2150,67 @@ public:
     }
 
 private:
-    static bool BeginPlotBox(const char* id, const ImVec2& size) {
-        return ImPlot::BeginPlot(id, size);
+    // Phase B：缩略图禁用框选（永远跟随，框选无意义且被 X 覆盖冲掉）；
+    // 放大态启用框选/平移并叠加十字线（§2.3①）。
+    static bool BeginPlotBox(const char* id, const ImVec2& size, bool enlarge) {
+        return ImPlot::BeginPlot(id, size, enlarge ? ImPlotFlags_Crosshairs
+                                                   : ImPlotFlags_NoBoxSelect);
+    }
+
+    // Phase B §2.3：放大态跟随实现。跟随态每帧在 SetupFinish 前以
+    // Cond_Always 提交最新窗（xMin = newest-span，xMax = newest）——vendored
+    // ImPlot 对 Cond_Always 立即 SetRange；随后 SetupLock 内的输入处理把
+    // 用户的平移/框选/滚轮增量叠加在该范围上。检视态不提交 X limits，
+    // 用户视窗由 ImPlot 按绘制 id 持久化。
+    static void EnlFollowSetupX(const PerfHistory& hist, int window) {
+        if (!follow_) return;
+        const int count = hist.cpuTotal.Count();
+        const double newest = static_cast<double>(std::max(0, count - 1)) * tickSec_;
+        const double span = static_cast<double>(std::max(0, window - 1)) * tickSec_;
+        lastXMin_ = std::max(0.0, newest - span);
+        lastXMax_ = std::max(newest, tickSec_);  // 单样本时避免 0 宽范围
+        ImPlot::SetupAxisLimits(ImAxis_X1, lastXMin_, lastXMax_, ImPlotCond_Always);
+    }
+
+    // SetupFinish 后比对当前 X 范围与本帧设定值：差值超 ε 即用户动作
+    //（平移/框选/滚轮/双击 fit），经 FollowTick 纯函数落入检视态。
+    static void EnlFollowDetect() {
+        if (!follow_) return;
+        constexpr double kEps = 1e-6;
+        const ImPlotRect lim = ImPlot::GetPlotLimits(ImAxis_X1, ImAxis_Y1);
+        if (std::fabs(lim.X.Min - lastXMin_) > kEps || std::fabs(lim.X.Max - lastXMax_) > kEps) {
+            follow_ = ui3::FollowTick(follow_, true, false);
+        }
+    }
+
+    // Phase B §2.2：放大态 hover 吸附读数 tooltip。鼠标 x（秒）经
+    // ReadoutIndexAt 反推环形逻辑下标（取整到 1Hz 采样栅格），逐序列列值
+    // 由 PerfReadoutText 生成（NaN -> "—"）。
+    static void EnlReadoutTooltip(const PerfHistory& hist, int blockId, int window) {
+        if (!ImPlot::IsPlotHovered()) return;
+        const ImPlotPoint mp = ImPlot::GetPlotMousePos(ImAxis_X1, ImAxis_Y1);
+        const int idx = ui3::ReadoutIndexAt(mp.x, hist.cpuTotal.Count(), window, tickSec_);
+        if (idx < 0) return;
+        const std::wstring text = ui3::PerfReadoutText(hist, blockId, idx, tickSec_);
+        if (!text.empty()) ImGui::SetTooltip("%s", U8(text));
     }
 
     static void DrawCpu(AppContext& ctx, float w, float plotH,
-                        const PerfHistory& hist, int window) {
-        if (!BeginPlotBox("##cpu", ImVec2(w, plotH))) return;
+                        const PerfHistory& hist, int window, bool enlarge) {
+        if (!BeginPlotBox("##cpu", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"CPU"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        if (enlarge) {
+            EnlFollowSetupX(hist, window);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 100.0, ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g%%");
         ImPlot::SetupFinish();
+        if (enlarge) EnlFollowDetect();
         // Phase A：告警阈值线（alertOn 开启时）——可拖拽 DragLineY，
         // 拖拽结果双向同步回 cfg alertCpu（钳 1..100、取整百分比）。
         if (ctx.cfg.GetBool(L"alertOn", false)) {
@@ -2013,106 +2225,212 @@ private:
         }
         PlotRing(U8(L"总量"), hist.cpuTotal, window, false, tickSec_);
         for (const Ring& core : hist.cores) PlotRing("##core", core, window, true, tickSec_);
+        if (enlarge) EnlReadoutTooltip(hist, ui3::kPerfBlockCpu, window);
         ImPlot::EndPlot();
     }
 
     // 字节类（内存/磁盘/网络）Y 轴：ImPlotAxisFlags_AutoFit 每 tick 跟随
-    // 数据（Phase A 修复「首帧 fit 后永不调整导致削顶」）；CPU/每核保持恒定
-    // 0-100，保证扫视可比性（设计 §2.4）。
-    static void DrawMemory(float w, float plotH, const PerfHistory& hist, int window) {
-        if (!BeginPlotBox("##mem", ImVec2(w, plotH))) return;
+    // 数据（Phase A 修复「首帧 fit 后永不调整导致削顶」）。放大检视态去掉
+    // AutoFit（用户可框选缩放 Y，ImPlot 持久化；回到跟随态恢复 AutoFit，
+    // 设计 §2.4③）；CPU/每核保持恒定 0-100，保证扫视可比性。
+    static ImPlotAxisFlags Y1ByteFlags(bool enlarge) {
+        return (enlarge && !follow_) ? ImPlotAxisFlags_None : ImPlotAxisFlags_AutoFit;
+    }
+
+    static void DrawMemory(float w, float plotH, const PerfHistory& hist, int window,
+                           bool enlarge) {
+        if (!BeginPlotBox("##mem", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"内存"), ImPlotAxisFlags_AutoFit);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"内存"), Y1ByteFlags(enlarge));
+        // Phase C：Y2 副轴 = 提交占比%（commit/commitLimit 派生，0-100 固定；
+        // 设计 §3.3）。limit<=0 的样本为 NaN，渲染/读数诚实跳过。
+        ImPlot::SetupAxis(ImAxis_Y2, U8(L"占比"), ImPlotAxisFlags_AuxDefault);
+        if (enlarge) {
+            EnlFollowSetupX(hist, window);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisFormat(ImAxis_Y1, &FmtBytesAxis);
+        ImPlot::SetupAxisLimits(ImAxis_Y2, 0.0, 100.0, ImPlotCond_Always);
+        ImPlot::SetupAxisFormat(ImAxis_Y2, "%g%%");
         ImPlot::SetupFinish();
+        if (enlarge) EnlFollowDetect();
         PlotRing(U8(L"可用物理"), hist.physAvail, window, false, tickSec_);
         PlotRing(U8(L"提交"), hist.commit, window, false, tickSec_);
+        ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+        PlotRing(U8(L"提交占比"), hist.commitPct, window, false, tickSec_);
+        ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
+        if (enlarge) EnlReadoutTooltip(hist, ui3::kPerfBlockMem, window);
         ImPlot::EndPlot();
     }
 
-    static void DrawDisk(float w, float plotH, const PerfHistory& hist, int window) {
-        if (!BeginPlotBox("##disk", ImVec2(w, plotH))) return;
+    static void DrawDisk(float w, float plotH, const PerfHistory& hist, int window,
+                         bool enlarge) {
+        // Phase C：磁盘队列 Y2 副轴——本机无计数器（hasData=false）时整个
+        // Y2 隐藏，不留一根空轴（诚实空态与硬故障/s 同模式）。
+        const bool showQueue = hist.diskQueue.hasData;
+        if (!BeginPlotBox("##disk", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"磁盘"), ImPlotAxisFlags_AutoFit);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"磁盘"), Y1ByteFlags(enlarge));
+        if (showQueue) {
+            ImPlot::SetupAxis(ImAxis_Y2, U8(L"队列"),
+                              ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
+        }
+        if (enlarge) {
+            EnlFollowSetupX(hist, window);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisFormat(ImAxis_Y1, &FmtBytesAxis);
         ImPlot::SetupFinish();
+        if (enlarge) EnlFollowDetect();
         PlotRing(U8(L"读取"), hist.diskRead, window, false, tickSec_);
         PlotRing(U8(L"写入"), hist.diskWrite, window, false, tickSec_);
+        if (showQueue) {
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+            PlotRing(U8(L"队列深度"), hist.diskQueue, window, false, tickSec_);
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
+        }
+        if (enlarge) EnlReadoutTooltip(hist, ui3::kPerfBlockDisk, window);
         ImPlot::EndPlot();
     }
 
-    static void DrawNet(float w, float plotH, const PerfHistory& hist, int window) {
-        if (!BeginPlotBox("##net", ImVec2(w, plotH))) return;
+    static void DrawNet(float w, float plotH, const PerfHistory& hist, int window,
+                        bool enlarge, bool adaptersOn) {
+        if (!BeginPlotBox("##net", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"网络"), ImPlotAxisFlags_AutoFit);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"网络"), Y1ByteFlags(enlarge));
+        if (enlarge) {
+            EnlFollowSetupX(hist, window);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisFormat(ImAxis_Y1, &FmtBytesAxis);
         ImPlot::SetupFinish();
+        if (enlarge) EnlFollowDetect();
         PlotRing(U8(L"接收"), hist.netRecv, window, false, tickSec_);
         PlotRing(U8(L"发送"), hist.netSend, window, false, tickSec_);
+        // Phase D：每适配器吞吐多序列（Up 适配器各一条线 = 收+发合计，
+        // 序列名 = 友好名；>8 条已在摄取端按流量 Top8 截断）。适配器环与
+        // 系统 ring 不同步（重建即重启），各自线性化渲染。
+        if (adaptersOn) {
+            for (size_t i = 0; i < hist.netAdapters.size(); ++i) {
+                PlotRing(U8(hist.netAdapterNames[i]),
+                         hist.netAdapters[i], window, false, tickSec_);
+            }
+        }
+        if (enlarge) EnlReadoutTooltip(hist, ui3::kPerfBlockNet, window);
         ImPlot::EndPlot();
     }
 
     // ---- P3 任务二：新增图表 --------------------------------------------------
     // 不可用计数器的诚实空态（硬故障/s 在部分机器上 PDH 无此计数器；上下文切换/s
     // 在兼容模式下无每进程数据可聚合）。
-    static void DrawCounterUnavailable() {
+    // L1（用户报告②审计）：空态行撑到与图表块同高（plotH）——计数器数据首次
+    // 到达与否都不改变网格行高，网格之下的内存条/告警/CSV 行不再被顶动。
+    static void DrawCounterUnavailable(float plotH) {
+        const float y0 = ImGui::GetCursorPosY();
         ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.65f, 1.0f), "%s", U8(L"本机此计数器不可用"));
+        const float deficit = plotH - (ImGui::GetCursorPosY() - y0);
+        if (deficit > 0.0f) ImGui::Dummy(ImVec2(0.0f, deficit));
     }
 
-    static void DrawPerCore(float w, float plotH, const PerfHistory& hist, int window) {
-        if (!BeginPlotBox("##percore", ImVec2(w, plotH))) return;
+    static void DrawPerCore(float w, float plotH, const PerfHistory& hist, int window,
+                            bool enlarge, bool heatmap) {
+        // Phase C：每核热图（行=核心、列=尾窗时间，最多 kHeatmapMaxCols 列，
+        // 0-100 固定色标 Viridis）。与曲线互斥渲染。
+        const ui3::CoreHeatmap hm =
+            heatmap ? ui3::CoreHeatmapValues(hist.cores, window) : ui3::CoreHeatmap{};
+        const int span = heatmap ? std::max(1, hm.cols) : window;
+        if (heatmap && (hm.rows <= 0 || hm.cols <= 0)) {
+            DrawCounterUnavailable(plotH);
+            return;
+        }
+        if (!BeginPlotBox("##percore", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
-        ImPlot::SetupAxis(ImAxis_Y1, U8(L"CPU 每核"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        ImPlot::SetupAxis(ImAxis_Y1, U8(L"CPU 每核"), heatmap ? ImPlotAxisFlags_Invert : 0);
+        if (heatmap) {
+            // 热图数据恒为重定基尾窗（x ∈ [0, cols·tick]）——跟随 = 固定
+            // 全域，每帧 Cond_Always 提交；不参与跟随/检视状态机。
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0,
+                                    static_cast<double>(span) * tickSec_,
+                                    ImPlotCond_Always);
+        } else if (enlarge) {
+            EnlFollowSetupX(hist, span);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(span - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 100.0, ImPlotCond_Always);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g%%");
         ImPlot::SetupFinish();
-        for (const Ring& core : hist.cores) PlotRing("##core", core, window, true, tickSec_);
+        if (enlarge && !heatmap) EnlFollowDetect();
+        if (heatmap) {
+            ImPlot::PushColormap(ImPlotColormap_Viridis);
+            ImPlot::PlotHeatmap("##corehm", hm.values.data(), hm.rows, hm.cols, 0.0, 100.0,
+                                "%.0f", ImPlotPoint(0, 0),
+                                ImPlotPoint(static_cast<double>(hm.cols) * tickSec_,
+                                            static_cast<double>(hm.rows)));
+            ImPlot::PopColormap();
+        } else {
+            for (const Ring& core : hist.cores) PlotRing("##core", core, window, true, tickSec_);
+        }
+        if (enlarge && !heatmap) EnlReadoutTooltip(hist, ui3::kPerfBlockPerCore, window);
         ImPlot::EndPlot();
     }
 
-    static void DrawHardFaults(float w, float plotH, const PerfHistory& hist, int window) {
+    static void DrawHardFaults(float w, float plotH, const PerfHistory& hist, int window,
+                               bool enlarge) {
         if (!hist.hardFaults.hasData) {  // 从未收到有效样本：诚实空态而非空图
-            DrawCounterUnavailable();
+            DrawCounterUnavailable(plotH);
             return;
         }
-        if (!BeginPlotBox("##hardfaults", ImVec2(w, plotH))) return;
+        if (!BeginPlotBox("##hardfaults", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"硬故障/s"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        if (enlarge) {
+            EnlFollowSetupX(hist, window);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g");
         ImPlot::SetupFinish();
+        if (enlarge) EnlFollowDetect();
         PlotRing(U8(L"硬故障"), hist.hardFaults, window, false, tickSec_);
+        if (enlarge) EnlReadoutTooltip(hist, ui3::kPerfBlockHardFaults, window);
         ImPlot::EndPlot();
     }
 
-    static void DrawCtxSwitch(float w, float plotH, const PerfHistory& hist, int window) {
+    static void DrawCtxSwitch(float w, float plotH, const PerfHistory& hist, int window,
+                              bool enlarge) {
         if (!hist.ctxSwitch.hasData) {
-            DrawCounterUnavailable();
+            DrawCounterUnavailable(plotH);
             return;
         }
-        if (!BeginPlotBox("##ctxswitch", ImVec2(w, plotH))) return;
+        if (!BeginPlotBox("##ctxswitch", ImVec2(w, plotH), enlarge)) return;
         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
         ImPlot::SetupAxis(ImAxis_X1, U8(L"秒"));
         ImPlot::SetupAxis(ImAxis_Y1, U8(L"上下文切换/s"));
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
-                                ImPlotCond_Always);
+        if (enlarge) {
+            EnlFollowSetupX(hist, window);
+        } else {
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+        }
         ImPlot::SetupAxisFormat(ImAxis_Y1, "%g");
         ImPlot::SetupFinish();
+        if (enlarge) EnlFollowDetect();
         PlotRing(U8(L"切换"), hist.ctxSwitch, window, false, tickSec_);
+        if (enlarge) EnlReadoutTooltip(hist, ui3::kPerfBlockCtxSwitch, window);
         ImPlot::EndPlot();
     }
 
@@ -2258,6 +2576,41 @@ private:
         });
         if (merged.size() > top) merged.resize(top);
         return merged;
+    }
+
+    // L1（用户报告②审计）：GPU 块体（适配器表行数、进程 Top5 出现与否随数据
+    // 变化）装入**定高滚动子区**（高度 = 同行图表块的绘图区高）——网格单元高
+    // 度因此与纯图表块一致且恒定，下方内容不再被数据增减顶动。内部可滚动。
+    // Phase C：块顶追加「利用率历史」小图（多卡合计 %，2s 一点；数据缺席
+    // 时 hasData=false 诚实隐藏，不留空图）。
+    static void DrawGpuBlock(const Snapshot& snap, const PerfHistory& hist, float cellW,
+                             float bodyH, bool enlarge) {
+        ImGui::BeginChild("##gpubody", ImVec2(cellW, bodyH), ImGuiChildFlags_None);
+        if (hist.gpuUtil.hasData) {
+            const float sparkH = enlarge ? bodyH * 0.35f : 90.0f;
+            DrawGpuUtilSpark(hist, cellW, sparkH, kHistCap);
+        }
+        DrawGpuBlockBody(snap);
+        ImGui::EndChild();
+    }
+
+    // GPU 利用率合计%历史小图（装饰轴 CanvasOnly；0-100 固定，跟随最新窗）。
+    static void DrawGpuUtilSpark(const PerfHistory& hist, float w, float h, int window) {
+        ImGui::TextDisabled("%s", U8(L"利用率历史（多卡合计 %）"));
+        const ImPlotFlags flags = ImPlotFlags_CanvasOnly | ImPlotFlags_NoInputs;
+        if (ImPlot::BeginPlot("##gpuutilhist", ImVec2(w, h), flags)) {
+            ImPlot::SetupAxis(ImAxis_X1, nullptr,
+                              ImPlotAxisFlags_NoDecorations | ImPlotAxisFlags_Lock);
+            ImPlot::SetupAxis(ImAxis_Y1, nullptr,
+                              ImPlotAxisFlags_NoDecorations | ImPlotAxisFlags_Lock);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0,
+                                    static_cast<double>(window - 1) * tickSec_,
+                                    ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 100.0, ImPlotCond_Always);
+            ImPlot::SetupFinish();
+            PlotRing(U8(L"GPU 利用率"), hist.gpuUtil, window, true, tickSec_);
+            ImPlot::EndPlot();
+        }
     }
 
     static void DrawGpuBlockBody(const Snapshot& snap) {
@@ -2788,19 +3141,36 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
 void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     ImGui::BeginChild("##statusbar", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY,
                       ImGuiWindowFlags_NoScrollbar);
-    // R-Fix Bug1（状态栏两段式）：工具条挤不下的「全局热键」开关、「管理员」
-    // 徽标与运行统计统一收纳于此 —— 左段=采集与队列状态（自然流式），右段=
-    // 外观类与自身开销 [全局热键][权限徽标][帧耗时]（LayoutHeaderRight 实测
-    // 宽度右对齐，热键(次要)先藏、帧耗时永不藏）。左段每段绘制前用
-    // FlowSegmentFits（app/ui/HeaderLayout.h 纯函数）判断，放不下的段连同
-    // 分隔符一起隐藏（窄窗优雅降级，不再截出半截文本或互相压盖）。
-    const float contentRightX = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+    // L1 防抖（用户报告①）：右半信息组改为**固定槽位**布局 —— 槽位宽度只来自
+    // 常量上限样本（app/ui3/StatusLayout.h：定宽数字文本 + 最宽字形样本的
+    // CalcTextSize），槽位坐标逐帧恒定；数值位数变化只改变槽内文本，绝不再
+    // 推挤相邻项（旧实现用当前数值的实测宽，"帧 3.2 ms"->"帧 123.4 ms" 会把
+    // 整个右段左右平移）。槽内文本统一左对齐（契约见 StatusLayout.h 头注释）。
+    // 窄窗降级与旧版一致：放不下的左段槽（LayoutFlowSlots）与右段条目
+    //（LayoutHeaderRight：热键先藏、徽标次之、帧耗时永不藏）直接不绘制。
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float contentRightX = ImGui::GetWindowWidth() - st.WindowPadding.x;
+    const float sp = st.ItemSpacing.x;
     const float pipeW = ImGui::CalcTextSize("|").x;
-    const float sp = ImGui::GetStyle().ItemSpacing.x;
-    const auto segFits = [contentRightX, pipeW, sp](const char* u8Text) {
-        return ui::FlowSegmentFits(ImGui::GetCursorPosX(), contentRightX,
-                                   pipeW + sp + ImGui::CalcTextSize(u8Text).x);
+    const auto measure = [](const char* u8) { return ImGui::CalcTextSize(u8).x; };
+
+    // ---- 常量槽宽：只依赖编译期常量样本（每帧约 15 次缓存字形查询）----
+    const float msNumW = ui::MaxSampleWidth(ui::kMsNumberSamples, measure);
+    const float cntNumW = ui::MaxSampleWidth(ui::kCountNumberSamples, measure);
+    const float p95PrefixW = ImGui::CalcTextSize(ui::kP95Prefix).x;
+    const float msSuffixW = ImGui::CalcTextSize(ui::kMsSuffix).x;
+    const float queuePrefixW = ImGui::CalcTextSize(ui::kQueuePrefix).x;
+    const float procsPrefixW = ImGui::CalcTextSize(ui::kProcsPrefix).x;
+    const float csvTextW = ImGui::CalcTextSize(U8(L"● 记录 CSV")).x;
+    // 左段槽：[|采集 p95][|操作队列][|进程 N][|● 记录 CSV]（CSV 槽仅记录中绘制）。
+    const float slotW[4] = {
+        ui::PipeSlotWidth(pipeW, sp, ui::TextSlotWidth(p95PrefixW, msNumW, msSuffixW)),
+        ui::PipeSlotWidth(pipeW, sp, ui::AltSlotWidth(queuePrefixW, cntNumW,
+                                                      ImGui::CalcTextSize(ui::kQueueIdleText).x)),
+        ui::PipeSlotWidth(pipeW, sp, ui::TextSlotWidth(procsPrefixW, cntNumW, 0.0f)),
+        ui::PipeSlotWidth(pipeW, sp, csvTextW),
     };
+
     {   // 锚点段（必显）：采集模式（降级时给原因；维护轮 10：可点击打开说明模态）。
         if (snap.degraded) {
             const char* mode =
@@ -2818,80 +3188,89 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
             ImGui::TextDisabled("%s", U8(L"完整模式"));
         }
     }
-    // P2-3（F2 评审）：暂停采集需要全局指示。
+    // P2-3（F2 评审）：暂停采集需要全局指示（用户动作可见性切换，宽度恒定）。
     if (Ui().paused) {
         ImGui::SameLine();
         ImGui::TextColored(ColWarn(), "%s", U8(L"[已暂停]"));
     }
-    {
-        const char* p95 = U8(Fmt(L"采集 p95 {:.1f} ms", ctx.collect.TickP95Ms()));
-        if (segFits(p95)) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-            ImGui::SameLine();
-            ImGui::TextUnformatted(p95);
-        }
+
+    // 锚点之后布固定槽位（降级原因文本只在模式切换时变化 —— 状态变化而非
+    // 逐帧数据变化，槽起点随之一次性移动是可接受的）。
+    const float slotsStartX = ImGui::GetCursorPosX();
+    float slotX[4] = {};
+    const int firstBadSlot = ui::LayoutFlowSlots(slotsStartX, sp, contentRightX, slotW, 4, slotX);
+    const auto drawSlotText = [pipeW, sp](float x, const char* text) {
+        ImGui::SameLine(x);
+        ImGui::TextDisabled("|");
+        ImGui::SameLine(x + pipeW + sp);
+        ImGui::TextUnformatted(text);
+    };
+    {   // 槽 0：采集 p95（定宽数字文本，钳制见 FormatSlotMs）。
+        char p95Buf[48];
+        ui::FormatSlotMs(p95Buf, ui::kP95Prefix, ctx.collect.TickP95Ms(), ui::kMsSuffix);
+        if (0 < firstBadSlot) drawSlotText(slotX[0], p95Buf);
     }
-    {
+    {   // 槽 1：操作队列（忙=计数 / 闲=「操作队列空闲」，槽宽取两者上限）。
         const size_t pending = ctx.jobs.PendingCount();
-        const char* queue = pending > 0
-                                ? U8(Fmt(L"操作队列 {}", pending))
-                                : U8(L"操作队列空闲");
-        if (segFits(queue)) {
-            ImGui::SameLine();
+        char queueBuf[48];
+        if (pending > 0) {
+            ui::FormatSlotCount(queueBuf, ui::kQueuePrefix, pending);
+        } else {
+            snprintf(queueBuf, sizeof(queueBuf), "%s", ui::kQueueIdleText);
+        }
+        if (1 < firstBadSlot) {
+            ImGui::SameLine(slotX[1]);
             ImGui::TextDisabled("|");
-            ImGui::SameLine();
+            ImGui::SameLine(slotX[1] + pipeW + sp);
             if (pending > 0) {
-                ImGui::TextColored(ColWarn(), "%s", queue);
+                ImGui::TextColored(ColWarn(), "%s", queueBuf);
             } else {
-                ImGui::TextDisabled("%s", queue);
+                ImGui::TextDisabled("%s", queueBuf);
             }
         }
     }
-    {
-        const char* procs = U8(Fmt(L"进程 {}", static_cast<int>(snap.procs.size())));
-        if (segFits(procs)) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-            ImGui::SameLine();
-            ImGui::TextUnformatted(procs);
+    {   // 槽 2：进程数。
+        char procsBuf[48];
+        ui::FormatSlotCount(procsBuf, ui::kProcsPrefix,
+                            static_cast<unsigned long long>(snap.procs.size()));
+        if (2 < firstBadSlot) drawSlotText(slotX[2], procsBuf);
+    }
+    // 槽 3：CSV 记录状态（记录中才绘制；悬停显示文件路径）。
+    bool csvDrawn = false;
+    if (ui3::SharedPerfCsv().Active() && 3 < firstBadSlot) {
+        drawSlotText(slotX[3], U8(L"● 记录 CSV"));
+        csvDrawn = true;
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(ui3::SharedPerfCsv().Path()));
         }
     }
-    // F4#7: CSV 记录状态在状态栏常显（悬停显示文件路径）。
-    if (ui3::SharedPerfCsv().Active()) {
-        const char* csv = U8(L"● 记录 CSV");
-        if (segFits(csv)) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-            ImGui::SameLine();
-            ImGui::TextColored(ColDone(), "%s", csv);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("%s", U8(ui3::SharedPerfCsv().Path()));
-            }
-        }
-    }
+    // 自由文本（最后一条通知）保持文档流尾：它在最后一个可见槽之后，
+    // 宽度变化只向右侧伸展，不再有可被推挤的相邻项。
     if (!Ui().lastNote.empty()) {
-        const char* note = U8(Ui().lastNote);
-        if (segFits(note)) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.60f, 0.62f, 0.68f, 1.0f), "%s", note);
+        const int lastDrawn = csvDrawn ? 3 : (2 < firstBadSlot ? 2 : firstBadSlot - 1);
+        if (lastDrawn >= 0) {
+            const float noteX = slotX[lastDrawn] + slotW[lastDrawn] + sp;
+            const char* note = U8(Ui().lastNote);
+            if (ui::FlowSegmentFits(noteX, contentRightX, ImGui::CalcTextSize(note).x)) {
+                ImGui::SameLine(noteX);
+                ImGui::TextColored(ImVec4(0.60f, 0.62f, 0.68f, 1.0f), "%s", note);
+            }
         }
     }
     // --- 右段：外观类与自身开销 [全局热键][权限徽标][帧耗时] ------------------
+    // 槽宽全部为常量上限（热键标签恒定；徽标取两种文案较宽者；帧耗时取
+    // 数字样本上限）——LayoutHeaderRight 的坐标因此逐帧恒定。
     {
-        const ImGuiStyle& st = ImGui::GetStyle();
         const float leftEnd = ImGui::GetCursorPosX();  // 左段流程结束（窗口坐标）
         const float frameH = ImGui::GetFrameHeight();
         const float hotkeyW = frameH + st.ItemInnerSpacing.x +
                               ImGui::CalcTextSize(U8(L"全局热键 Ctrl+Alt+M")).x;
-        char frameMsBuf[32];
-        snprintf(frameMsBuf, sizeof(frameMsBuf), "帧 %.1f ms", ctx.frameMs);
-        // 徽标/帧耗时前各带一个「|」分隔符，分隔符宽一并计入测量宽。
-        const float badgeW = pipeW + sp + ImGui::CalcTextSize(U8(ctx.elevated ? L"管理员"
-                                                                              : L"普通权限")).x;
-        const float frameW = pipeW + sp + ImGui::CalcTextSize(frameMsBuf).x;
+        const float badgeTextW = std::max(ImGui::CalcTextSize(U8(L"管理员")).x,
+                                          ImGui::CalcTextSize(U8(L"普通权限")).x);
+        const float badgeW = ui::PipeSlotWidth(pipeW, sp, badgeTextW);
+        const float frameW = ui::PipeSlotWidth(
+            pipeW, sp, ui::TextSlotWidth(ImGui::CalcTextSize(ui::kFrameMsPrefix).x, msNumW,
+                                         msSuffixW));
         // 数组顺序 == 屏幕从左到右；priority 大者先藏：热键(2) → 徽标(1)，
         // 帧耗时(0) 永不隐藏。
         const ui::HeaderItem kRightItems[3] = {{hotkeyW, 2}, {badgeW, 1}, {frameW, 0}};
@@ -2914,17 +3293,21 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
         if (place[1].visible) {
             ImGui::SameLine(place[1].x);
             ImGui::TextDisabled("|");
-            ImGui::SameLine();
+            ImGui::SameLine(place[1].x + pipeW + sp);
             if (ctx.elevated) {
                 ImGui::TextColored(ColInfo(), "%s", U8(L"管理员"));
             } else {
                 ImGui::TextDisabled("%s", U8(L"普通权限"));
             }
         }
-        ImGui::SameLine(place[2].x);
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-        ImGui::TextUnformatted(frameMsBuf);
+        if (place[2].visible) {
+            char frameMsBuf[48];
+            ui::FormatSlotMs(frameMsBuf, ui::kFrameMsPrefix, ctx.frameMs, ui::kMsSuffix);
+            ImGui::SameLine(place[2].x);
+            ImGui::TextDisabled("|");
+            ImGui::SameLine(place[2].x + pipeW + sp);
+            ImGui::TextUnformatted(frameMsBuf);
+        }
     }
     ImGui::EndChild();
 }

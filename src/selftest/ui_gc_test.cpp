@@ -314,10 +314,11 @@ STM_TEST(csv_header_roundtrip) {
     for (const size_t cores : {size_t{0}, size_t{1}, size_t{4}, size_t{24}}) {
         const std::wstring header = PerfCsvHeader(cores);
         // 列 = 时间 + CPU% + cores + 内存可用/提交 + 磁盘读/写 + 网络收/发 + GPU
-        // => 9 + cores 列，逗号数 = 8 + cores
+        //     + 磁盘队列（Phase C）
+        // => 10 + cores 列，逗号数 = 9 + cores
         size_t commas = 0;
         for (wchar_t ch : header) commas += ch == L',' ? 1 : 0;
-        if (commas != 8 + cores) {
+        if (commas != 9 + cores) {
             *err = L"表头列数错误（cores=" + std::to_wstring(cores) + L"）：" + header;
             return false;
         }
@@ -328,6 +329,7 @@ STM_TEST(csv_header_roundtrip) {
         snap.sys.physAvail = 1;
         snap.sys.commitTotal = 2;
         snap.sys.diskReadBps = kUnavail;   // NaN -> 空单元格（列仍在）
+        snap.sys.diskQueueDepth = kUnavail;  // NaN -> 空单元格（Phase C）
         snap.sys.gpus.push_back(GpuAdapterInfo{});
         snap.sys.gpus[0].utilPercent = 7.0;
         const std::wstring row = PerfCsvRow(snap, L"2026-09-18 12:00:00");
@@ -347,6 +349,18 @@ STM_TEST(csv_header_roundtrip) {
         }
         if (row.find(L"7.00") == std::wstring::npos) {
             *err = L"GPU 利用率缺失";
+            return false;
+        }
+        // Phase C：磁盘队列合法读数与表头新列名都必须在。
+        if (header.find(L"磁盘队列") == std::wstring::npos) {
+            *err = L"表头缺「磁盘队列」列";
+            return false;
+        }
+        snap.sys.diskQueueDepth = 4.0;
+        const std::wstring row2 = PerfCsvRow(snap, L"2026-09-18 12:00:01");
+        if (row2.find(L",4") == std::wstring::npos ||
+            row2.find(L",4") != row2.size() - 2) {
+            *err = L"磁盘队列读数应为末列 4：" + row2;
             return false;
         }
     }

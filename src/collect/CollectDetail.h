@@ -274,10 +274,16 @@ private:
     bool haveCorePrev_ = false;
     uint64_t prevRecv_ = 0, prevSend_ = 0;  // GetIfTable2 字节计数器
     bool haveNetPrev_ = false;
+    // Phase D：每适配器吞吐差分基线（ifIndex -> 上一 tick 的 In/OutOctets）。
+    // 首拍无基线、新接口/计数回退 -> 该接口该 tick 速率 kUnavail（防下溢）。
+    std::unordered_map<uint64_t, uint64_t> prevRecvByIf_, prevSendByIf_;
+    bool haveAdapterPrev_ = false;
     // PDH：磁盘速率（通配；实例集合由 PDH 自身维护）+
-    // 全系统硬缺页（普通计数器）。
+    // 全系统硬缺页（普通计数器）+ 磁盘队列深度（Phase C；部分机器
+    // 无此计数器 -> 缺席 -> SystemInfo::diskQueueDepth 保持 kUnavail）。
     PDH_HQUERY pdhQuery_ = nullptr;
     PDH_HCOUNTER diskRead_ = nullptr, diskWrite_ = nullptr, hardFaults_ = nullptr;
+    PDH_HCOUNTER diskQueue_ = nullptr;
     bool pdhFailed_ = false, pdhLogged_ = false;
 };
 

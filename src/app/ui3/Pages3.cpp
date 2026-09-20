@@ -18,12 +18,15 @@
 #include "app/ui3/JumpState.h"  // F4#3: 跨页跳转槽
 #include "app/ui3/NetAdapterUi.h"  // A2: 适配器区纯逻辑（速度/排序/复制 IP）
 #include "app/ui3/NetMonUi.h"  // D5: 实时监视区纯逻辑（过滤/CSV/标签）
+#include "app/ui3/PcapUi.h"  // C2: 深度抓包区纯逻辑（HexDump/BPF 提示/行摘要/CSV）
 #include "app/ui3/PageHelpers.h"
+#include "app/ui3/PageLayout.h"  // M2: 顶栏位置固定的定高区/可见集合纯函数
 #include "app/ui/Pages.h"
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/UiText.h"
 #include "collect/AdapterInfo.h"
 #include "collect/LhmSource.h"
+#include "collect/NpcapSource.h"  // C2: 深度抓包源（wpcap.dll 动态绑定，零链接依赖）
 #include "collect/NetMonitor.h"
 #include "collect/NetTables.h"
 #include "collect/Sensors.h"
@@ -45,6 +48,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <shellapi.h>
 #include <utility>
 #include <vector>
 
@@ -215,6 +219,13 @@ stm::NetMonitor& NetMonInst() {
     return *mon;
 }
 
+// C2：深度抓包会话（单实例）。析构停消费线程并 pcap_close（晚于 main 返回，
+// 与 NetMonitor 同生命周期口径）；wpcap.dll 只在首次使用时动态加载。
+stm::NpcapSource& PcapSourceInst() {
+    static std::unique_ptr<stm::NpcapSource> src = std::make_unique<stm::NpcapSource>();
+    return *src;
+}
+
 class NetworkPage final : public IPage {
 public:
     const wchar_t* Id() const override { return L"net"; }
@@ -232,6 +243,8 @@ public:
         DrawAdapterSection();  // A2：适配器区（独立抓取，置于页面顶部）
         ImGui::Separator();
         DrawNetMon(ctx);  // D5：实时监视区（适配器区与连接表之间）
+        ImGui::Separator();
+        DrawPcap(ctx);  // C2：深度抓包区（默认折叠；未装 Npcap 时只展示指引）
         ImGui::Separator();
         fetch_.MaybeFetch(Produce, false);
         std::shared_ptr<const Result> res = fetch_.Peek();
@@ -347,8 +360,23 @@ private:
             viewDnsGen_ = dnsGen_;
         }
 
+        // M2 审计（顶栏位置固定）：本头部行的 y 只取决于上方的适配器定高
+        // 卡区（M2 起恒高）与分隔线。Drain/DNS/开关读回只改写本地容器
+        //（evAll_/dnsAll_/视图向量），全部渲染在头部行**之下**，且
+        // CollapsingHeader 标签为常量文本 —— 头部行不受 Drain 内容影响。
+        // 折叠 = 用户主动行为（可接受）；展开时头部行以下的 y 恒定。
         if (!ImGui::CollapsingHeader(U8(L"实时监视"), ImGuiTreeNodeFlags_DefaultOpen)) return;
 
+        // V28-P1-1（布局稳定化）：折叠头以下整段包进定高滚动段
+        //（高度 = kNetMonSectionHeight，选型理由见 NetMonUi.h）——
+        // 诚实边界行、「已丢弃 N 条」/「DNS 自动禁用」警告行（原画在定高
+        // 区外，随数据出现/消失增减页面行数）、开关/过滤行、连接事件表
+        //（空态单行↔300px 定高表互斥切换）、Top 远程目标表（原无定高，
+        // ETW 聚合 0→20 行逐行下推 DNS 区）、DNS 表全部画进段内：任何
+        // 数据变化只改变段内滚动量，绝不改变段外（深度抓包标题/工具栏/
+        // 连接表标题）的 y 坐标。段内结构不变，「暂停显示」语义不变。
+        ImGui::BeginChild("##netmonsection", ImVec2(0.0f, kNetMonSectionHeight),
+                          ImGuiChildFlags_None);
         // 诚实边界 + 丢弃警告。
         ImGui::TextWrapped("%s", U8(L"连接级监视：不捕获通信内容；远程聚合与 DNS 记录需要"
                                    L"管理员权限并依赖 ETW。"));
@@ -368,6 +396,7 @@ private:
         DrawNetMonEventTable(ctx);
         DrawNetMonTop();
         DrawNetMonDns();
+        ImGui::EndChild();
     }
 
     void DrawNetMonControls(AppContext& ctx, stm::NetMonitor& mon) {
@@ -747,6 +776,463 @@ private:
         }
     }
 
+    // ---- C2：深度抓包（Npcap）区 --------------------------------------------
+    // 诚实边界（文案在 DrawPcap 内呈现）：依赖用户显式安装的 Npcap（本应用
+    // 不下载/不分发/不代装驱动）；抓包需管理员权限，打开失败如实报错；载荷
+    // 仅保留前 256 字节；导出 CSV 仅元数据（载荷与 .pcap 导出明确不提供）。
+    // 默认折叠：折叠帧只做一次廉价的安装检测（SCM/文件存在性）。
+    // V28-P1-1：展开态正文包进定高滚动段，段高与实时监视段
+    //（kNetMonSectionHeight，NetMonUi.h 有完整选型说明）同取 340px ——
+    // 段位于页中部、其下还有工具栏与连接表，固定值使段下布局只随窗口
+    // 缩放变化，内容高度绝不是输入。
+    static constexpr float kPcapSectionHeight = 340.0f;
+
+    struct PcapToggle {
+        std::mutex mu;
+        bool ready = false;
+        bool ok = false;
+        std::wstring err;
+    };
+
+    using DeviceResult = AsyncFetch<std::vector<stm::PcapDevice>>::Result;
+    static std::vector<stm::PcapDevice> PcapDevicesProduce(std::wstring* err) {
+        return stm::ListDevices(err);
+    }
+
+    void DrawPcap(AppContext& ctx) {
+        if (!npcapChecked_) {  // 免管理员、无副作用：只查服务与 DLL 存在性
+            npcapChecked_ = true;
+            npcapPresent_ = stm::NpcapInstalled();
+        }
+        if (!ImGui::CollapsingHeader(U8(L"深度抓包（Npcap）"))) return;
+
+        if (!npcapPresent_) {
+            ImGui::TextWrapped("%s", U8(std::wstring(stm::NpcapInstallGuidance())));
+            if (ImGui::Button(U8(L"打开官方下载页"))) {
+                const INT_PTR rc = reinterpret_cast<INT_PTR>(::ShellExecuteW(
+                    nullptr, L"open", stm::NpcapDownloadUrl(), nullptr, nullptr,
+                    SW_SHOWNORMAL));
+                if (rc <= 32) {
+                    PushNote(ctx, Notification::Kind::JobFailed,
+                             L"无法打开浏览器，请手动访问 https://npcap.com/dist/");
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "%s", U8(L"打开 npcap.com 官方下载页（用户主动安装；本应用"
+                             L"不下载、不分发、不代装驱动）"));
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(U8(L"重新检测"))) npcapChecked_ = false;
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", U8(L"安装完成后点击重新检测（也可重启应用）"));
+            }
+            return;
+        }
+
+        // V28-P1-1（与实时监视段同原则）：展开后的整段包进定高滚动段
+        //（kPcapSectionHeight）—— 启动失败错误行、「已捕获…」统计行、包表
+        // 空态单行↔300px 定高表互斥切换、选中包详情（徽标行/截断警告/hex
+        // 视图 190px）的出现/消失全部由段内滚动消化，工具栏与连接表标题
+        // 不再被顶动。折叠头保留（用户折叠 = 主动行为）；未安装分支为静态
+        // 指引（仅「重新检测」用户动作可改变），无数据驱动抖动，保持段外。
+        ImGui::BeginChild("##pcapsection", ImVec2(0.0f, kPcapSectionHeight),
+                          ImGuiChildFlags_None);
+        DrawPcapBody(ctx);
+        ImGui::EndChild();
+    }
+
+    // V28-P1-1：定高滚动段（##pcapsection）内部的原展开态正文。空态单行、
+    // 错误行、详情块等「出现即改变高度」的内容全部画在段内，早退只影响
+    // 段内滚动量；Drain 每帧执行（含空态帧）与暂停积压语义不变。
+    void DrawPcapBody(AppContext& ctx) {
+        PollPcapToggle(ctx);
+        // 每帧取走新包（暂停帧也照常取走：积压进 hold，恢复后并入，不丢包）。
+        std::vector<stm::PktRecord> fresh;
+        PcapSourceInst().DrainPackets(&fresh);
+        if (!fresh.empty()) {
+            if (pcapPaused_) {
+                pktsHold_.insert(pktsHold_.begin(), fresh.rbegin(), fresh.rend());
+                if (pktsHold_.size() > stm::kPktRingCap) {
+                    pktsHold_.resize(stm::kPktRingCap);
+                }
+            } else {
+                for (auto it = fresh.rbegin(); it != fresh.rend(); ++it) {
+                    pktsAll_.push_front(std::move(*it));  // 最新在前
+                }
+                if (pktsAll_.size() > stm::kPktRingCap) {
+                    pktsAll_.resize(stm::kPktRingCap);
+                }
+            }
+        }
+
+        ImGui::TextWrapped(
+            "%s",
+            U8(L"抓包需管理员权限（依赖 Wireshark 同源的 Npcap 驱动）。仅本机显示、"
+               L"不上传。载荷仅保留前 256 字节；「导出 CSV」仅含元数据（载荷与 "
+               L".pcap 导出明确不提供）。"));
+
+        // 设备行：下拉 + 重新扫描（枚举走任务队列，毫秒级、不阻塞 UI）。
+        pcapDevices_.MaybeFetch(PcapDevicesProduce, false);
+        std::shared_ptr<const DeviceResult> devs = pcapDevices_.Peek();
+        if (devs != nullptr && lastPcapDevices_ != devs.get()) {
+            lastPcapDevices_ = devs.get();
+            pcapDevs_ = devs->data;
+            pcapDevIndex_ = -1;
+            for (size_t i = 0; i < pcapDevs_.size(); ++i) {
+                if (pcapDevs_[i].name == pcapDevName_) {
+                    pcapDevIndex_ = static_cast<int>(i);
+                }
+            }
+        }
+        ImGui::TextUnformatted(U8(L"设备"));
+        ImGui::SameLine();
+        std::vector<std::string> devLabels;
+        devLabels.reserve(pcapDevs_.size());
+        for (const stm::PcapDevice& d : pcapDevs_) {
+            devLabels.push_back(WideToUtf8(stm::ui3::PcapDeviceLabel(d)));
+        }
+        const char* preview =
+            pcapDevIndex_ >= 0 &&
+                    static_cast<size_t>(pcapDevIndex_) < devLabels.size()
+                ? devLabels[static_cast<size_t>(pcapDevIndex_)].c_str()
+                : U8(L"选择捕获设备…");
+        ImGui::SetNextItemWidth(300.0f);
+        if (ImGui::BeginCombo("##pcapdev", preview)) {
+            for (int i = 0; i < static_cast<int>(devLabels.size()); ++i) {
+                const bool selected = i == pcapDevIndex_;
+                if (ImGui::Selectable(devLabels[static_cast<size_t>(i)].c_str(),
+                                      selected)) {
+                    pcapDevIndex_ = i;
+                    pcapDevName_ = pcapDevs_[static_cast<size_t>(i)].name;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(pcapDevName_.empty()
+                                     ? std::wstring(L"先选择要抓包的网卡；"
+                                                    L"回环流量请选「回环」设备")
+                                     : pcapDevName_));
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(U8(L"重新扫描"))) {
+            pcapDevices_.MaybeFetch(PcapDevicesProduce, true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", U8(L"立即重新枚举捕获设备（可越过 10 秒最小间隔）"));
+        }
+
+        // BPF 过滤 + 启停（pcap_open_live 可能阻塞，走任务队列）。
+        ImGui::SetNextItemWidth(300.0f);
+        ImGui::InputTextWithHint("##pcapbpf", U8(L"BPF 过滤（留空不过滤）"),
+                                 pcapBpfUtf8_, sizeof(pcapBpfUtf8_));
+        ImGui::SetItemTooltip("%s", U8(stm::ui3::BpfHintText()));
+        ImGui::SameLine();
+        const bool running = PcapSourceInst().Running();
+        ImGui::BeginDisabled(pcapToggle_ != nullptr || pcapDevName_.empty() ||
+                             running);
+        if (ImGui::Button(U8(L"开始抓包"))) RequestPcapStart(ctx);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s",
+                              U8(pcapDevName_.empty()
+                                     ? std::wstring(L"先选择捕获设备")
+                                     : std::wstring(L"打开设备（混杂模式，全帧捕获）"
+                                                    L"并应用 BPF 过滤器；需管理员权限")));
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(pcapToggle_ != nullptr || !running);
+        if (ImGui::Button(U8(L"停止"))) RequestPcapStop(ctx);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", U8(L"停止并丢弃会话（已显示的包保留）"));
+        }
+        if (!running && !pcapLastErr_.empty()) {
+            ImGui::TextColored(ColFail(), "%s", U8(pcapLastErr_));
+        }
+
+        // 统计行 + 暂停/清空/导出。
+        ImGui::TextUnformatted(
+            U8(Fmt(L"已捕获 {} · 丢弃 {}（保新弃旧）· 显示 {} 条（最新在上）",
+                   PcapSourceInst().CapturedTotal(),
+                   PcapSourceInst().DroppedPackets(), pktsAll_.size())));
+        if (running) {
+            ImGui::SameLine();
+            ImGui::TextColored(ColDone(), "%s", U8(L"抓包进行中"));
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox(U8(L"暂停显示"), &pcapPaused_)) {
+            if (!pcapPaused_ && !pktsHold_.empty()) {  // 恢复：并入积压的包
+                for (auto it = pktsHold_.rbegin(); it != pktsHold_.rend(); ++it) {
+                    pktsAll_.push_front(std::move(*it));
+                }
+                pktsHold_.clear();
+                if (pktsAll_.size() > stm::kPktRingCap) {
+                    pktsAll_.resize(stm::kPktRingCap);
+                }
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s",
+                              U8(L"冻结表格刷新；后台照常抓取，取消暂停后自动补齐"
+                                 L"（积压超出 4096 条按保新弃旧丢弃）"));
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(U8(L"清空"))) {
+            pktsAll_.clear();
+            pktsHold_.clear();
+            pcapHasSel_ = false;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(pktsAll_.empty());
+        if (ImGui::SmallButton(U8(L"导出 CSV"))) ExportPcapCsv(ctx);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "%s", U8(L"把当前显示的包写入 %LOCALAPPDATA%\\SuperTaskMgr\\captures"
+                         L"\\pcap_*.csv（UTF-8 BOM）。仅元数据列：时间/源/目的/协议/"
+                         L"端口/长度/信息；载荷与 .pcap 文件导出不提供"));
+        }
+
+        if (pktsAll_.empty()) {
+            // V28-P1-1：空态画在定高段内部 —— 首包到达只增加段内滚动量，
+            // 不再使段外（工具栏/连接表标题）一次性下移。
+            ImGui::TextColored(
+                ColMuted(), "%s",
+                U8(running
+                       ? L"已开始，等待数据包（可在本机产生流量，如 ping 127.0.0.1；"
+                         L"回环设备只显示本机回环流量）"
+                       : L"未开始抓包；选择设备后点击「开始抓包」"));
+            return;
+        }
+        const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                          ImGuiTableFlags_SizingFixedFit;
+        ImGui::BeginChild("##pcapchild", ImVec2(0.0f, 300.0f),
+                          ImGuiChildFlags_Borders);
+        if (ImGui::BeginTable("pcap_pkts", 5, flags)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed,
+                                    118.0f);
+            ImGui::TableSetupColumn(U8(L"源 → 目的"),
+                                    ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed,
+                                    84.0f);
+            ImGui::TableSetupColumn(U8(L"长度"), ImGuiTableColumnFlags_WidthFixed,
+                                    66.0f);
+            ImGui::TableSetupColumn(U8(L"信息"), ImGuiTableColumnFlags_WidthStretch,
+                                    3.0f);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(pktsAll_.size()));
+            while (clipper.Step()) {
+                for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+                    const stm::PktRecord& p = pktsAll_[static_cast<size_t>(r)];
+                    ImGui::PushID(r);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const bool sel = pcapHasSel_ &&
+                                     pcapSel_.unixTime == p.unixTime &&
+                                     pcapSel_.length == p.length &&
+                                     pcapSel_.info == p.info;
+                    if (ImGui::Selectable("##pktrow", sel,
+                                          ImGuiSelectableFlags_SpanAllColumns)) {
+                        pcapHasSel_ = true;
+                        pcapSel_ = p;  // 拷贝载荷供 hex 视图（环形随时被淘汰）
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(U8(stm::ui3::PktClockText(p.unixTime)));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(U8(stm::ui3::PacketRowText(p)));
+                    ImGui::TableNextColumn();
+                    const stm::ui3::PktTone tone =
+                        stm::ui3::PktProtoTone(p.proto);
+                    ImGui::TextColored(
+                        tone == stm::ui3::PktTone::Info
+                            ? ColInfo()
+                            : (tone == stm::ui3::PktTone::Warn ? ColWarn()
+                                                               : ColMuted()),
+                        "%s", U8(stm::ui3::PktProtoBadge(p.proto)));
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", p.length);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(
+                        U8(p.info.empty() ? std::wstring(L"—") : p.info));
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+
+        // 选中包详情：徽标 + 摘要 + hex/ASCII 双栏视图（≤256B 载荷全显）。
+        if (pcapHasSel_) {
+            const std::wstring badge = stm::ui3::PktProtoBadge(pcapSel_.proto);
+            ImGui::TextColored(ColInfo(), "[%s]", U8(badge));
+            ImGui::SameLine();
+            ImGui::TextUnformatted(
+                U8(Fmt(L"{} 字节（{}）· {}", pcapSel_.length,
+                       stm::ui3::PacketRowText(pcapSel_),
+                       pcapSel_.info.empty() ? std::wstring(L"—") : pcapSel_.info)));
+            if (pcapSel_.payloadTruncated) {
+                ImGui::TextColored(ColWarn(), "%s",
+                                   U8(L"载荷已截断至 256 字节（展示上限）"));
+            }
+            if (pcapSel_.payloadBytes.empty()) {
+                ImGui::TextDisabled("%s",
+                                    U8(L"无载荷可显示（头部之外没有数据或已按协议"
+                                       L"截取为空）"));
+            } else {
+                ImGui::BeginChild("##pkthex", ImVec2(0.0f, 190.0f),
+                                  ImGuiChildFlags_Borders);
+                ImGui::TextUnformatted(
+                    U8(stm::ui3::HexDump(pcapSel_.payloadBytes)));
+                ImGui::EndChild();
+            }
+        }
+    }
+
+    void RequestPcapStart(AppContext& ctx) {
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        if (!app) {
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，抓包未启动（应用可能正在退出）");
+            return;
+        }
+        std::shared_ptr<PcapToggle> toggle = std::make_shared<PcapToggle>();
+        pcapToggle_ = toggle;
+        stm::NpcapSource* src = &PcapSourceInst();
+        const std::wstring dev = pcapDevName_;
+        const std::wstring bpf = Utf8ToWide(std::string(pcapBpfUtf8_));
+        if (app->jobs.Submit([app, toggle, src, dev, bpf] {
+                std::wstring err;
+                const bool ok = src->StartCapture(dev, bpf, &err);
+                std::lock_guard<std::mutex> lock(toggle->mu);
+                toggle->ok = ok;
+                toggle->err = std::move(err);
+                toggle->ready = true;
+            }) == 0) {
+            pcapToggle_.reset();
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，抓包未启动（应用可能正在退出）");
+        }
+    }
+
+    void RequestPcapStop(AppContext& ctx) {
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        if (!app) {
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，抓包未停止（应用可能正在退出）");
+            return;
+        }
+        std::shared_ptr<PcapToggle> toggle = std::make_shared<PcapToggle>();
+        pcapToggle_ = toggle;
+        stm::NpcapSource* src = &PcapSourceInst();
+        if (app->jobs.Submit([app, toggle, src] {
+                src->StopCapture();  // 幂等；join 消费线程
+                std::lock_guard<std::mutex> lock(toggle->mu);
+                toggle->ok = true;
+                toggle->ready = true;
+            }) == 0) {
+            pcapToggle_.reset();
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，抓包未停止（应用可能正在退出）");
+        }
+    }
+
+    void PollPcapToggle(AppContext& ctx) {
+        if (!pcapToggle_) return;
+        bool ready = false, ok = false;
+        std::wstring err;
+        {
+            std::lock_guard<std::mutex> lock(pcapToggle_->mu);
+            ready = pcapToggle_->ready;
+            ok = pcapToggle_->ok;
+            err = pcapToggle_->err;
+        }
+        if (!ready) return;
+        pcapToggle_.reset();
+        if (ok) {
+            pcapLastErr_.clear();
+            // 新会话：清空展示（统计口径自本会话开始，与采集器一致）。
+            pktsAll_.clear();
+            pktsHold_.clear();
+            pcapHasSel_ = false;
+            PushNote(ctx, Notification::Kind::Info,
+                     PcapSourceInst().Running()
+                         ? Fmt(L"已开始抓包：{}", pcapDevName_)
+                         : std::wstring(L"已停止抓包"));
+        } else {
+            // 诚实报错：pcap_geterr 原文 + 常见原因（采集层已拼接提权提示）。
+            pcapLastErr_ = err;
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     Fmt(L"抓包启动失败：{}", err));
+        }
+    }
+
+    void ExportPcapCsv(AppContext& ctx) {
+        if (pktsAll_.empty()) return;
+        auto rows = std::make_shared<const std::vector<stm::PktRecord>>(
+            pktsAll_.begin(), pktsAll_.end());
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        if (!app) {
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，导出未执行（应用可能正在退出）");
+            return;
+        }
+        if (app->jobs.Submit([app, rows] {
+                const std::wstring dir = NetMonCsvDir();
+                if (EnsureDir(dir).empty()) {  // 契约：失败返回空串
+                    PushNote(*app, Notification::Kind::JobFailed,
+                             Fmt(L"创建目录失败：{}", dir));
+                    return;
+                }
+                const std::wstring path =
+                    dir + L"\\" + PcapCsvFileName(static_cast<int64_t>(std::time(nullptr)));
+                std::ofstream f(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+                if (!f.is_open()) {
+                    PushNote(*app, Notification::Kind::JobFailed,
+                             L"无法创建 CSV 文件（被占用或无写入权限）");
+                    return;
+                }
+                f << "\xEF\xBB\xBF";  // UTF-8 BOM：Excel 直接双击可读
+                f << WideToUtf8(BuildPcapCsv(*rows));
+                f.flush();
+                const bool ok = f.good();
+                f.close();
+                if (ok) {
+                    PushNote(*app, Notification::Kind::JobDone,
+                             Fmt(L"已导出 {} 条包元数据（不含载荷）：{}", rows->size(),
+                                 path));
+                } else {
+                    PushNote(*app, Notification::Kind::JobFailed, L"写入 CSV 失败（磁盘错误）");
+                }
+            }) == 0) {
+            PushNote(ctx, Notification::Kind::JobFailed,
+                     L"操作队列未运行，导出未执行（应用可能正在退出）");
+        }
+    }
+
+    // C2 深度抓包状态。
+    AsyncFetch<std::vector<stm::PcapDevice>> pcapDevices_{10.0};
+    const DeviceResult* lastPcapDevices_ = nullptr;
+    std::shared_ptr<PcapToggle> pcapToggle_;  // 非 null = 启停在途
+    std::vector<stm::PcapDevice> pcapDevs_;   // 下拉展示副本
+    int pcapDevIndex_ = -1;
+    std::wstring pcapDevName_;      // 选中的设备名（\\Device\\NPF\\...）
+    char pcapBpfUtf8_[256] = {};    // BPF 输入框（UTF-8）
+    std::deque<stm::PktRecord> pktsAll_;  // 最新在前；容量 kPktRingCap
+    std::vector<stm::PktRecord> pktsHold_;  // 暂停期间积压（恢复并入）
+    bool pcapPaused_ = false;
+    bool pcapHasSel_ = false;
+    stm::PktRecord pcapSel_;
+    bool npcapChecked_ = false;
+    bool npcapPresent_ = false;
+    std::wstring pcapLastErr_;  // StartCapture 失败原文（行内诚实展示）
+
     // D5 实时监视状态。
     std::shared_ptr<NetMonToggle> evToggle_;      // 非 null = 开关在途
     std::shared_ptr<NetMonToggle> trafficToggle_;
@@ -782,7 +1268,8 @@ private:
         return stm::EnumAdaptersNet(err);
     }
 
-    // 标签 + 数量 + 手动刷新一行；随后是适配器卡片列表。
+    // 标签 + 数量 + 手动刷新一行（定高行：溢出提示用 SameLine，行数恒定）；
+    // 随后是 M2 定高滚动卡区。
     void DrawAdapterSection() {
         adapters_.MaybeFetch(AdapterProduce, false);
         std::shared_ptr<const AdapterResult> res = adapters_.Peek();
@@ -811,27 +1298,67 @@ private:
                               U8(L"手动刷新：立即重新枚举适配器（可越过 10 秒最小间隔；"
                                  L"自动刷新受该间隔限制）"));
         }
+        // M2：卡片可能超出下方定高区 —— 行内提示（SameLine：出现/消失
+        // 不增减行数，头部行高恒定是「顶栏不移动」契约的一部分）。
+        if (res != nullptr && AdapterCardsOverflowHint(*res)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", U8(L"卡片较多，在列表框内滚动查看"));
+        }
         ImGui::Separator();
 
+        // M2（顶栏位置固定）：卡区包进定高（约 200px，PageLayout.h::
+        // AdapterRegionHeight）滚动区 —— 适配器数量增减、「更多适配器」
+        // 展开/折叠、加载/错误态都只改变区内滚动量，绝不改变区外任何
+        // 元素的 y 坐标，下方的实时监视/深度抓包/连接表不再被顶动。
+        ImGui::BeginChild(
+            "##adapters",
+            ImVec2(0.0f, AdapterRegionHeight(ImGui::GetContentRegionAvail().y)),
+            ImGuiChildFlags_Borders);
         if (res == nullptr) {
             DrawLoading();
-            return;
-        }
-        if (!res->ok && res->data.empty()) {
+        } else if (!res->ok && res->data.empty()) {
             bool retry = false;
             DrawLoadError(res->err, &retry);
             if (retry) adapters_.MaybeFetch(AdapterProduce, true);
-            return;
+        } else {
+            DrawAdapterCards(*res);
         }
-        if (!res->err.empty()) {
+        ImGui::EndChild();
+    }
+
+    // 卡区溢出行内提示的估算（公式在 PageLayout.h，ui_m2_test 覆盖）：
+    // 每张非回环卡片 = 1 标题行 + 6 基线明细行 + 超出基线的额外 IPv6 行；
+    // 总高含卡片间条目间距。仅决定提示文字是否出现，不参与真实布局。
+    bool AdapterCardsOverflowHint(const AdapterResult& res) const {
+        const float rowH = ImGui::GetTextLineHeightWithSpacing();
+        std::vector<int> extraRows;
+        extraRows.reserve(res.data.size());
+        for (const stm::AdapterNetInfo& a : res.data) {
+            if (a.isLoopback) continue;
+            int v6 = 0;
+            for (const stm::AdapterAddressEntry& e : a.addresses) {
+                if (e.family != L"IPv4" && !e.ip.empty()) ++v6;
+            }
+            extraRows.push_back(v6 > 0 ? v6 - 1 : 0);  // 基线明细已含 1 行 IPv6
+        }
+        const float totalH = AdapterCardsTotalHeight(
+            rowH, extraRows.data(), static_cast<int>(extraRows.size()));
+        return AdapterCardsOverflow(
+            AdapterRegionHeight(ImGui::GetContentRegionAvail().y), totalH);
+    }
+
+    // 定高卡区内部：部分失败警告 + 主/更多适配器分区（纯逻辑判定在
+    // NetAdapterUi.h）+ 卡片列表。
+    void DrawAdapterCards(const AdapterResult& res) {
+        if (!res.err.empty()) {
             ImGui::TextColored(ColWarn(), "%s",
-                               U8(Fmt(L"部分数据不可用：{}", res->err)));
+                               U8(Fmt(L"部分数据不可用：{}", res.err)));
         }
-        // 分区（纯逻辑判定在 NetAdapterUi.h）：已连接的物理适配器直接
-        // 展示；媒体断开/蓝牙/虚拟等折叠进「更多适配器」；回环不显示。
+        // 已连接的物理适配器直接展示；媒体断开/蓝牙/虚拟等折叠进
+        // 「更多适配器」；回环不显示。
         std::vector<const stm::AdapterNetInfo*> primary;
         std::vector<const stm::AdapterNetInfo*> others;
-        for (const stm::AdapterNetInfo& a : res->data) {
+        for (const stm::AdapterNetInfo& a : res.data) {
             if (a.isLoopback) continue;
             if (a.up && IsPhyscialAdapter(a)) {
                 primary.push_back(&a);
@@ -2029,11 +2556,47 @@ public:
         PollLhmProbe(ctx);
         std::shared_ptr<const Result> res = fetch_.Peek();
 
+        // 顶栏三段（工具行 / 显隐行 / LHM 区）保持原位原行数 —— 定高区
+        // 之外的元素逐帧恒定是「页头位置固定」的前提。
         DrawToolbar(ctx, res.get());
         DrawVisibilityRow(ctx);
         DrawLhmSection(ctx);
         ImGui::Separator();
 
+        // M2（顶栏位置固定）：工具行/显隐行/LHM 区/分隔线均为恒定行数，
+        // 其下把分组展示区整体放进定高滚动区。高度实现选「页高减顶栏」
+        //（avail 在顶栏绘制完成后测取，钳制到 [240, 600]，见 PageLayout.h::
+        // SensorGroupsRegionHeight）：窗口够大时恒为 600，小窗口恰好填满
+        // 页高 → 父级永不出现滚动条。分组内容增减（温度条目出现/消失、
+        // LHM 行合入、组显隐切换、加载/错误/说明行）只改变区内滚动量，
+        // 绝不改变区外任何元素的 y 坐标 → 页头不再随内容上下移动。
+        ImGui::BeginChild(
+            "##sensorgroups",
+            ImVec2(0.0f, SensorGroupsRegionHeight(ImGui::GetContentRegionAvail().y)),
+            ImGuiChildFlags_None);
+        DrawSensorBody(ctx, res);
+        ImGui::EndChild();
+    }
+
+private:
+    using Result = AsyncFetch<SensorSnapshot>::Result;
+    using LhmResult = AsyncFetch<std::vector<SensorReading>>::Result;
+    static SensorSnapshot Produce(std::wstring* err) { return ReadSensors(err); }
+    static std::vector<SensorReading> LhmProduce(std::wstring* err) {
+        std::vector<SensorReading> out;
+        PollLhm(&out, err);  // 仅限本机的客户端，约 1s 有界超时
+        return out;
+    }
+
+    static bool AllEmpty(const SensorSnapshot& s) {
+        return s.cpu.empty() && s.gpu.empty() && s.disks.empty() && s.fans.empty() &&
+               s.cpuCores.empty() && s.gpus.empty() && s.network.empty() &&
+               s.battery.empty() && s.memory.empty();
+    }
+
+    // 定高分组区内部（M2）：加载态/错误态/「说明」行也画进区内 —— 它们的
+    // 出现与消失同样只影响区内滚动量，不影响区外顶栏。
+    void DrawSensorBody(AppContext& ctx, const std::shared_ptr<const Result>& res) {
         if (res == nullptr) {
             DrawLoading();
             return;
@@ -2054,6 +2617,18 @@ public:
 
         const SensorSnapshot& snap = res->data;
         const std::vector<SensorReading> lhm = CurrentLhmRows();
+        // 显隐状态 → 分组可见集合（纯函数 PageLayout.h：本帧内的一致快照，
+        // selftest ui_m2_test 覆盖同一份数学；语义与逐组 SensorGroupVisible
+        // 完全一致）。
+        constexpr int kGroupCount = static_cast<int>(SensorGroup::Count);
+        bool visFlags[kGroupCount];
+        for (int i = 0; i < kGroupCount; ++i) {
+            visFlags[i] = SensorGroupVisible(ctx.cfg, static_cast<SensorGroup>(i));
+        }
+        const SensorGroupMask visMask = SensorGroupMaskFromFlags(visFlags, kGroupCount);
+        const auto groupOn = [visMask](SensorGroup g) {
+            return SensorGroupMaskHas(visMask, g);
+        };
         // 组渲染分发：详细模式逐条渲染全部读数（含完整标签），精简模式为现有概要。
         const auto readings = [&](const std::vector<SensorReading>& items) {
             if (detailMode_) {
@@ -2064,7 +2639,7 @@ public:
         };
 
         // Vertical full-width groups; each 可选显示 via cfg (P2 requirement).
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Cpu)) {
+        if (groupOn(SensorGroup::Cpu)) {
             const std::vector<SensorReading> cpuLhm = FilterLhm(lhm, LhmGroup::Cpu);
             BeginGroup("##grp_cpu", L"CPU",
                        snap.cpu.size() + snap.cpuCores.size() + cpuLhm.size());
@@ -2077,45 +2652,45 @@ public:
             DrawCoreTable(ctx, snap.cpuCores);
             EndGroup();
         }
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Gpu)) {
+        if (groupOn(SensorGroup::Gpu)) {
             BeginGroup("##grp_gpu", L"GPU", snap.gpu.size() + snap.gpus.size());
             readings(snap.gpu);
             readings(snap.gpus);
             readings(FilterLhm(lhm, LhmGroup::Gpu));
             EndGroup();
         }
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Mem)) {
+        if (groupOn(SensorGroup::Mem)) {
             BeginGroup("##grp_mem", L"内存", snap.memory.size());
             readings(snap.memory);
             readings(FilterLhm(lhm, LhmGroup::Mem));
             EndGroup();
         }
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Disk)) {
+        if (groupOn(SensorGroup::Disk)) {
             BeginGroup("##grp_disk", L"磁盘", snap.disks.size());
             DrawDisks(ctx, snap.disks);
             readings(FilterLhm(lhm, LhmGroup::Disk));
             EndGroup();
         }
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Net)) {
+        if (groupOn(SensorGroup::Net)) {
             BeginGroup("##grp_net", L"网络", snap.network.size());
             readings(snap.network);
             readings(FilterLhm(lhm, LhmGroup::Net));
             EndGroup();
         }
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Battery)) {
+        if (groupOn(SensorGroup::Battery)) {
             BeginGroup("##grp_battery", L"电池", snap.battery.size());
             readings(snap.battery);   // NoHardware 条目 = 诚实的空态
             readings(FilterLhm(lhm, LhmGroup::Battery));
             EndGroup();
         }
-        if (SensorGroupVisible(ctx.cfg, SensorGroup::Fan)) {
+        if (groupOn(SensorGroup::Fan)) {
             BeginGroup("##grp_fan", L"风扇", snap.fans.size());
             readings(snap.fans);      // 诚实的 NeedDriver 条目
             readings(FilterLhm(lhm, LhmGroup::Fan));
             EndGroup();
         }
         // G-B 的 extra 读数（不归入上述任一组的杂项；契约：空 = 未发现，整组不显示）。
-        if (!snap.extra.empty() && SensorGroupVisible(ctx.cfg, SensorGroup::Extra)) {
+        if (!snap.extra.empty() && groupOn(SensorGroup::Extra)) {
             BeginGroup("##grp_extra", L"其他", snap.extra.size());
             readings(snap.extra);
             EndGroup();
@@ -2123,22 +2698,6 @@ public:
         // TODO(integrator): G-B 后续如再向 collect/Sensors.h 增补字段，在本函数
         // 对应分组内追加一行 `readings(snap.<newField>);` 即可 —— 精简/详细开关、
         // 四态诚实渲染与组显隐（PageHelpers.h SensorGroup）自动生效。
-    }
-
-private:
-    using Result = AsyncFetch<SensorSnapshot>::Result;
-    using LhmResult = AsyncFetch<std::vector<SensorReading>>::Result;
-    static SensorSnapshot Produce(std::wstring* err) { return ReadSensors(err); }
-    static std::vector<SensorReading> LhmProduce(std::wstring* err) {
-        std::vector<SensorReading> out;
-        PollLhm(&out, err);  // 仅限本机的客户端，约 1s 有界超时
-        return out;
-    }
-
-    static bool AllEmpty(const SensorSnapshot& s) {
-        return s.cpu.empty() && s.gpu.empty() && s.disks.empty() && s.fans.empty() &&
-               s.cpuCores.empty() && s.gpus.empty() && s.network.empty() &&
-               s.battery.empty() && s.memory.empty();
     }
 
     // ---- 偏好（cfg 持久化）--------------------------------------------------

@@ -103,7 +103,7 @@ STM_TEST(sensors_zones_multi_label) {
             return false;
         }
     }
-    // Labels pairwise distinct — "同类多值逐项" 的最小可展示性要求。
+    // 各条目 label 两两不同——"同类多值逐项展示"的最小可展示性要求。
     for (size_t i = 0; i < zones.size(); ++i) {
         for (size_t j = i + 1; j < zones.size(); ++j) {
             if (zones[i]->label == zones[j]->label) {

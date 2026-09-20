@@ -93,8 +93,19 @@ struct SystemInfo {
     double diskReadBps = kUnavail, diskWriteBps = kUnavail;
     double netRecvBps = kUnavail, netSendBps = kUnavail;
     double hardFaultsPerSec = kUnavail;  // 全系统（PDH \Memory）
+    double diskQueueDepth = kUnavail;    // 全系统磁盘队列长度（PDH Current Disk Queue Length 合计）
     std::vector<GpuAdapterInfo> gpus;    // 已过滤虚拟显示适配器
     double uptimeSec = 0;
+
+    // 每适配器吞吐（GetIfTable2 按 ifIndex 差分；仅 Up 的非回环物理/虚拟接口，排除环回）。
+    struct AdapterThroughput {
+        uint64_t ifIndex = 0;
+        std::wstring name;      // 适配器友好名（中文系统即中文名，如"以太网"/"WLAN"）
+        std::wstring typeLabel; // "以太网"/"Wi-Fi"/…（复用 IF_TYPE 映射）
+        double recvBps = kUnavail;
+        double sendBps = kUnavail;
+    };
+    std::vector<AdapterThroughput> netAdapters;
 };
 
 enum SnapshotCap : uint32_t { CAP_NET_ETW = 1u << 0 };

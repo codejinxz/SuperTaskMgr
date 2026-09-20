@@ -157,19 +157,8 @@ bool PawnIOInstalled() {
     return FileExists(sys.c_str());
 }
 
-bool NpcapInstalled() {
-    // Npcap 1.x 服务名 NPCAP（WinPcap 兼容层可能注册 npf）。
-    if (RegKeyExists(L"SYSTEM\\CurrentControlSet\\Services\\NPCAP") ||
-        RegKeyExists(L"SYSTEM\\CurrentControlSet\\Services\\npf")) {
-        return true;
-    }
-    // DLL 事实：Npcap 默认装到 System32\Npcap\；勾选 WinPcap 兼容模式则直装 System32。
-    if (FileExists(L"C:\\Windows\\System32\\Npcap\\wpcap.dll") ||
-        FileExists(L"C:\\Windows\\System32\\wpcap.dll")) {
-        return true;
-    }
-    return false;
-}
+// NpcapInstalled() 的唯一实现在 NpcapSource.cpp（C2 维护轮契约，见
+// NpcapSource.h）；KernelProbe.h 的声明与之相同，仅为兼容诊断调用方保留。
 
 std::wstring TestSignStatus() {
     std::wstring opts;

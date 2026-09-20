@@ -1,13 +1,16 @@
 // SystemCollector：每 tick 的系统级指标。
 // CPU：总量用 GetSystemTimes（内核时间含空闲 -> 忙碌 =
 // kernel-idle+user），每核用 NtQSI(SystemProcessorPerformanceInformation)。
-// 内存：GlobalMemoryStatusEx + GetPerformanceInfo。磁盘速率 + 系统硬缺页：
-// PDH 英文计数器。网络：GetIfTable2 字节差值。所有采不到的字段
+// 内存：GlobalMemoryStatusEx + GetPerformanceInfo。磁盘速率 + 系统硬缺页 +
+// 磁盘队列深度（Phase C）：PDH 英文计数器。网络：GetIfTable2 字节差值
+//（总量 + Phase D 每适配器按 ifIndex 差分）。所有采不到的字段
 // 保持 kUnavail——绝不用约定俗成的 0。
 #include <winsock2.h>  // 必须在 iphlpapi/netioapi 之前包含（LEAN_AND_MEAN 会隐藏 winsock）
 #include <ws2tcpip.h>  // 引入 ws2ipdef.h -> 为 netioapi 的 MIB_* 声明定义 _WS2IPDEF_
+#include "collect/AdapterInfo.h"  // IfTypeLabel（IF_TYPE -> 中文标签，头内纯函数）
 #include "collect/CollectDetail.h"
 #include "core/Log.h"
+#include "core/Str.h"  // Fmt（接口名兜底文案）
 #include <iphlpapi.h>
 #include <ipifcons.h>
 #include <netioapi.h>
@@ -21,6 +24,8 @@ namespace {
 
 constexpr wchar_t kDiskRead[] = L"\\PhysicalDisk(*)\\Disk Read Bytes/sec";
 constexpr wchar_t kDiskWrite[] = L"\\PhysicalDisk(*)\\Disk Write Bytes/sec";
+// Phase C：队列深度为非速率（原始）计数器；与速率计数器同查询同节奏读取。
+constexpr wchar_t kDiskQueue[] = L"\\PhysicalDisk(*)\\Current Disk Queue Length";
 constexpr wchar_t kHardFaults[] = L"\\Memory\\Hard Faults/sec";
 
 uint64_t FtU64(const FILETIME& f) {
@@ -61,6 +66,13 @@ void SystemCollector::CollectPdh(SystemInfo* out) {
         if (PdhLocalizeEnglishPath(kHardFaults, &hfTemplate)) {
             PdhAddWildcardCounter(pdhQuery_, hfTemplate, &hardFaults_);
         }
+        // Phase C：磁盘队列深度。部分机器无 PhysicalDisk 计数器对象
+        //（或被禁用）——单独降级，不影响同查询的速率/硬缺页计数器；
+        // diskQueue_ 为空时 diskQueueDepth 恒保持 kUnavail（诚实）。
+        std::wstring dqTemplate;
+        if (PdhLocalizeEnglishPath(kDiskQueue, &dqTemplate)) {
+            PdhAddWildcardCounter(pdhQuery_, dqTemplate, &diskQueue_);
+        }
     }
     if (!PdhCollect(pdhQuery_)) return;
 
@@ -96,22 +108,78 @@ void SystemCollector::CollectPdh(SystemInfo* out) {
     if (hardFaults_ && PdhFmtDouble(hardFaults_, &hf)) {
         out->hardFaultsPerSec = hf;  // 不可得时诚实给 kUnavail
     }
+    // Phase C：队列深度合计。口径与磁盘速率一致：跳过 "_Total" 防重复
+    // 计数；无任何单盘有效值时回退 _Total。队列长度为原始（非速率）计数器，
+    // 但首拍走与速率相同的 PdhCollect 流程，无额外预热逻辑。
+    if (diskQueue_) {
+        std::vector<PdhArrayItem> queue;
+        if (PdhFmtArrayDouble(diskQueue_, &queue)) {
+            double qSum = 0.0, qTotal = 0.0;
+            bool sawDiskQ = false, sawTotalQ = false;
+            for (const PdhArrayItem& it : queue) {
+                if (!it.valid) continue;
+                if (IsTotalInstance(it.name)) {
+                    qTotal = it.value;
+                    sawTotalQ = true;
+                } else {
+                    qSum += it.value;
+                    sawDiskQ = true;
+                }
+            }
+            if (sawDiskQ || sawTotalQ) {
+                out->diskQueueDepth = sawDiskQ ? qSum : qTotal;
+            }
+        }
+    }
 }
 
-// 网络吞吐：对所有非回环、
-// 处于运行状态的接口取 GetIfTable2 字节差值。
+// 网络吞吐：对所有非回环、处于运行状态的接口取 GetIfTable2 字节差值。
+// 总量（netRecvBps/netSendBps）之外，Phase D 起同时产出每适配器差分
+//（SystemInfo::netAdapters，仅 Up 非回环；名称取 MIB_IF_ROW2.Alias 即
+// 适配器友好名，typeLabel 复用 AdapterInfo 的 IfTypeLabel 映射——不引入
+// 第二张 IF_TYPE 表，也不需要 30s 友好名缓存，因为 GetIfTable2 每拍
+// 已原样带回 Alias）。
 void SystemCollector::CollectNet(SystemInfo* out, double elapsedSec) {
     MIB_IF_TABLE2* tbl = nullptr;
     if (::GetIfTable2(&tbl) != NO_ERROR) return;  // 保留先前值/kUnavail
     uint64_t recv = 0, send = 0;
+    std::vector<SystemInfo::AdapterThroughput> adapters;
+    std::unordered_map<uint64_t, uint64_t> curRecv, curSend;
     for (ULONG i = 0; i < tbl->NumEntries; ++i) {
         const MIB_IF_ROW2& r = tbl->Table[i];
         if (r.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
         if (r.OperStatus != IfOperStatusUp) continue;
         recv += r.InOctets;
         send += r.OutOctets;
+        const uint64_t ifIdx = static_cast<uint64_t>(r.InterfaceIndex);
+        curRecv[ifIdx] = r.InOctets;
+        curSend[ifIdx] = r.OutOctets;
+        SystemInfo::AdapterThroughput a;
+        a.ifIndex = ifIdx;
+        a.name = r.Alias[0] != L'\0' ? std::wstring(r.Alias)
+                                     : (r.Description[0] != L'\0'
+                                            ? std::wstring(r.Description)
+                                            : Fmt(L"接口 {}", ifIdx));
+        a.typeLabel = IfTypeLabel(r.Type);
+        // 首拍无基线、新出现接口、或计数回退（驱动重置/掉卡）——该接口
+        // 本 tick 速率 kUnavail（防无符号差下溢出假尖峰），下一拍恢复。
+        if (haveAdapterPrev_ && elapsedSec > 0.0) {
+            const auto pr = prevRecvByIf_.find(ifIdx);
+            const auto ps = prevSendByIf_.find(ifIdx);
+            if (pr != prevRecvByIf_.end() && r.InOctets >= pr->second) {
+                a.recvBps = static_cast<double>(r.InOctets - pr->second) / elapsedSec;
+            }
+            if (ps != prevSendByIf_.end() && r.OutOctets >= ps->second) {
+                a.sendBps = static_cast<double>(r.OutOctets - ps->second) / elapsedSec;
+            }
+        }
+        adapters.push_back(std::move(a));
     }
     ::FreeMibTable(tbl);
+    out->netAdapters = std::move(adapters);
+    prevRecvByIf_ = std::move(curRecv);
+    prevSendByIf_ = std::move(curSend);
+    haveAdapterPrev_ = true;
     if (haveNetPrev_ && elapsedSec > 0.0) {
         // 接口集合变化（VPN 断开、网卡热拔、计数器重置）会使
         // 字节总和无符号差回绕到约 1.8e19，

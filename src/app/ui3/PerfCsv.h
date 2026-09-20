@@ -21,11 +21,11 @@ namespace stm {
 namespace ui3 {
 
 // 列：时间, CPU%, 核心0%..核心N-1%, 内存可用B, 内存提交B, 磁盘读B/s, 磁盘写B/s,
-//     网络收B/s, 网络发B/s, GPU利用率%
+//     网络收B/s, 网络发B/s, GPU利用率%, 磁盘队列
 inline std::wstring PerfCsvHeader(size_t coreCount) {
     std::wstring h = L"时间,CPU%";
     for (size_t i = 0; i < coreCount; ++i) h += Fmt(L",核心{}%", i);
-    h += L",内存可用B,内存提交B,磁盘读B/s,磁盘写B/s,网络收B/s,网络发B/s,GPU利用率%";
+    h += L",内存可用B,内存提交B,磁盘读B/s,磁盘写B/s,网络收B/s,网络发B/s,GPU利用率%,磁盘队列";
     return h;
 }
 
@@ -65,6 +65,9 @@ inline std::wstring PerfCsvRow(const Snapshot& s, const std::wstring& localTime)
     } else {
         AppendCell(row, std::wstring());
     }
+    // Phase C：磁盘队列深度（PDH Current Disk Queue Length 合计）；
+    // 本机无此计数器 -> kUnavail -> 空单元格（绝不写 0 冒充数据）。
+    AppendDouble(row, s.sys.diskQueueDepth, false);
     return row;
 }
 

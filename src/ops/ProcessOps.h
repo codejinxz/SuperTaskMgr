@@ -26,7 +26,7 @@ struct TreeResult {
 bool TerminateProcessById(const ProcKey& key, std::wstring* err);
 
 // 仅规划的后代枚举（纯快照遍历；无副作用）。
-// Used by the UI confirm dialog: "预计 N 个（执行时可能变化）".
+// UI 确认框用：展示"预计 N 个（执行时可能变化）"。
 bool PlanTerminateTree(const ProcKey& root, std::vector<ProcKey>* out, std::wstring* err);
 
 // 先叶子后根地终止根 + 后代，带重新快照与逐成员复核。
