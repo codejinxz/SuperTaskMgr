@@ -21,6 +21,7 @@
 #include "app/ui3/PcapUi.h"  // C2: 深度抓包区纯逻辑（HexDump/BPF 提示/行摘要/CSV）
 #include "app/ui3/PageHelpers.h"
 #include "app/ui3/PageLayout.h"  // M2: 顶栏位置固定的定高区/可见集合纯函数
+#include "app/ui3/ThemeCfg.h"    // P1③: netcol_* 列宽键登记/软删除（纯函数）
 #include "app/ui/Pages.h"
 #include "app/ui/ConfirmAction.h"
 #include "app/ui/UiText.h"
@@ -37,6 +38,7 @@
 #include "ops/Signature.h"
 #include "ops/StartupOps.h"
 #include "imgui.h"
+#include "imgui_internal.h"  // P1③: ImGuiTable 列宽回读（GetCurrentTable）
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -58,6 +60,7 @@ namespace ui3 {
 // 共享槽位（定义在文件底部；匿名命名空间内使用）。
 std::shared_ptr<AppContext>& P3Slot();
 BalloonSink& SinkSlot();
+std::shared_ptr<AppContext> LiveP3Ctx();
 
 namespace {
 
@@ -83,6 +86,69 @@ void PushNote(AppContext& ctx, Notification::Kind kind, const std::wstring& text
 std::wstring FailSuffix(bool elevated) {
     return elevated ? std::wstring()
                     : std::wstring(L"（可能需要管理员权限，可尝试提权重启）");
+}
+
+// ===========================================================================
+// P1③：网络页/适配器明细表格列宽持久化（cfg netcol_<表名>_<列>）。
+// 背景：io.IniFilename = nullptr（布局持久化由应用自己的配置负责），ImGui
+// 自身的表格列宽记忆不落盘 —— 表格虽已 Resizable，重启后即回默认宽，用户
+// 感知为「列宽不能调整」。键名生成/登记见 ThemeCfg.h::NetColCfgKey（纯函数，
+// stm_selftest 覆盖）。用法（每表三步）：
+//   float* w = NetColWidths("netconn", kDefs, 6);   // 惰性从 cfg 加载
+//   TableSetupColumn(…, WidthFixed, w[2]);          // 固定列用缓存宽
+//   NetColSaveWidths("netconn", 6);                 // EndTable 前 ~1Hz 回写
+// 拉伸列（WidthStretch）不在持久化范围：缓存槽保持默认权重原样透传。
+// ===========================================================================
+
+constexpr int kNetColMaxCols = 12;
+
+struct NetColCache {
+    float w[kNetColMaxCols] = {};
+    bool loaded = false;
+    uint64_t loadedGen = 0;  // V29-P1-1：布局重置代际，变化即失效重读
+};
+
+// 表级缓存（惰性加载；UI 单线程，static 局部安全）。
+NetColCache& NetColCacheFor(const char* table) {
+    static std::map<std::string, NetColCache> caches;
+    return caches[table];
+}
+
+float* NetColWidths(const char* table, const float* defaults, int count) {
+    NetColCache& c = NetColCacheFor(table);
+    const uint64_t gen = ui3::LayoutResetGeneration();
+    if (!c.loaded || c.loadedGen != gen) {
+        c.loaded = true;
+        c.loadedGen = gen;
+        std::shared_ptr<AppContext> app = LiveP3Ctx();
+        for (int i = 0; i < count && i < kNetColMaxCols; ++i) {
+            c.w[i] = defaults[i];
+            if (app) {
+                c.w[i] = static_cast<float>(
+                    app->cfg.GetDouble(NetColCfgKey(table, i), defaults[i]));
+            }
+        }
+    }
+    return c.w;
+}
+
+// EndTable 前调用：回读 ImGui 表的每列实际宽（WidthGiven），变化时写回 cfg
+//（SetDouble 是内存写，文件在退出时统一保存 —— 与 ProcessesPage::PersistWidths
+// 同一模式；拖动停止才产生变化，频率自然受限）。
+// persistMask：与列数等长的掩码，false = 拉伸列（不持久化）。
+void NetColSaveWidths(const char* table, int count, const bool* persistMask) {
+    ImGuiTable* t = ImGui::GetCurrentTable();
+    if (t == nullptr) return;
+    NetColCache& c = NetColCacheFor(table);
+    std::shared_ptr<AppContext> app = LiveP3Ctx();
+    if (!app) return;
+    for (int i = 0; i < count && i < kNetColMaxCols; ++i) {
+        if (persistMask != nullptr && !persistMask[i]) continue;  // 拉伸列跳过
+        const float w = t->Columns[i].WidthGiven;
+        if (w <= 0.01f || w == c.w[i]) continue;
+        c.w[i] = w;
+        app->cfg.SetDouble(NetColCfgKey(table, i), static_cast<double>(w));
+    }
 }
 
 std::wstring LowerCopy(const std::wstring& s) {
@@ -368,14 +434,14 @@ private:
         if (!ImGui::CollapsingHeader(U8(L"实时监视"), ImGuiTreeNodeFlags_DefaultOpen)) return;
 
         // V28-P1-1（布局稳定化）：折叠头以下整段包进定高滚动段
-        //（高度 = kNetMonSectionHeight，选型理由见 NetMonUi.h）——
-        // 诚实边界行、「已丢弃 N 条」/「DNS 自动禁用」警告行（原画在定高
-        // 区外，随数据出现/消失增减页面行数）、开关/过滤行、连接事件表
+        //（高度 = kNetMonSectionHeight 经 P1④ 运行时缩放，选型理由见
+        // NetMonUi.h）—— 诚实边界行、「已丢弃 N 条」/「DNS 自动禁用」警告行
+        //（原画在定高区外，随数据出现/消失增减页面行数）、开关/过滤行、连接事件表
         //（空态单行↔300px 定高表互斥切换）、Top 远程目标表（原无定高，
         // ETW 聚合 0→20 行逐行下推 DNS 区）、DNS 表全部画进段内：任何
         // 数据变化只改变段内滚动量，绝不改变段外（深度抓包标题/工具栏/
         // 连接表标题）的 y 坐标。段内结构不变，「暂停显示」语义不变。
-        ImGui::BeginChild("##netmonsection", ImVec2(0.0f, kNetMonSectionHeight),
+        ImGui::BeginChild("##netmonsection", ImVec2(0.0f, Scaled(kNetMonSectionHeight)),
                           ImGuiChildFlags_None);
         // 诚实边界 + 丢弃警告。
         ImGui::TextWrapped("%s", U8(L"连接级监视：不捕获通信内容；远程聚合与 DNS 记录需要"
@@ -515,17 +581,24 @@ private:
         const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                           ImGuiTableFlags_SizingFixedFit;
-        ImGui::BeginChild("##nmevtchild", ImVec2(0.0f, 300.0f), ImGuiChildFlags_Borders);
+        // P1③：列宽 cfg 持久化（netcol_netmon_events_<列>）；进程列（3）为
+        // 拉伸列，缓存槽存默认权重、不持久化。
+        static constexpr float kDefCols[8] = {82.0f, 58.0f, 56.0f, 2.0f,
+                                              168.0f, 168.0f, 92.0f, 92.0f};
+        static constexpr bool kPersistCols[8] = {true, true, true, false,
+                                                 true, true, true, true};
+        float* w = NetColWidths("netmon_events", kDefCols, 8);
+        ImGui::BeginChild("##nmevtchild", ImVec2(0.0f, Scaled(300.0f)), ImGuiChildFlags_Borders);
         if (ImGui::BeginTable("netmon_events", 8, flags)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, 82.0f);
-            ImGui::TableSetupColumn(U8(L"事件"), ImGuiTableColumnFlags_WidthFixed, 58.0f);
-            ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed, 56.0f);
-            ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
-            ImGui::TableSetupColumn(U8(L"本地"), ImGuiTableColumnFlags_WidthFixed, 168.0f);
-            ImGui::TableSetupColumn(U8(L"远程"), ImGuiTableColumnFlags_WidthFixed, 168.0f);
-            ImGui::TableSetupColumn(U8(L"服务"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
-            ImGui::TableSetupColumn(U8(L"状态"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, w[0]);
+            ImGui::TableSetupColumn(U8(L"事件"), ImGuiTableColumnFlags_WidthFixed, w[1]);
+            ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed, w[2]);
+            ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, w[3]);
+            ImGui::TableSetupColumn(U8(L"本地"), ImGuiTableColumnFlags_WidthFixed, w[4]);
+            ImGui::TableSetupColumn(U8(L"远程"), ImGuiTableColumnFlags_WidthFixed, w[5]);
+            ImGui::TableSetupColumn(U8(L"服务"), ImGuiTableColumnFlags_WidthFixed, w[6]);
+            ImGui::TableSetupColumn(U8(L"状态"), ImGuiTableColumnFlags_WidthFixed, w[7]);
             ImGui::TableHeadersRow();
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(viewEvents_.size()));
@@ -558,6 +631,7 @@ private:
                     ImGui::PopID();
                 }
             }
+            NetColSaveWidths("netmon_events", 8, kPersistCols);
             ImGui::EndTable();
         }
         ImGui::EndChild();
@@ -580,14 +654,19 @@ private:
             ImGui::TextColored(ColMuted(), "%s", U8(L"暂无端点聚合数据（等待本机网络流量…）"));
             return;
         }
-        const int flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+        // P1③：本表原先无 Resizable（列宽完全锁死），连同持久化一并补齐。
+        const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerH |
                           ImGuiTableFlags_SizingFixedFit;
+        static constexpr float kDefCols[5] = {190.0f, 100.0f, 2.0f, 100.0f, 100.0f};
+        static constexpr bool kPersistCols[5] = {true, true, false, true, true};
+        float* w = NetColWidths("netmon_top", kDefCols, 5);
         if (!ImGui::BeginTable("netmon_top", 5, flags)) return;
-        ImGui::TableSetupColumn(U8(L"远程:端口"), ImGuiTableColumnFlags_WidthFixed, 190.0f);
-        ImGui::TableSetupColumn(U8(L"服务"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
-        ImGui::TableSetupColumn(U8(L"↓入"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn(U8(L"↑出"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn(U8(L"远程:端口"), ImGuiTableColumnFlags_WidthFixed, w[0]);
+        ImGui::TableSetupColumn(U8(L"服务"), ImGuiTableColumnFlags_WidthFixed, w[1]);
+        ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, w[2]);
+        ImGui::TableSetupColumn(U8(L"↓入"), ImGuiTableColumnFlags_WidthFixed, w[3]);
+        ImGui::TableSetupColumn(U8(L"↑出"), ImGuiTableColumnFlags_WidthFixed, w[4]);
         ImGui::TableHeadersRow();
         for (size_t i = 0; i < res->data.size(); ++i) {
             const stm::RemoteTraffic& t = res->data[i];
@@ -610,6 +689,7 @@ private:
             ImGui::TextUnformatted(U8(FormatBytes(static_cast<uint64_t>(t.bytesOut))));
             ImGui::PopID();
         }
+        NetColSaveWidths("netmon_top", 5, kPersistCols);
         ImGui::EndTable();
     }
 
@@ -623,12 +703,17 @@ private:
         const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                           ImGuiTableFlags_SizingFixedFit;
-        ImGui::BeginChild("##nmdnschild", ImVec2(0.0f, 170.0f), ImGuiChildFlags_Borders);
+        // P1③：列宽 cfg 持久化（netcol_netmon_dns_<列>）；进程/域名两列为
+        // 拉伸列，不持久化。
+        static constexpr float kDefCols[3] = {82.0f, 1.4f, 2.6f};
+        static constexpr bool kPersistCols[3] = {true, false, false};
+        float* w = NetColWidths("netmon_dns", kDefCols, 3);
+        ImGui::BeginChild("##nmdnschild", ImVec2(0.0f, Scaled(170.0f)), ImGuiChildFlags_Borders);
         if (ImGui::BeginTable("netmon_dns", 3, flags)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, 82.0f);
-            ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 1.4f);
-            ImGui::TableSetupColumn(U8(L"查询域名"), ImGuiTableColumnFlags_WidthStretch, 2.6f);
+            ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed, w[0]);
+            ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, w[1]);
+            ImGui::TableSetupColumn(U8(L"查询域名"), ImGuiTableColumnFlags_WidthStretch, w[2]);
             ImGui::TableHeadersRow();
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(viewDns_.size()));
@@ -650,6 +735,7 @@ private:
                     ImGui::PopID();
                 }
             }
+            NetColSaveWidths("netmon_dns", 3, kPersistCols);
             ImGui::EndTable();
         }
         ImGui::EndChild();
@@ -831,12 +917,12 @@ private:
         }
 
         // V28-P1-1（与实时监视段同原则）：展开后的整段包进定高滚动段
-        //（kPcapSectionHeight）—— 启动失败错误行、「已捕获…」统计行、包表
-        // 空态单行↔300px 定高表互斥切换、选中包详情（徽标行/截断警告/hex
-        // 视图 190px）的出现/消失全部由段内滚动消化，工具栏与连接表标题
-        // 不再被顶动。折叠头保留（用户折叠 = 主动行为）；未安装分支为静态
+        //（kPcapSectionHeight 经 P1④ 运行时缩放）—— 启动失败错误行、「已捕获…」
+        // 统计行、包表空态单行↔300px 定高表互斥切换、选中包详情（徽标行/截断
+        // 警告/hex 视图 190px）的出现/消失全部由段内滚动消化，工具栏与连接表
+        // 标题不再被顶动。折叠头保留（用户折叠 = 主动行为）；未安装分支为静态
         // 指引（仅「重新检测」用户动作可改变），无数据驱动抖动，保持段外。
-        ImGui::BeginChild("##pcapsection", ImVec2(0.0f, kPcapSectionHeight),
+        ImGui::BeginChild("##pcapsection", ImVec2(0.0f, Scaled(kPcapSectionHeight)),
                           ImGuiChildFlags_None);
         DrawPcapBody(ctx);
         ImGui::EndChild();
@@ -1011,20 +1097,25 @@ private:
         const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                           ImGuiTableFlags_SizingFixedFit;
-        ImGui::BeginChild("##pcapchild", ImVec2(0.0f, 300.0f),
+        // P1③：列宽 cfg 持久化（netcol_pcap_pkts_<列>）；源→目的/信息两列
+        // 为拉伸列，不持久化。
+        static constexpr float kDefCols[5] = {118.0f, 2.0f, 84.0f, 66.0f, 3.0f};
+        static constexpr bool kPersistCols[5] = {true, false, true, true, false};
+        float* w = NetColWidths("pcap_pkts", kDefCols, 5);
+        ImGui::BeginChild("##pcapchild", ImVec2(0.0f, Scaled(300.0f)),
                           ImGuiChildFlags_Borders);
         if (ImGui::BeginTable("pcap_pkts", 5, flags)) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableSetupColumn(U8(L"时间"), ImGuiTableColumnFlags_WidthFixed,
-                                    118.0f);
+                                    w[0]);
             ImGui::TableSetupColumn(U8(L"源 → 目的"),
-                                    ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                                    ImGuiTableColumnFlags_WidthStretch, w[1]);
             ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed,
-                                    84.0f);
+                                    w[2]);
             ImGui::TableSetupColumn(U8(L"长度"), ImGuiTableColumnFlags_WidthFixed,
-                                    66.0f);
+                                    w[3]);
             ImGui::TableSetupColumn(U8(L"信息"), ImGuiTableColumnFlags_WidthStretch,
-                                    3.0f);
+                                    w[4]);
             ImGui::TableHeadersRow();
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(pktsAll_.size()));
@@ -1064,6 +1155,7 @@ private:
                     ImGui::PopID();
                 }
             }
+            NetColSaveWidths("pcap_pkts", 5, kPersistCols);
             ImGui::EndTable();
         }
         ImGui::EndChild();
@@ -1300,6 +1392,7 @@ private:
         }
         // M2：卡片可能超出下方定高区 —— 行内提示（SameLine：出现/消失
         // 不增减行数，头部行高恒定是「顶栏不移动」契约的一部分）。
+        // P1④：定高上限按运行时布局缩放（可用高度退化语义不变）。
         if (res != nullptr && AdapterCardsOverflowHint(*res)) {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", U8(L"卡片较多，在列表框内滚动查看"));
@@ -1310,9 +1403,11 @@ private:
         // AdapterRegionHeight）滚动区 —— 适配器数量增减、「更多适配器」
         // 展开/折叠、加载/错误态都只改变区内滚动量，绝不改变区外任何
         // 元素的 y 坐标，下方的实时监视/深度抓包/连接表不再被顶动。
+        // P1④：定高按运行时布局缩放（缩放=1 时与原常量逐位一致）。
         ImGui::BeginChild(
             "##adapters",
-            ImVec2(0.0f, AdapterRegionHeight(ImGui::GetContentRegionAvail().y)),
+            ImVec2(0.0f, AdapterRegionHeightScaled(ImGui::GetContentRegionAvail().y,
+                                                   ui3::LayoutScale())),
             ImGuiChildFlags_Borders);
         if (res == nullptr) {
             DrawLoading();
@@ -1329,6 +1424,7 @@ private:
     // 卡区溢出行内提示的估算（公式在 PageLayout.h，ui_m2_test 覆盖）：
     // 每张非回环卡片 = 1 标题行 + 6 基线明细行 + 超出基线的额外 IPv6 行；
     // 总高含卡片间条目间距。仅决定提示文字是否出现，不参与真实布局。
+    // P1④：定高与缩放后的真实卡区保持一致。
     bool AdapterCardsOverflowHint(const AdapterResult& res) const {
         const float rowH = ImGui::GetTextLineHeightWithSpacing();
         std::vector<int> extraRows;
@@ -1336,7 +1432,7 @@ private:
         for (const stm::AdapterNetInfo& a : res.data) {
             if (a.isLoopback) continue;
             int v6 = 0;
-            for (const stm::AdapterAddressEntry& e : a.addresses) {
+            for (const AdapterAddressEntry& e : a.addresses) {
                 if (e.family != L"IPv4" && !e.ip.empty()) ++v6;
             }
             extraRows.push_back(v6 > 0 ? v6 - 1 : 0);  // 基线明细已含 1 行 IPv6
@@ -1344,7 +1440,9 @@ private:
         const float totalH = AdapterCardsTotalHeight(
             rowH, extraRows.data(), static_cast<int>(extraRows.size()));
         return AdapterCardsOverflow(
-            AdapterRegionHeight(ImGui::GetContentRegionAvail().y), totalH);
+            AdapterRegionHeightScaled(ImGui::GetContentRegionAvail().y,
+                                      ui3::LayoutScale()),
+            totalH);
     }
 
     // 定高卡区内部：部分失败警告 + 主/更多适配器分区（纯逻辑判定在
@@ -1601,14 +1699,19 @@ private:
         const int flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                           ImGuiTableFlags_SizingFixedFit;
+        // P1③：列宽 cfg 持久化（netcol_netconn_<列>）；进程名列（5）为
+        // 拉伸列，不持久化。
+        static constexpr float kDefCols[6] = {64.0f, 210.0f, 210.0f, 100.0f, 76.0f, 1.5f};
+        static constexpr bool kPersistCols[6] = {true, true, true, true, true, false};
+        float* w = NetColWidths("netconn", kDefCols, 6);
         if (!ImGui::BeginTable("netconn", 6, flags)) return;
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed, 64.0f);
-        ImGui::TableSetupColumn(U8(L"本地地址:端口"), ImGuiTableColumnFlags_WidthFixed, 210.0f);
-        ImGui::TableSetupColumn(U8(L"远程地址:端口"), ImGuiTableColumnFlags_WidthFixed, 210.0f);
-        ImGui::TableSetupColumn(U8(L"状态"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn(U8(L"PID"), ImGuiTableColumnFlags_WidthFixed, 76.0f);
-        ImGui::TableSetupColumn(U8(L"进程名"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(U8(L"协议"), ImGuiTableColumnFlags_WidthFixed, w[0]);
+        ImGui::TableSetupColumn(U8(L"本地地址:端口"), ImGuiTableColumnFlags_WidthFixed, w[1]);
+        ImGui::TableSetupColumn(U8(L"远程地址:端口"), ImGuiTableColumnFlags_WidthFixed, w[2]);
+        ImGui::TableSetupColumn(U8(L"状态"), ImGuiTableColumnFlags_WidthFixed, w[3]);
+        ImGui::TableSetupColumn(U8(L"PID"), ImGuiTableColumnFlags_WidthFixed, w[4]);
+        ImGui::TableSetupColumn(U8(L"进程名"), ImGuiTableColumnFlags_WidthStretch, w[5]);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
@@ -1667,6 +1770,7 @@ private:
                 ImGui::PopID();
             }
         }
+        NetColSaveWidths("netconn", 6, kPersistCols);
         ImGui::EndTable();
     }
 
@@ -2570,11 +2674,25 @@ public:
         // 页高 → 父级永不出现滚动条。分组内容增减（温度条目出现/消失、
         // LHM 行合入、组显隐切换、加载/错误/说明行）只改变区内滚动量，
         // 绝不改变区外任何元素的 y 坐标 → 页头不再随内容上下移动。
-        ImGui::BeginChild(
-            "##sensorgroups",
-            ImVec2(0.0f, SensorGroupsRegionHeight(ImGui::GetContentRegionAvail().y)),
-            ImGuiChildFlags_None);
+        // P1④：定高按运行时布局缩放。
+        // P1⑤（用户报告「传感器页底部有一个白色块」）：本区位于页尾、其下
+        // 无内容 —— 过去内容不足时定高区（上限 600px）露出大片空白底（各
+        // 主题/壁纸组合下都可能被读作一块无意义的「白色残块」）。现按上一帧
+        // 实测内容高收缩（FixedRegionShrinkToContent，纯函数）：内容不足时
+        // 区高 = 内容高（空白消失，且不影响区外任何元素的 y 坐标 —— 顶栏
+        // 固定契约不破）；内容超出时仍为定高滚动（M2 语义不变）。首帧内容
+        // 未知时用定高（下一帧即收缩，仅一次性）。
+        const float regionH = SensorGroupsRegionHeightScaled(
+            ImGui::GetContentRegionAvail().y, ui3::LayoutScale());
+        const float contentH =
+            sensorBodyContentY_ > 0.0f
+                ? sensorBodyContentY_ + ImGui::GetStyle().WindowPadding.y
+                : 0.0f;  // 首帧未知 → 用定高
+        ImGui::BeginChild("##sensorgroups",
+                          ImVec2(0.0f, FixedRegionShrinkToContent(regionH, contentH)),
+                          ImGuiChildFlags_None);
         DrawSensorBody(ctx, res);
+        sensorBodyContentY_ = ImGui::GetCursorPosY();  // 内容底（含滚动偏移）
         ImGui::EndChild();
     }
 
@@ -3151,6 +3269,9 @@ private:
     bool lhmOn_ = false;       // 已校验状态（探测通过），持久化于 cfg
     uint16_t lhmPort_ = 8085;
     uint64_t lastFrame_ = kNeverDrawn;
+    // P1⑤：##sensorgroups 上一帧的内容底 y（含滚动偏移的内容空间实测）；
+    // 0 = 尚未测得（首帧用定高）。
+    float sensorBodyContentY_ = 0.0f;
 };
 
 // ===========================================================================

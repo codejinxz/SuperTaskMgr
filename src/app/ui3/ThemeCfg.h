@@ -12,6 +12,7 @@
 // ============================================================================
 #include "app/ui/SortKey.h"
 #include "core/Cfg.h"
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -44,11 +45,88 @@ inline void SoftDeleteColWidthKeys(Config& cfg) {
     }
 }
 
-// 从 config.json 剔除 colW_* 键。onlyEmptyValues=true 只剔软删除残留（值为 ""
-// 的行）；false 剔除全部 colW_* 行（点击「恢复默认列宽」时磁盘值本就是上一
-// 次运行的旧宽度，直接全剔）。行格式不认识的文件（手工编辑过）不动、返回 -1。
+// ----------------------------------------------------------------------------
+// P1③：网络页/适配器明细表格列宽持久化（netcol_<表名>_<列>）。
+// ImGui 自身布局因 io.IniFilename = nullptr 不落盘，列宽经 cfg 持久化；
+// 表名/列序与 Pages3.cpp / Pages.cpp 中 BeginTable 的 TableSetupColumn
+// 一一对应（见 NetColTableSpecs）。拉伸列（WidthStretch）不持久化。
+// ----------------------------------------------------------------------------
+// 键名生成：表名为 ASCII（BeginTable 的 id），逐字节升宽拼接
+//（const char* 不能直接 operator+ 到 wstring）。
+inline std::wstring NetColCfgKey(const char* table, int col) {
+    std::wstring k = L"netcol_";
+    for (const char* p = table; *p != '\0'; ++p) {
+        k += static_cast<wchar_t>(*p);
+    }
+    k += L'_';
+    k += std::to_wstring(col);
+    return k;
+}
+
+inline std::wstring NetColCfgKeyPrefix() { return L"netcol_"; }
+
+// 登记的 netcol 表清单（id 与 BeginTable 第一参一致；cols=固定列数上限，
+// 覆盖全部列号，拉伸列在写入端跳过）。新增持久化列宽的表：先改这里。
+struct NetColTableSpec {
+    const char* id;
+    int cols;
+};
+
+inline const NetColTableSpec* NetColTableSpecs(int* count) {
+    static const NetColTableSpec kSpecs[] = {
+        {"netmon_events", 8},  // 实时监视·连接事件表
+        {"netmon_top", 5},     // 实时监视·Top 远程目标表
+        {"netmon_dns", 3},     // 实时监视·DNS 解析记录表
+        {"pcap_pkts", 5},      // 深度抓包表
+        {"netconn", 6},        // 连接表
+        {"gpuadapters", 4},    // 性能页·GPU 适配器明细
+        {"gpuprocs", 4},       // 性能页·GPU 进程明细
+    };
+    if (count != nullptr) *count = static_cast<int>(sizeof(kSpecs) / sizeof(kSpecs[0]));
+    return kSpecs;
+}
+
+// 全部 netcol_* 键（「重置布局」的软删除与剔除清单）。
+inline std::vector<std::wstring> NetColCfgKeys() {
+    std::vector<std::wstring> keys;
+    int n = 0;
+    const NetColTableSpec* specs = NetColTableSpecs(&n);
+    for (int t = 0; t < n; ++t) {
+        for (int c = 0; c < specs[t].cols; ++c) {
+            keys.push_back(NetColCfgKey(specs[t].id, c));
+        }
+    }
+    return keys;
+}
+
+// ----------------------------------------------------------------------------
+// P1④：「重置布局」的键清单 —— 布局缩放/进程表列顺序/进程表列宽/网络表
+// 列宽/性能页放大块。全部软删除 + 从 config.json 剔除。
+// ----------------------------------------------------------------------------
+inline std::vector<std::wstring> LayoutResetExactKeys() {
+    return {std::wstring(L"layoutScale"), std::wstring(L"colOrder"),
+            std::wstring(L"perfZoom")};
+}
+
+inline void SoftDeleteLayoutKeys(Config& cfg) {
+    SoftDeleteColWidthKeys(cfg);
+    for (const std::wstring& k : NetColCfgKeys()) {
+        cfg.SetString(k, L"");
+    }
+    for (const std::wstring& k : LayoutResetExactKeys()) {
+        cfg.SetString(k, L"");
+    }
+}
+
+// 从 config.json 剔除键：键名等于 exactKeys 之一，或以 prefixes 之一开头。
+// onlyEmptyValues=true 只剔软删除残留（值为 "" 的行）；false 剔除全部匹配行
+//（点击「恢复默认列宽」时磁盘值本就是上一次运行的旧宽度，直接全剔）。
+// 行格式不认识的文件（手工编辑过）不动、返回 -1。
 // 返回剔除的行数；文件不存在返回 0。
-inline int StripColWidthKeysFromFile(const std::wstring& cfgPath, bool onlyEmptyValues) {
+inline int StripCfgKeysFromFile(const std::wstring& cfgPath,
+                                const std::vector<std::string>& prefixes,
+                                const std::vector<std::string>& exactKeys,
+                                bool onlyEmptyValues) {
     FILE* f = nullptr;
     if (_wfopen_s(&f, cfgPath.c_str(), L"rb") != 0 || f == nullptr) return 0;
     std::string u8;
@@ -67,8 +145,6 @@ inline int StripColWidthKeysFromFile(const std::wstring& cfgPath, bool onlyEmpty
         pos = end;
     }
 
-    constexpr const char* kPrefix = "colW_";
-    constexpr size_t kPrefixLen = 5;  // strlen("colW_")（sizeof 陷阱：kPrefix 是指针）
     int removed = 0;
     std::string out;
     out.reserve(u8.size());
@@ -82,7 +158,7 @@ inline int StripColWidthKeysFromFile(const std::wstring& cfgPath, bool onlyEmpty
             continue;
         }
         if (c0 != '"') return -1;  // 不认识的形状：放弃重写（宁缺毋滥，绝不截断）
-        // 找到 key 的结束引号（容忍 \" 转义；colW_* 键本身无转义，前缀按原字节匹配）
+        // 找到 key 的结束引号（容忍 \" 转义；本清单键本身无转义，按原字节匹配）
         size_t q = b + 1;
         while (q < line.size()) {
             if (line[q] == '\\') { q += 2; continue; }
@@ -100,9 +176,17 @@ inline int StripColWidthKeysFromFile(const std::wstring& cfgPath, bool onlyEmpty
             --ve;
         }
         const std::string rawValue = line.substr(vb, ve - vb);
-        const bool isColW = rawKey.compare(0, kPrefixLen, kPrefix) == 0;
+        bool isMatch = false;
+        for (const std::string& p : prefixes) {
+            if (rawKey.compare(0, p.size(), p) == 0) { isMatch = true; break; }
+        }
+        if (!isMatch) {
+            for (const std::string& k : exactKeys) {
+                if (rawKey == k) { isMatch = true; break; }
+            }
+        }
         const bool isEmptyValue = rawValue == "\"\"";  // Escape(L"") 的输出
-        if (isColW && (!onlyEmptyValues || isEmptyValue)) {
+        if (isMatch && (!onlyEmptyValues || isEmptyValue)) {
             ++removed;  // 丢弃该行
             continue;
         }
@@ -127,5 +211,31 @@ inline int StripColWidthKeysFromFile(const std::wstring& cfgPath, bool onlyEmpty
     return removed;
 }
 
+// 兼容入口：剔除 colW_*（进程表列宽）。语义同 StripCfgKeysFromFile。
+inline int StripColWidthKeysFromFile(const std::wstring& cfgPath, bool onlyEmptyValues) {
+    return StripCfgKeysFromFile(cfgPath, {"colW_"}, {}, onlyEmptyValues);
+}
+
+// P1④：「重置布局」剔除 —— colW_* / netcol_* 前缀 + layoutScale/colOrder/
+// perfZoom 精确键，一次重写完成。
+inline int StripLayoutKeysFromFile(const std::wstring& cfgPath) {
+    return StripCfgKeysFromFile(cfgPath, {"colW_", "netcol_"},
+                                {"layoutScale", "colOrder", "perfZoom"}, false);
+}
+
+}  // namespace ui3
+}  // namespace stm
+
+// V29-P1-1：布局重置代际。「重置布局」时递增；NetCol/GpuCol 等列宽内存缓存
+// 记录 loadedGen 与之对比，变化即失效重读 cfg（否则重置后本次会话不回默认宽，
+// 且后续拖列会以旧宽为基线写回——与「已重置布局」的承诺矛盾）。
+namespace stm {
+namespace ui3 {
+inline std::atomic<uint64_t>& LayoutResetGen() {
+    static std::atomic<uint64_t> g{0};
+    return g;
+}
+inline uint64_t LayoutResetGeneration() { return LayoutResetGen().load(std::memory_order_acquire); }
+inline void NotifyLayoutReset() { LayoutResetGen().fetch_add(1, std::memory_order_release); }
 }  // namespace ui3
 }  // namespace stm

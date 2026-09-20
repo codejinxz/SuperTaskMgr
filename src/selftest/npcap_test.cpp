@@ -139,7 +139,11 @@ STM_TEST(npcap_detect) {
             *err = L"ListDevices 返回了空设备名";
             return false;
         }
-        if (!d.loopback && d.name.find(L"\\Device\\NPF\\") == std::wstring::npos &&
+        // P1 登记（本文件外维护轮改动）：原断言误写为 "\\Device\\NPF\\"（带
+        // 尾斜杠），真实 Npcap 设备名是 "\Device\NPF_{GUID}"（下划线）—— 装
+        // 了 Npcap 的机器上该用例必挂。改为前缀 "\\Device\\NPF"（原意即前缀
+        // 匹配），`\Device\Npcap` 旧式保留。
+        if (!d.loopback && d.name.find(L"\\Device\\NPF") == std::wstring::npos &&
             d.name.find(L"\\Device\\Npcap") == std::wstring::npos) {
             *err = L"设备名不符合 NPF/Npcap 命名：" + d.name;
             return false;

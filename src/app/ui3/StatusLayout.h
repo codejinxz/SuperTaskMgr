@@ -27,6 +27,8 @@
 
 #include <cstdio>
 #include <cstddef>
+#include <cstring>
+#include <string>
 
 namespace stm {
 namespace ui {
@@ -98,6 +100,73 @@ inline float PipeSlotWidth(float pipeW, float spacing, float textW) {
 }
 
 // ---- 槽位坐标（纯）--------------------------------------------------------
+
+// ---- 锚点段截断（P1①，纯）------------------------------------------------
+// 根因补充（用户报告①「完整采集模式…与相邻槽位叠在一起」）：DrawStatusBar
+// 过去用 `GetCursorPosX()` 在绘制锚点文本（「完整模式」/「兼容模式：<原因>」）
+// 之后采集槽位起点 —— 而 ImGui 的 ItemSize 在每个条目绘制完成后把
+// CursorPos.x 重置回**行首**（imgui.cpp：`window->DC.CursorPos.x =
+// IM_TRUNC(window->Pos.x + Indent.x + ColumnsOffset.x)`），所以该值恒为
+// 行首（≈WindowPadding.x），与锚点文本的真实末端无关：定宽槽全部压在锚点
+// 文本上（降级原因越长叠得越明显）。修复契约：
+//   1. 锚点末端只能由 `起点 + 锚点文本实测宽` 计算（本文件
+//      AnchorEndX），绝不读回光标；
+//   2. 降级原因文本按可用宽度经 EllipsizeTextUtf8 截断加「…」，悬停
+//      tooltip 显示完整原因（完整信息另有兼容模式说明模态）；
+//   3. 无降级时只有紧凑的「完整模式」徽标，原因槽自然消失不占位。
+inline float AnchorEndX(float anchorStartX, float anchorTextW) {
+    return anchorStartX + (anchorTextW > 0.0f ? anchorTextW : 0.0f);
+}
+
+// UTF-8 感知的按宽截断：在 maxWidth 内找完整字符（码点）边界，放不下的
+// 尾部以「…」（U+2026，3 字节）收尾；首字符即超宽时只返回「…」。
+// measure(str) 返回整串实测宽（应用注入 ImGui::CalcTextSize；selftest 注入
+// 确定性字宽模型）。输出写 out（含 NUL，最多 outCap 字节），返回写入字节数
+//（不含 NUL）。非码点首字节（0x80-0xBF）按 ASCII 边界处理，绝越界不崩。
+template <typename MeasureF>
+inline int EllipsizeTextUtf8(const char* u8, float maxWidth, MeasureF&& measure,
+                             char* out, size_t outCap) {
+    if (outCap == 0) return 0;
+    out[0] = '\0';
+    if (u8 == nullptr || maxWidth <= 0.0f) return 0;
+    const size_t len = strlen(u8);
+    // 快路径：整串本来就放得下（含「…」比整串还宽的情形），原样保留。
+    if (measure(u8) <= maxWidth) {
+        const size_t n = len < outCap - 1 ? len : outCap - 1;
+        std::memcpy(out, u8, n);
+        out[n] = '\0';
+        return static_cast<int>(n);
+    }
+    const float ellW = measure("\xE2\x80\xA6");  // "…"
+    if (ellW > maxWidth) return 0;               // 连「…」都放不下：什么都不画
+    size_t keep = 0;                             // 可保留的字节数
+    while (keep < len) {
+        const unsigned char c = static_cast<unsigned char>(u8[keep]);
+        size_t step = 1;                          // 码点字节数（ASCII=1）
+        if (c >= 0xF0) step = 4;
+        else if (c >= 0xE0) step = 3;
+        else if (c >= 0xC0) step = 2;
+        if (keep + step > len) step = len - keep;  // 截断序列防御
+        // measure 只读入参（CalcTextSize / FakeMeasure）；std::string 拷贝
+        // 自带 NUL 结尾，无需触碰原串。
+        const float w = measure(std::string(u8, keep + step).c_str());
+        const float ellReserve = (keep + step < len) ? ellW : 0.0f;
+        if (w + ellReserve > maxWidth) break;
+        maxWidth -= w;
+        keep += step;
+    }
+    if (keep == 0) {                               // 一个字符都放不下
+        if (outCap < 4) return 0;
+        std::memcpy(out, "\xE2\x80\xA6", 3);
+        out[3] = '\0';
+        return 3;
+    }
+    const size_t n = keep < outCap - 4 ? keep : (outCap >= 4 ? outCap - 4 : 0);
+    std::memcpy(out, u8, n);
+    std::memcpy(out + n, "\xE2\x80\xA6", 3);
+    out[n + 3] = '\0';
+    return static_cast<int>(n + 3);
+}
 
 // 左段固定槽位：从 startX 自左向右布 count 个定宽槽（间隔 spacing）。
 // outX[i] = 槽 i 的绝对 x（与 ImGui::SameLine(offset) 的窗口相对坐标同系）。

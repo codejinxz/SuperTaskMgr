@@ -17,6 +17,7 @@
 #include "app/ui3/GcPages.h"      // F4: 崩溃记录/窗口页注册 + 宿主服务模态 + 热键
 #include "app/ui3/JumpState.h"    // F4#3: 跨页跳转槽
 #include "app/ui3/MemCleanup.h"   // P3 任务一: 一键内存优化候选/聚合（纯逻辑）
+#include "app/ui3/PageLayout.h"    // P1④: 运行时布局缩放 / P1⑤: 定高区收缩（纯函数）
 #include "app/ui3/Pages3.h"       // 第 3 阶段扩展标签 + 外壳钩子（增量式）
 #include "app/ui3/PerfChart.h"    // Phase A: 性能历史 Ring/时间窗/RingView 纯函数
 #include "app/ui3/PerfCsv.h"      // F4#7: 性能 CSV 记录
@@ -45,6 +46,7 @@
 #include <cwctype>
 #include <deque>
 #include <limits>
+#include <map>      // P1③: GPU 明细表列宽缓存（按表名）
 #include <memory>
 #include <mutex>
 #include <shellapi.h>
@@ -771,9 +773,12 @@ public:
         LoadPersistedOnce(ctx);
         // H-A: 外壳「外观→恢复默认列宽」置位世代号后，这里把 widths_ 拉回默认；
         // 表格 id 同步换代（DrawTable），ImGui 内部按 id 记忆的旧列宽随之丢弃。
+        // P1②：同一世代号也重置列显示顺序（默认恒等排列，并清待应用队列）。
         if (appliedResetGen_ != Ui().colWidthResetGen) {
             appliedResetGen_ = Ui().colWidthResetGen;
             for (int i = 0; i < kColCount; ++i) widths_[i] = kDefaultWidths[i];
+            ui::ProcColumnDefaultOrder(colOrderPending_, ui::kProcColSlots);
+            colOrderPendingValid_ = true;  // 换代表格上应用一次（回到默认序）
         }
         // F4#3: 消费跨页跳转（DrawShell 已把 activePage 切到本页）。找不到时诚实提示。
         if (Ui().jumpPendingPid != 0) {
@@ -846,6 +851,20 @@ private:
         }
         widths_[11] = static_cast<float>(ctx.cfg.GetDouble(L"colW_badges", kDefaultWidths[11]));
         widths_[12] = static_cast<float>(ctx.cfg.GetDouble(L"colW_desc", kDefaultWidths[12]));
+
+        // P1②：恢复上次会话的列显示顺序（UserID 逗号串）。非法/缺失保持
+        // 默认（恒等）顺序 —— 持久化值只在启动时消费一次。
+        {
+            const std::wstring saved = ctx.cfg.GetString(L"colOrder", L"");
+            int parsed[ui::kProcColSlots] = {};
+            if (!saved.empty() &&
+                ui::ProcColumnOrderFromCfg(saved.c_str(), parsed, ui::kProcColSlots) ==
+                    ui::kProcColSlots) {
+                for (int i = 0; i < ui::kProcColSlots; ++i) colOrderPending_[i] = parsed[i];
+                colOrderPendingValid_ = true;
+                colOrderLastSaved_ = saved;
+            }
+        }
         // P0-2（F2 评审）：描述（与名称）槽位存的是拉伸权重。
         // 旧构建曾把像素（数百）存进这些槽位，导致名称列每次启动
         // 都被压扁；任何 > 10 的旧值都不可能是权重。
@@ -1087,10 +1106,12 @@ private:
         // F4#4: 树形模式下禁用表头点击排序（全局排序降级为同级排序，UI 明示）。
         // H-A: 表格 id 带列宽重置世代号 —— 恢复默认后换代，ImGui 丢弃按 id
         // 记忆的旧列宽，SetupColumns 的默认值立即生效。
+        // P1②：ImGuiTableFlags_Reorderable 允许拖动表头重排列顺序。
         char tableId[32];
         snprintf(tableId, sizeof(tableId), "procs#%llu",
                  static_cast<unsigned long long>(Ui().colWidthResetGen));
-        const int tableFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+        const int tableFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
+                               ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                                ImGuiTableFlags_SizingFixedFit |
                                (treeMode_ ? 0 : ImGuiTableFlags_Sortable);
@@ -1100,18 +1121,26 @@ private:
         }
         ImGui::TableSetupScrollFreeze(0, 1);
         SetupColumns();
+        ApplyPersistedColumnOrderOnce();
         if (!treeMode_) ReflectPersistedSortOnce();
 
         if (!treeMode_) {
             if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
                 if (specs->SpecsDirty) {
-                    if (specs->SpecsCount > 0 && specs->Specs[0].ColumnIndex < static_cast<int>(ui::SortColumn::Count)) {
-                        // 排序键只在用户点击表头时变化。
-                        sortColumn_ = static_cast<ui::SortColumn>(specs->Specs[0].ColumnIndex);
-                        sortDesc_ = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
-                        Ui().sortColumn = sortColumn_;
-                        Ui().sortDesc = sortDesc_;
-                        PersistSort(ctx);
+                    // P1②：按 UserID（列槽位）映射排序键，绝不按显示序 ——
+                    // 拖动重排后 Specs[0].ColumnIndex 会随显示位置变化，
+                    // UserID 与列的逻辑身份的绑定不变。
+                    if (specs->SpecsCount > 0) {
+                        ui::SortColumn c;
+                        if (ui::ProcColumnFromUserId(
+                                static_cast<int>(specs->Specs[0].ColumnUserID), &c)) {
+                            sortColumn_ = c;
+                            sortDesc_ =
+                                specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                            Ui().sortColumn = sortColumn_;
+                            Ui().sortDesc = sortDesc_;
+                            PersistSort(ctx);
+                        }
                     }
                     specs->SpecsDirty = false;
                     rebuildNeeded_ = true;
@@ -1137,27 +1166,78 @@ private:
         }
 
         PersistWidths(ctx);
+        PersistColumnOrder(ctx);  // P1②：拖动重排后 ~1Hz 写回列顺序
         ImGui::EndTable();
     }
 
+    // P1②：列按槽位序提交，UserID = 槽位值（ui::ProcColumnUserId）。显示
+    // 顺序（拖动重排）由 ImGui 管理，与这里的提交顺序解耦；排序回调、
+    // widths_[] 与 colW_* 键全部按 UserID/槽位映射（见 SortKey.h 契约）。
     void SetupColumns() {
         ImGui::TableSetupColumn("##name", ImGuiTableColumnFlags_WidthStretch |
                                               ImGuiTableColumnFlags_NoHide |
-                                              ImGuiTableColumnFlags_NoClip, widths_[0]);
-        ImGui::TableSetupColumn(U8(L"PID"), ImGuiTableColumnFlags_WidthFixed, widths_[1]);
-        ImGui::TableSetupColumn(U8(L"CPU%"), ImGuiTableColumnFlags_WidthFixed, widths_[2]);
-        ImGui::TableSetupColumn(U8(L"内存"), ImGuiTableColumnFlags_WidthFixed, widths_[3]);
-        ImGui::TableSetupColumn(U8(L"提交"), ImGuiTableColumnFlags_WidthFixed, widths_[4]);
-        ImGui::TableSetupColumn(U8(L"磁盘"), ImGuiTableColumnFlags_WidthFixed, widths_[5]);
-        ImGui::TableSetupColumn(U8(L"网络"), ImGuiTableColumnFlags_WidthFixed, widths_[6]);
-        ImGui::TableSetupColumn(U8(L"硬故障/s"), ImGuiTableColumnFlags_WidthFixed, widths_[7]);
-        ImGui::TableSetupColumn(U8(L"句柄"), ImGuiTableColumnFlags_WidthFixed, widths_[8]);
-        ImGui::TableSetupColumn(U8(L"线程"), ImGuiTableColumnFlags_WidthFixed, widths_[9]);
-        ImGui::TableSetupColumn(U8(L"上下文切换/s"), ImGuiTableColumnFlags_WidthFixed, widths_[10]);
+                                              ImGuiTableColumnFlags_NoClip,
+                                widths_[0], static_cast<ImGuiID>(ui::ProcColumnUserId(0)));
+        ImGui::TableSetupColumn(U8(L"PID"), ImGuiTableColumnFlags_WidthFixed, widths_[1],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(1)));
+        ImGui::TableSetupColumn(U8(L"CPU%"), ImGuiTableColumnFlags_WidthFixed, widths_[2],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(2)));
+        ImGui::TableSetupColumn(U8(L"内存"), ImGuiTableColumnFlags_WidthFixed, widths_[3],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(3)));
+        ImGui::TableSetupColumn(U8(L"提交"), ImGuiTableColumnFlags_WidthFixed, widths_[4],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(4)));
+        ImGui::TableSetupColumn(U8(L"磁盘"), ImGuiTableColumnFlags_WidthFixed, widths_[5],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(5)));
+        ImGui::TableSetupColumn(U8(L"网络"), ImGuiTableColumnFlags_WidthFixed, widths_[6],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(6)));
+        ImGui::TableSetupColumn(U8(L"硬故障/s"), ImGuiTableColumnFlags_WidthFixed, widths_[7],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(7)));
+        ImGui::TableSetupColumn(U8(L"句柄"), ImGuiTableColumnFlags_WidthFixed, widths_[8],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(8)));
+        ImGui::TableSetupColumn(U8(L"线程"), ImGuiTableColumnFlags_WidthFixed, widths_[9],
+                                static_cast<ImGuiID>(ui::ProcColumnUserId(9)));
+        ImGui::TableSetupColumn(U8(L"上下文切换/s"), ImGuiTableColumnFlags_WidthFixed,
+                                widths_[10], static_cast<ImGuiID>(ui::ProcColumnUserId(10)));
         ImGui::TableSetupColumn(U8(L"徽标"), ImGuiTableColumnFlags_WidthFixed |
-                                                 ImGuiTableColumnFlags_NoSort, widths_[11]);
+                                                 ImGuiTableColumnFlags_NoSort,
+                                widths_[11], static_cast<ImGuiID>(ui::kProcColUserIdBadges));
         ImGui::TableSetupColumn(U8(L"描述"), ImGuiTableColumnFlags_WidthStretch |
-                                                 ImGuiTableColumnFlags_NoSort, widths_[12]);
+                                                 ImGuiTableColumnFlags_NoSort,
+                                widths_[12], static_cast<ImGuiID>(ui::kProcColUserIdDesc));
+    }
+
+    // P1②：把 cfg 恢复的显示顺序应用到 ImGui 表。每个表格 id 世代只应用一次
+    //（ImGui 自身的内存设置会在会话内记住拖动结果；这里只负责跨会话恢复）。
+    void ApplyPersistedColumnOrderOnce() {
+        if (!colOrderPendingValid_) return;
+        ImGuiTable* table = ImGui::GetCurrentTable();
+        if (table == nullptr) return;
+        colOrderPendingValid_ = false;
+        colOrderAppliedGen_ = Ui().colWidthResetGen;
+        // colOrderPending_[d] = 显示位置 d 处的列 UserID（== 提交序槽位）。
+        for (int d = 0; d < ui::kProcColSlots; ++d) {
+            const int slot = colOrderPending_[d];
+            if (slot < 0 || slot >= ui::kProcColSlots || slot == d) continue;
+            ImGui::TableSetColumnDisplayOrder(table, slot, d);  // imgui_internal
+        }
+    }
+
+    // P1②：拖动重排后把新的显示顺序写回 cfg（~1Hz 节流，与 PersistWidths
+    // 同一模式）。读 ImGui 表的提交序 → DisplayOrder，按显示位置排列 UserID。
+    void PersistColumnOrder(AppContext& ctx) {
+        ImGuiTable* table = ImGui::GetCurrentTable();
+        if (table == nullptr) return;
+        int byDisplay[ui::kProcColSlots] = {};
+        for (int slot = 0; slot < ui::kProcColSlots; ++slot) {
+            const int order = table->Columns[slot].DisplayOrder;
+            if (order < 0 || order >= ui::kProcColSlots) return;  // 异常：不写
+            byDisplay[order] = ui::ProcColumnUserId(slot);
+        }
+        const std::wstring s = ui::ProcColumnOrderToCfg(byDisplay, ui::kProcColSlots);
+        if (s.empty() || s == colOrderLastSaved_) return;
+        if (ImGui::GetTime() - lastWidthSave_ < 1.0) return;  // 与列宽同节拍
+        colOrderLastSaved_ = s;
+        ctx.cfg.SetString(L"colOrder", s);
     }
 
     void ReflectPersistedSortOnce() {
@@ -1188,7 +1268,10 @@ private:
         ImGui::TableNextRow();
 
         // 名称 + 行交互（选择、双击、右键菜单）。
-        ImGui::TableNextColumn();
+        // P1②：列可拖动重排 —— 行单元格一律用 TableSetColumnIndex(槽位)
+        // 定位，与显示顺序解耦（TableNextColumn 会跟随当前显示序，重排后
+        // 数据会串列）。
+        ImGui::TableSetColumnIndex(0);
         // F4#4: 树形模式名称列缩进 depth*12px + 「└」连接符（根行无缩进）。
         if (depth > 0) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
@@ -1221,18 +1304,18 @@ private:
         }
         DrawContextMenu(ctx, p);
 
-        ImGui::TableNextColumn(); ImGui::Text("%u", p.key.pid);
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatPercent(p.cpuPercent)));
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatBytes(p.privateWorkingSet)));
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatBytes(p.commitBytes)));
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatRate(p.diskBytesPerSec)));
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatRate(p.netBytesPerSec)));
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatNumber(p.pageFaultsPerSec)));
-        ImGui::TableNextColumn(); ImGui::Text("%u", p.handles);
-        ImGui::TableNextColumn(); ImGui::Text("%u", p.threads);
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(U8(FormatNumber(p.contextSwitchesPerSec)));
-        ImGui::TableNextColumn(); DrawBadges(p);
-        ImGui::TableNextColumn(); DrawDescription(p);
+        ImGui::TableSetColumnIndex(1); ImGui::Text("%u", p.key.pid);
+        ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(U8(FormatPercent(p.cpuPercent)));
+        ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(U8(FormatBytes(p.privateWorkingSet)));
+        ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(U8(FormatBytes(p.commitBytes)));
+        ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(U8(FormatRate(p.diskBytesPerSec)));
+        ImGui::TableSetColumnIndex(6); ImGui::TextUnformatted(U8(FormatRate(p.netBytesPerSec)));
+        ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(U8(FormatNumber(p.pageFaultsPerSec)));
+        ImGui::TableSetColumnIndex(8); ImGui::Text("%u", p.handles);
+        ImGui::TableSetColumnIndex(9); ImGui::Text("%u", p.threads);
+        ImGui::TableSetColumnIndex(10); ImGui::TextUnformatted(U8(FormatNumber(p.contextSwitchesPerSec)));
+        ImGui::TableSetColumnIndex(11); DrawBadges(p);
+        ImGui::TableSetColumnIndex(12); DrawDescription(p);
         ImGui::PopID();
         ImGui::PopID();
     }
@@ -1885,6 +1968,13 @@ private:
     float widths_[kColCount] = {};  // 固定：像素宽；拉伸：权重
     double lastWidthSave_ = 0.0;
     uint64_t appliedResetGen_ = 0;  // H-A: 已应用的「恢复默认列宽」世代号
+    // P1②：列显示顺序持久化（cfg "colOrder"，UserID 逗号串按显示位置）。
+    // pending = 待应用到 ImGui 表（每个表格 id 世代只应用一次）；lastSaved =
+    // 最近一次写盘的顺序串（拖动重排后 ~1Hz 比对写回）。
+    int colOrderPending_[ui::kProcColSlots] = {};
+    bool colOrderPendingValid_ = false;
+    uint64_t colOrderAppliedGen_ = 0;
+    std::wstring colOrderLastSaved_;
 
     uint64_t lastTickId_ = 0;
     std::string filterUtf8_;
@@ -2009,9 +2099,11 @@ public:
         // P3 任务二：页面区宽度 > 1200 时两列网格，否则单列铺满（块按序流入）。
         const bool twoCol = ImGui::GetWindowWidth() > 1200.0f;
         const float cellW = twoCol ? (avail.x - spacing) * 0.5f : avail.x;
-        const float barsH = ImGui::GetFrameHeightWithSpacing() * 2.0f + 8.0f;
-        const float plotH = std::max(120.0f, (avail.y - barsH - spacing) * 0.5f);
-        const float plotHz = std::max(200.0f, plotH * 1.8f);  // 放大 = 全宽双高
+        // P1④：图表块高下限按布局缩放（FramePadding 等样式缩放已随 DrawShell
+        // 生效 → barsH 随行高自动放大；这里的常量下限与间距再显式缩放）。
+        const float barsH = ImGui::GetFrameHeightWithSpacing() * 2.0f + ui3::Scaled(8.0f);
+        const float plotH = std::max(ui3::Scaled(120.0f), (avail.y - barsH - spacing) * 0.5f);
+        const float plotHz = std::max(ui3::Scaled(200.0f), plotH * 1.8f);  // 放大 = 全宽双高
 
         // 块标题行：显隐复选框 + 放大/还原按钮；放大态追加「跟随最新」
         // 复选与「回到最新」按钮（Phase B §2.3 状态机的 UI 侧）。
@@ -2613,6 +2705,50 @@ private:
         }
     }
 
+    // P1③：GPU 适配器/进程明细表列宽持久化（netcol_gpuadapters_*/netcol_gpuprocs_*，
+    // 登记见 ThemeCfg.h::NetColTableSpecs）。与 Pages3.cpp 的 NetColWidths 同一
+    // 模式（该助手在本编译单元的匿名命名空间内不可跨 TU 复用 —— 两处实现都
+    // 只经 NetColCfgKey 产键，键名契约由 selftest 钉死）。liveCtx 为空（离屏
+    // smoke 尾帧）时退回默认宽，仅跳过持久化。
+    struct GpuColCache {
+        float w[4] = {};
+        bool loaded = false;
+        uint64_t loadedGen = 0;  // V29-P1-1：布局重置代际失效
+    };
+    static std::map<std::string, GpuColCache>& GpuColCaches() {
+        static std::map<std::string, GpuColCache> m;
+        return m;
+    }
+    static float* GpuColWidths(const char* table, const float* defaults) {
+        GpuColCache& c = GpuColCaches()[table];
+        const uint64_t gen = ui3::LayoutResetGeneration();
+        if (!c.loaded || c.loadedGen != gen) {
+            c.loaded = true;
+            c.loadedGen = gen;
+            for (int i = 0; i < 4; ++i) c.w[i] = defaults[i];
+            if (std::shared_ptr<AppContext> app = Ui().liveCtx) {
+                for (int i = 0; i < 4; ++i) {
+                    c.w[i] = static_cast<float>(
+                        app->cfg.GetDouble(ui3::NetColCfgKey(table, i), defaults[i]));
+                }
+            }
+        }
+        return c.w;
+    }
+    static void GpuColSaveWidths(const char* table, const bool* persistMask) {
+        ImGuiTable* t = ImGui::GetCurrentTable();
+        std::shared_ptr<AppContext> app = Ui().liveCtx;
+        if (t == nullptr || !app) return;
+        GpuColCache& c = GpuColCaches()[table];
+        for (int i = 0; i < 4; ++i) {
+            if (!persistMask[i]) continue;
+            const float w = t->Columns[i].WidthGiven;
+            if (w <= 0.01f || w == c.w[i]) continue;
+            c.w[i] = w;
+            app->cfg.SetDouble(ui3::NetColCfgKey(table, i), static_cast<double>(w));
+        }
+    }
+
     static void DrawGpuBlockBody(const Snapshot& snap) {
         if (snap.sys.gpus.empty()) {
             // 诚实的空态：首个 tick 未到，或没有适配器
@@ -2620,13 +2756,18 @@ private:
                                U8(L"暂无 GPU 数据（等待采集，或本机无适配器）"));
             return;
         }
-        if (ImGui::BeginTable("gpuadapters", 4, ImGuiTableFlags_RowBg |
+        // P1③：适配器明细可拖宽 + cfg 持久化（适配器名列为拉伸列）。
+        static constexpr float kDefA[4] = {2.4f, 72.0f, 92.0f, 92.0f};
+        static constexpr bool kPersistA[4] = {false, true, true, true};
+        float* wa = GpuColWidths("gpuadapters", kDefA);
+        if (ImGui::BeginTable("gpuadapters", 4, ImGuiTableFlags_Resizable |
+                                                   ImGuiTableFlags_RowBg |
                                                    ImGuiTableFlags_BordersInnerH |
                                                    ImGuiTableFlags_SizingFixedFit)) {
-            ImGui::TableSetupColumn(U8(L"适配器"), ImGuiTableColumnFlags_WidthStretch, 2.4f);
-            ImGui::TableSetupColumn(U8(L"利用率"), ImGuiTableColumnFlags_WidthFixed, 72.0f);
-            ImGui::TableSetupColumn(U8(L"显存已用"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
-            ImGui::TableSetupColumn(U8(L"显存总量"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableSetupColumn(U8(L"适配器"), ImGuiTableColumnFlags_WidthStretch, wa[0]);
+            ImGui::TableSetupColumn(U8(L"利用率"), ImGuiTableColumnFlags_WidthFixed, wa[1]);
+            ImGui::TableSetupColumn(U8(L"显存已用"), ImGuiTableColumnFlags_WidthFixed, wa[2]);
+            ImGui::TableSetupColumn(U8(L"显存总量"), ImGuiTableColumnFlags_WidthFixed, wa[3]);
             ImGui::TableHeadersRow();
             for (const GpuAdapterInfo& a : snap.sys.gpus) {
                 ImGui::TableNextRow();
@@ -2645,18 +2786,24 @@ private:
                                               ? FormatBytes(a.memTotal)
                                               : std::wstring(L"—")));
             }
+            GpuColSaveWidths("gpuadapters", kPersistA);
             ImGui::EndTable();
         }
         const std::vector<GpuProcRow> top = TopGpuProcs(snap, 5);
         if (!top.empty()) {
             ImGui::TextDisabled("%s", U8(L"按进程 GPU 占用（Top 5，跨适配器合计）"));
-            if (ImGui::BeginTable("gpuprocs", 4, ImGuiTableFlags_RowBg |
+            // P1③：GPU 进程明细可拖宽 + cfg 持久化（进程名列拉伸，不持久化）。
+            static constexpr float kDefP[4] = {2.4f, 72.0f, 92.0f, 92.0f};
+            static constexpr bool kPersistP[4] = {false, true, true, true};
+            float* wp = GpuColWidths("gpuprocs", kDefP);
+            if (ImGui::BeginTable("gpuprocs", 4, ImGuiTableFlags_Resizable |
+                                                     ImGuiTableFlags_RowBg |
                                                      ImGuiTableFlags_BordersInnerH |
                                                      ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, 2.4f);
-                ImGui::TableSetupColumn(U8(L"利用率"), ImGuiTableColumnFlags_WidthFixed, 72.0f);
-                ImGui::TableSetupColumn(U8(L"专用显存"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
-                ImGui::TableSetupColumn(U8(L"共享显存"), ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                ImGui::TableSetupColumn(U8(L"进程"), ImGuiTableColumnFlags_WidthStretch, wp[0]);
+                ImGui::TableSetupColumn(U8(L"利用率"), ImGuiTableColumnFlags_WidthFixed, wp[1]);
+                ImGui::TableSetupColumn(U8(L"专用显存"), ImGuiTableColumnFlags_WidthFixed, wp[2]);
+                ImGui::TableSetupColumn(U8(L"共享显存"), ImGuiTableColumnFlags_WidthFixed, wp[3]);
                 ImGui::TableHeadersRow();
                 for (const GpuProcRow& r : top) {
                     ImGui::TableNextRow();
@@ -2674,6 +2821,7 @@ private:
                     ImGui::TextUnformatted(U8(r.shared > 0 ? FormatBytes(r.shared)
                                                            : std::wstring(L"—")));
                 }
+                GpuColSaveWidths("gpuprocs", kPersistP);
                 ImGui::EndTable();
             }
         }
@@ -2806,6 +2954,10 @@ void RequestOpenAppearance() {
     Ui().appearanceOpened = false;
 }
 
+// P1④：实现位于 DrawToolbar 前（外观模态与工具条共用两个入口）。
+void ApplyOneClickLayout(AppContext& ctx);
+void ResetLayout(AppContext& ctx);
+
 void DrawAppearanceModal(AppContext& ctx) {
     if (Ui().appearanceOpenRequested) {
         if (!ImGui::IsPopupOpen("##appearance")) {
@@ -2860,10 +3012,24 @@ void DrawAppearanceModal(AppContext& ctx) {
     DrawAppearancePanel(ctx);  // H-A(Phase-6): 选图/关闭/遮罩（实时生效）/性能提示
 
     ImGui::Separator();
+    // P1④：一键优化布局（分辨率/PPI → 布局缩放；详见 ApplyOneClickLayout）。
+    if (ImGui::Button(U8(L"一键优化布局"))) ApplyOneClickLayout(ctx);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"按当前分辨率与系统 DPI 自动缩放：区域高度、表格行高、"
+                                   L"间距与图表高度（等效工具条上的同名按钮）"));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"重置布局"))) ResetLayout(ctx);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"清除布局缩放、列顺序、进程表/网络表列宽与图表放大，"
+                                   L"恢复默认布局"));
+    }
+    ImGui::Separator();
     if (ImGui::Button(U8(L"恢复默认列宽"))) {
         // 键清单登记见 ui3::ColWidthCfgKeys()（app/ui3/ThemeCfg.h，与
         // ProcessesPage::PersistWidths 写入一一对应）。
         ui3::SoftDeleteColWidthKeys(ctx.cfg);
+        ctx.cfg.SetString(L"colOrder", L"");  // P1②：恢复默认列宽同时重置列顺序
         const int removed = ui3::StripColWidthKeysFromFile(ConfigPath(), false);
         ++Ui().colWidthResetGen;  // 进程页下一帧重置 widths_ 并换代表格 id
         PushToast(Notification::Kind::JobDone,
@@ -3049,6 +3215,43 @@ void DrawCompatDiagModal(AppContext& ctx) {
     ImGui::EndPopup();
 }
 
+// ===========================================================================
+// P1④：一键优化布局 / 重置布局。
+// 「一键优化布局」：读主视口 WorkSize（工作区高度）与窗口 DPI（Win32
+// GetDpiForWindow；vendored ImGui 1.92.9 无 PlatformMonitorDpi 等 DPI API，
+// PlatformHandleRaw 即 HWND），经 ui3::LayoutScaleFromEnv（纯函数，策略见
+// PageLayout.h：分辨率因子与 DPI 因子取 max，钳 [1.0, 2.0]）算缩放系数，
+// 应用到：PageLayout 各区域定高基准（Scaled）、表格行高与 FramePadding 等
+// 样式（DrawShell 每帧自基准重算）、图表块高下限（PerfPage）。
+// 「重置布局」：软删除 + 从 config.json 剔除布局键（layoutScale/colOrder/
+// colW_*/netcol_*/perfZoom），缩放槽回 1，进程表换代丢弃 ImGui 记忆的旧列宽。
+// ===========================================================================
+void ApplyOneClickLayout(AppContext& ctx) {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float dpi = 96.0f;  // 缺省 100%（PlatformHandleRaw 非 HWND / 调用过早）
+    if (const HWND hwnd = static_cast<HWND>(vp->PlatformHandleRaw); hwnd != nullptr) {
+        if (const UINT d = GetDpiForWindow(hwnd); d > 0) dpi = static_cast<float>(d);
+    }
+    const float scale = ui3::LayoutScaleFromEnv(vp->WorkSize.y, dpi);
+    ui3::SetLayoutScale(scale);
+    ctx.cfg.SetDouble(L"layoutScale", static_cast<double>(scale));
+    PushToast(Notification::Kind::JobDone,
+              Fmt(L"已按当前分辨率/PPI 优化布局（缩放 ×{:.2f}；可用外观中的"
+                  L"「重置布局」还原）",
+                  scale));
+}
+
+void ResetLayout(AppContext& ctx) {
+    ui3::SoftDeleteLayoutKeys(ctx.cfg);
+    const int removed = ui3::StripLayoutKeysFromFile(ConfigPath());
+    ui3::NotifyLayoutReset();   // V29-P1-1：网络/GPU 列宽缓存按代际失效
+    ui3::SetLayoutScale(1.0f);  // 下一帧 DrawShell 按缩放=1 重算样式
+    ++Ui().colWidthResetGen;    // 进程表换代：丢弃 ImGui 记忆的列宽/列序
+    PushToast(Notification::Kind::JobDone,
+              removed < 0 ? std::wstring(L"已重置布局（配置文件格式异常，部分键重启后生效）")
+                          : Fmt(L"已重置布局（清除 {} 项布局设置）", removed));
+}
+
 void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     (void)snap;
     const float barH = ImGui::GetFrameHeight() + 6.0f;
@@ -3115,6 +3318,14 @@ void DrawToolbar(AppContext& ctx, const Snapshot& snap) {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s", U8(L"主题（深色/浅色/跟随系统）、表格列宽与自定义壁纸"));
     }
+    // P1④: 「一键优化布局」—— 按当前分辨率/PPI 自动缩放布局，免手动拖拽。
+    // 外观模态内有同名入口；「重置布局」也在外观模态（低频操作不入工具条）。
+    ImGui::SameLine();
+    if (ImGui::Button(U8(L"一键优化布局"))) ApplyOneClickLayout(ctx);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", U8(L"按当前分辨率与系统 DPI 自动缩放布局：区域高度、"
+                                   L"表格行高、间距与图表高度"));
+    }
     // A1: 「关于」按钮 -> 关于模态（ui::OpenAbout 一次性标志，DrawAboutUi 消费）。
     // 按钮矩形发布进 AboutAutotestState（--autotest about 驱动瞄准真实渲染
     // 的按钮）；每帧重置，只有本帧真实提交过才有效（V19-P2-2 同规则）。
@@ -3171,32 +3382,65 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
         ui::PipeSlotWidth(pipeW, sp, csvTextW),
     };
 
+    // P1①（用户报告「完整采集模式…与相邻槽位叠在一起」）根因：锚点绘制后用
+    // GetCursorPosX() 采集槽位起点 —— ImGui 的 ItemSize 在条目绘制完成后把
+    // CursorPos.x 重置回行首（imgui.cpp），该值恒为 ≈WindowPadding.x，与锚点
+    // 真实末端无关，定宽槽全部压在锚点文本上（降级原因越长叠得越明显）。
+    // 修复契约（StatusLayout.h）：
+    //   1. 锚点末端 = 起点 + 锚点文本实测宽（AnchorEndX），绝不读回光标；
+    //   2. 降级原因按可用宽截断加「…」（EllipsizeTextUtf8），截断预算给
+    //      首个槽位留位（内容右缘 - 起点 - 首槽宽 - 间距）；悬停 tooltip
+    //      显示完整原因（完整信息另有兼容模式说明模态）；
+    //   3. 无降级时只有紧凑「完整模式」徽标，原因槽消失不占位；
+    //   4. 右段装箱的 leftFlowEndX 用同一套显式推算值（不再读光标），
+    //      任何原因长度下左段与右段/槽位互不重叠。
+    const float anchorStartX = ImGui::GetCursorPosX();  // 行首（窗口内边距处）
+    float leftEndX = anchorStartX;  // 左段流程末端（含锚点/暂停/各槽，喂右段）
+    char anchorBuf[512];
     {   // 锚点段（必显）：采集模式（降级时给原因；维护轮 10：可点击打开说明模态）。
         if (snap.degraded) {
-            const char* mode =
+            // 截断预算：内容右缘 - 锚点起点 - 首槽宽 - 间距（首槽保底可见）。
+            float budget = contentRightX - anchorStartX - slotW[0] - sp;
+            // 极窄窗口保底：至少保住「兼容模式：…」标签（放不下的槽交给
+            // LayoutFlowSlots 依约隐藏，绝不因预算为负而丢失模式指示）。
+            const float minBudget =
+                ImGui::CalcTextSize(U8(L"兼容模式：")).x + ImGui::CalcTextSize("\xE2\x80\xA6").x;
+            if (budget < minBudget) budget = minBudget;
+            const char* full =
                 U8(Fmt(L"兼容模式：{}",
                        snap.degradeReason.empty() ? std::wstring(L"采集能力受限")
                                                   : snap.degradeReason));
-            ImGui::TextColored(ColWarn(), "%s", mode);
+            ui::EllipsizeTextUtf8(full, budget, measure, anchorBuf,
+                                  sizeof(anchorBuf));
+            ImGui::TextColored(ColWarn(), "%s", anchorBuf);
+            const float anchorEnd =
+                ui::AnchorEndX(anchorStartX, ImGui::CalcTextSize(anchorBuf).x);
+            leftEndX = anchorEnd;
             // 维护轮 10：可点击 -> 兼容模式说明模态（每帧渲染，见 RequestOpenCompatDiag）。
             if (ImGui::IsItemHovered()) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                ImGui::SetTooltip("%s", U8(L"点击查看兼容模式说明与逐项自检结果"));
+                // P1①：tooltip 带完整未截断原因（超长自动换行）。
+                ImGui::SetTooltip("%s  ▸%s", U8(L"点击查看兼容模式说明与逐项自检结果"),
+                                  full);
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) RequestOpenCompatDiag();
             }
         } else {
             ImGui::TextDisabled("%s", U8(L"完整模式"));
+            leftEndX =
+                ui::AnchorEndX(anchorStartX, ImGui::CalcTextSize(U8(L"完整模式")).x);
         }
     }
-    // P2-3（F2 评审）：暂停采集需要全局指示（用户动作可见性切换，宽度恒定）。
+    // P2-3（F2 评审）：暂停采集需要全局指示（宽度恒定）。显式定位在锚点
+    // 末端 + 间距（SameLine 偏移与槽位坐标同系），此后槽位起点同步右移。
     if (Ui().paused) {
-        ImGui::SameLine();
+        ImGui::SameLine(leftEndX + sp);
         ImGui::TextColored(ColWarn(), "%s", U8(L"[已暂停]"));
+        leftEndX += sp + ImGui::CalcTextSize(U8(L"[已暂停]")).x;
     }
 
     // 锚点之后布固定槽位（降级原因文本只在模式切换时变化 —— 状态变化而非
     // 逐帧数据变化，槽起点随之一次性移动是可接受的）。
-    const float slotsStartX = ImGui::GetCursorPosX();
+    const float slotsStartX = leftEndX + sp;
     float slotX[4] = {};
     const int firstBadSlot = ui::LayoutFlowSlots(slotsStartX, sp, contentRightX, slotW, 4, slotX);
     const auto drawSlotText = [pipeW, sp](float x, const char* text) {
@@ -3208,7 +3452,10 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     {   // 槽 0：采集 p95（定宽数字文本，钳制见 FormatSlotMs）。
         char p95Buf[48];
         ui::FormatSlotMs(p95Buf, ui::kP95Prefix, ctx.collect.TickP95Ms(), ui::kMsSuffix);
-        if (0 < firstBadSlot) drawSlotText(slotX[0], p95Buf);
+        if (0 < firstBadSlot) {
+            drawSlotText(slotX[0], p95Buf);
+            leftEndX = slotX[0] + slotW[0];
+        }
     }
     {   // 槽 1：操作队列（忙=计数 / 闲=「操作队列空闲」，槽宽取两者上限）。
         const size_t pending = ctx.jobs.PendingCount();
@@ -3227,18 +3474,23 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
             } else {
                 ImGui::TextDisabled("%s", queueBuf);
             }
+            leftEndX = slotX[1] + slotW[1];
         }
     }
     {   // 槽 2：进程数。
         char procsBuf[48];
         ui::FormatSlotCount(procsBuf, ui::kProcsPrefix,
                             static_cast<unsigned long long>(snap.procs.size()));
-        if (2 < firstBadSlot) drawSlotText(slotX[2], procsBuf);
+        if (2 < firstBadSlot) {
+            drawSlotText(slotX[2], procsBuf);
+            leftEndX = slotX[2] + slotW[2];
+        }
     }
     // 槽 3：CSV 记录状态（记录中才绘制；悬停显示文件路径）。
     bool csvDrawn = false;
     if (ui3::SharedPerfCsv().Active() && 3 < firstBadSlot) {
         drawSlotText(slotX[3], U8(L"● 记录 CSV"));
+        leftEndX = slotX[3] + slotW[3];
         csvDrawn = true;
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("%s", U8(ui3::SharedPerfCsv().Path()));
@@ -3254,6 +3506,7 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
             if (ui::FlowSegmentFits(noteX, contentRightX, ImGui::CalcTextSize(note).x)) {
                 ImGui::SameLine(noteX);
                 ImGui::TextColored(ImVec4(0.60f, 0.62f, 0.68f, 1.0f), "%s", note);
+                leftEndX = noteX + ImGui::CalcTextSize(note).x;
             }
         }
     }
@@ -3261,7 +3514,7 @@ void DrawStatusBar(AppContext& ctx, const Snapshot& snap) {
     // 槽宽全部为常量上限（热键标签恒定；徽标取两种文案较宽者；帧耗时取
     // 数字样本上限）——LayoutHeaderRight 的坐标因此逐帧恒定。
     {
-        const float leftEnd = ImGui::GetCursorPosX();  // 左段流程结束（窗口坐标）
+        const float leftEnd = leftEndX;  // 左段流程末端（P1①：显式推算，不读光标）
         const float frameH = ImGui::GetFrameHeight();
         const float hotkeyW = frameH + st.ItemInnerSpacing.x +
                               ImGui::CalcTextSize(U8(L"全局热键 Ctrl+Alt+M")).x;
@@ -3387,6 +3640,26 @@ void DrawShell(AppContext& ctx) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
+    // P1④：布局缩放 —— 会话首帧从 cfg 恢复（「一键优化布局」写入），
+    // 之后每帧自 Theme 基准值重算样式（绝不累计；基准与 Theme.cpp
+    // ApplyLayout 同源：FramePadding (8,4)、ItemSpacing (8,6)）。缩放=1 时
+    // 写入的值与基准逐位一致（Scaled 恒等），布局与旧版完全相同。
+    {
+        static bool scaleLoaded = false;
+        if (!scaleLoaded) {
+            scaleLoaded = true;
+            ui3::SetLayoutScale(
+                static_cast<float>(ctx.cfg.GetDouble(L"layoutScale", 1.0)));
+        }
+        const float s = ui3::LayoutScale();
+        ImGuiStyle& st = ImGui::GetStyle();
+        st.FramePadding = ImVec2(ui3::Scaled(8.0f), ui3::Scaled(4.0f));
+        st.ItemSpacing = ImVec2(ui3::Scaled(8.0f), ui3::Scaled(6.0f));
+        st.ItemInnerSpacing = ImVec2(ui3::Scaled(6.0f), ui3::Scaled(6.0f));
+        st.CellPadding = ImVec2(ui3::Scaled(4.0f), ui3::Scaled(2.0f));
+        st.IndentSpacing = ui3::Scaled(20.0f);
+        (void)s;
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 4.0f));
     // R-Fix Bug2 根因修复：壁纸绘制在视口背景绘制列表里（main.cpp，位于一切
     // 普通窗口之下），而「##approot」是覆盖整个视口的普通窗口 —— 主题给它

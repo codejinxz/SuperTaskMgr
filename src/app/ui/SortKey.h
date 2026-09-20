@@ -8,6 +8,7 @@
 //  - 不可得指标（NaN / kUnavailU64）在两个方向上都恒排最后
 //  - 两个方向都以 pid 升序破平
 #include <cstdint>
+#include <string>
 #include "core/ProcData.h"
 
 namespace stm {
@@ -132,6 +133,89 @@ inline bool SortLess(const ProcInfo& a, const ProcInfo& b, SortColumn c, bool de
     const int r = CompareColumnRaw(a, b, c);
     if (r != 0) return desc ? r > 0 : r < 0;
     return a.key.pid < b.key.pid;
+}
+
+// ---------------------------------------------------------------------------
+// P1②：进程表列 UserID / 显示顺序持久化（纯函数，selftest 共用）。
+// 背景：进程表加 ImGuiTableFlags_Reorderable 后，表头可拖动重排 —— 排序
+// 回调（SortSpecs）与列宽/顺序持久化绝不能按**显示序**映射，否则拖动后
+// 全部错位。契约：
+//   - TableSetupColumn 一律按**槽位序**（0..kProcColSlots-1）提交，UserID
+//     即槽位值；widths_[slot] / "colW_"+SortColumnId(slot) 键槽与 UserID
+//     一一对应，与显示顺序解耦（ImGui 的 Columns[i] 也按提交序索引）。
+//   - 排序回调只认 specs->Specs[0].ColumnUserID（ProcColumnFromUserId）。
+//   - 显示顺序（拖动结果）持久化在 cfg "colOrder"：UserID 逗号串，按显示
+//     位置排列；启动时经 ProcColumnOrderFromCfg 校验为合法排列后恢复。
+// ---------------------------------------------------------------------------
+inline constexpr int kProcColUserIdBadges = static_cast<int>(SortColumn::Count);      // 11
+inline constexpr int kProcColUserIdDesc = static_cast<int>(SortColumn::Count) + 1;    // 12
+inline constexpr int kProcColSlots = static_cast<int>(SortColumn::Count) + 2;         // 13
+
+// 槽位 -> UserID（恒等；显式函数使映射关系在调用点可读）。
+inline int ProcColumnUserId(int slot) { return slot; }
+
+// UserID 是否为可排序列（徽标/描述不可排序，表头 NoSort）。
+inline bool ProcColumnIsSortableUserId(int userId) {
+    return userId >= 0 && userId < static_cast<int>(SortColumn::Count);
+}
+
+// UserID -> SortColumn；徽标/描述/越界返回 false（排序回调据此忽略）。
+inline bool ProcColumnFromUserId(int userId, SortColumn* out) {
+    if (!ProcColumnIsSortableUserId(userId)) return false;
+    if (out != nullptr) *out = static_cast<SortColumn>(userId);
+    return true;
+}
+
+// colOrder 值 → cfg 文本（UserID 逗号串，按显示位置排列）。
+inline std::wstring ProcColumnOrderToCfg(const int* userIds, int count) {
+    std::wstring s;
+    if (userIds == nullptr || count != kProcColSlots) return s;
+    for (int i = 0; i < count; ++i) {
+        if (i > 0) s += L',';
+        s += std::to_wstring(userIds[i]);
+    }
+    return s;
+}
+
+// 解析 colOrder 文本 → 按显示位置的 UserID 数组。
+// 返回写入的个数（= kProcColSlots）；任何形态错误（个数/越界/重复/非排列）
+// 返回 -1，调用方保持默认顺序（绝不应用半途而废的顺序）。
+inline int ProcColumnOrderFromCfg(const wchar_t* s, int* outUserIds, int cap) {
+    if (s == nullptr || outUserIds == nullptr || cap < kProcColSlots) return -1;
+    int seen[kProcColSlots] = {};
+    int n = 0;
+    const wchar_t* p = s;
+    while (*p != L'\0') {
+        if (*p == L',') return -1;          // 空字段
+        long v = 0;
+        int digits = 0;
+        while (*p >= L'0' && *p <= L'9') {
+            v = v * 10 + (*p - L'0');
+            if (v > kProcColSlots) return -1;  // 早停：必越界
+            ++digits;
+            ++p;
+        }
+        if (digits == 0) return -1;
+        if (n >= kProcColSlots) return -1;      // 字段过多
+        if (v >= kProcColSlots || seen[v] != 0) return -1;  // 越界/重复
+        seen[v] = 1;
+        outUserIds[n++] = static_cast<int>(v);
+        if (*p == L',') {
+            ++p;
+            if (*p == L'\0') return -1;         // 尾逗号
+        } else if (*p != L'\0') {
+            return -1;                          // 非数字非逗号
+        }
+    }
+    if (n != kProcColSlots) return -1;          // 字段不足
+    return n;
+}
+
+// 默认显示顺序（恒等排列）写入 out，返回个数。
+inline int ProcColumnDefaultOrder(int* outUserIds, int cap) {
+    if (outUserIds == nullptr || cap < kProcColSlots) return -1;
+    for (int i = 0; i < kProcColSlots; ++i) outUserIds[i] = ProcColumnUserId(i);
+    return kProcColSlots;
 }
 
 }  // namespace ui

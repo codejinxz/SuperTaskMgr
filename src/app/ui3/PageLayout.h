@@ -30,6 +30,68 @@
 namespace stm {
 namespace ui3 {
 
+// ---- P1④：运行时布局缩放（「一键优化布局」）--------------------------------
+// 需求：按当前分辨率/PPI 一键缩放布局（区域定高、表格行高与 FramePadding、
+// 图表块高等），免去手动拖拽。契约：
+//   - 缩放槽是进程级单槽（函数内 static，UI 单线程访问）；默认 1.0。
+//   - Scaled(base) = base * 缩放；缩放=1.0f 时与原编译期常量**逐位一致**
+//    （浮点乘 1.0 是恒等），selftest 有回归断言。
+//   - 缩放策略（LayoutScaleFromEnv，纯函数）：
+//       分辨率因子（按主视口工作区高度）：≥2000px（4K 级）→ 1.30；
+//       ≥1300px（1440p 级）→ 1.15；其余（1080p 及以下）→ 1.0。
+//       DPI 因子 = dpi / 96（96 = 100%；144（150% 缩放）→ 1.5）。
+//       取两者**最大值**而非乘积：Windows 显示缩放通常同时推高分辨率与
+//       DPI，取 max 已足够补偿；乘积会双重放大（4K+150% → 2.6）。
+//       结果钳制到 [1.0, 2.0]，非法输入（0/负/NaN）按缺失处理回退 1.0。
+inline float& LayoutScaleRef() {
+    static float s = 1.0f;
+    return s;
+}
+
+inline float LayoutScale() { return LayoutScaleRef(); }
+
+// 设置运行时缩放；返回实际生效值（钳制 [1.0, 2.0]，非法输入回 1.0）。
+inline float SetLayoutScale(float s) {
+    if (!(s > 0.0f)) s = 1.0f;  // 0/负/NaN 防御
+    if (s < 1.0f) s = 1.0f;
+    if (s > 2.0f) s = 2.0f;
+    LayoutScaleRef() = s;
+    return s;
+}
+
+// 基准值 × 运行时缩放。scale=1 时与原常量逐位一致（回归断言钉死）。
+inline float Scaled(float base) { return base * LayoutScaleRef(); }
+
+inline float LayoutScaleFromEnv(float workH, float dpi) {
+    // 分辨率因子。
+    float res = 1.0f;
+    if (workH > 0.0f) {
+        if (workH >= 2000.0f) res = 1.30f;
+        else if (workH >= 1300.0f) res = 1.15f;
+    }
+    // DPI 因子（96 = 100%）；缺失/非法按 96 处理。
+    float dpiF = 1.0f;
+    if (dpi > 0.0f) dpiF = dpi / 96.0f;
+    float s = res > dpiF ? res : dpiF;
+    if (!(s > 0.0f)) s = 1.0f;  // NaN 防御
+    if (s < 1.0f) s = 1.0f;
+    if (s > 2.0f) s = 2.0f;
+    return s;
+}
+
+// ---- P1⑤：定高区内容不足时收缩到内容高 ------------------------------------
+// 用户报告「传感器页底部有一个白色块」：##sensorgroups 定高 Child（上限
+// 600px）在分组内容不足时露出大片空白底。收缩规则（纯）：
+//   - contentH 合法且小于 region → 返回 contentH（空白消失；本区位于页尾，
+//     其下无内容，收缩不影响任何区外元素的 y 坐标 —— 顶栏固定契约不破）；
+//   - contentH ≥ region（或 contentH 非法/未知 ≤0/NaN，如首帧未测得）→
+//     返回 region（内容超出时维持定高滚动，M2 语义不变）。
+inline float FixedRegionShrinkToContent(float regionH, float contentH) {
+    if (!(regionH > 0.0f)) return contentH > 0.0f ? contentH : 0.0f;
+    if (!(contentH > 0.0f)) return regionH;  // 未知内容：维持定高
+    return contentH < regionH ? contentH : regionH;
+}
+
 // ---- 网络页：适配器卡区 ----------------------------------------------------
 
 // 适配器定高卡区的默认高度（约 200px；窗口极矮时退化为可用高度，
@@ -112,6 +174,27 @@ inline float SensorGroupsRegionHeight(float availBelowChrome) {
     if (!(h > 0.0f)) h = kSensorGroupsMinHeight;  // 0/负/NaN 防御
     if (h > kSensorGroupsMaxHeight) h = kSensorGroupsMaxHeight;
     if (h < kSensorGroupsMinHeight) h = kSensorGroupsMinHeight;
+    return h;
+}
+
+// M2 常量的缩放版（P1④；调用方用本函数替代直接使用常量）：
+// 先按缩放折算可用高度，走同一纯函数（退化/钳制语义不变），再还原。
+// scale=1 时与原函数逐位一致（回归断言钉死）。
+inline float AdapterRegionHeightScaled(float pageAvailY, float scale) {
+    if (!(scale > 0.0f)) return AdapterRegionHeight(pageAvailY);
+    return AdapterRegionHeight(pageAvailY / scale) * scale;
+}
+
+inline float SensorGroupsRegionHeightScaled(float availBelowChrome, float scale) {
+    if (!(scale > 0.0f)) return SensorGroupsRegionHeight(availBelowChrome);
+    float h = SensorGroupsRegionHeight(availBelowChrome / scale) * scale;
+    // 缩放 > 1 时下限（240*scale）可能越过可用高度：钳回可用高度 —— 定高区
+    // 绝不放大父级。scale == 1 时不钳制，与原函数逐位一致（含「极矮窗口
+    // 接受父级滚动条」的已声明降级，ui_m2_test 契约）。
+    if (scale > 1.0f && availBelowChrome > 0.0f && h > availBelowChrome) {
+        h = availBelowChrome;
+    }
+    if (!(h > 0.0f)) h = SensorGroupsRegionHeight(availBelowChrome);
     return h;
 }
 

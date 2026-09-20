@@ -24,6 +24,7 @@
 #include "ops/SingleInstance.h"
 #include "ops/StartupOps.h"
 #include "core/Privilege.h"
+#include <algorithm>
 #include <memory>
 #include <shellapi.h>
 #include <string>
@@ -479,7 +480,21 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     }
 
     if (hasSession && session.winW > 100 && session.winH > 100) {
-        MoveWindow(win.Hwnd(), session.winX, session.winY, session.winW, session.winH, FALSE);
+        // V30-P2-4：恢复的窗口矩形钳制到最近显示器工作区——显示器拔出/分辨率
+        // 降低后，旧坐标可能整窗落屏外且托盘无法移回。
+        RECT r{session.winX, session.winY,
+               session.winX + session.winW, session.winY + session.winH};
+        const HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(mon, &mi)) {
+            const LONG maxLeft = mi.rcWork.right - 120;   // 至少露出一部分可抓取
+            const LONG maxTop = mi.rcWork.bottom - 80;
+            r.left = std::clamp(r.left, mi.rcWork.left, std::max(mi.rcWork.left, maxLeft));
+            r.top = std::clamp(r.top, mi.rcWork.top, std::max(mi.rcWork.top, maxTop));
+            r.right = r.left + session.winW;
+            r.bottom = r.top + session.winH;
+        }
+        MoveWindow(win.Hwnd(), r.left, r.top, r.right - r.left, r.bottom - r.top, FALSE);
     }
 
     // 帧循环：按垂直同步节拍；采集在独立线程进行。
@@ -593,9 +608,13 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmdShow) {
     if (smokeFrames == 0 && autotestMode.empty()) {
         SaveSessionFromCtx(*ctx, win.Hwnd());  // 窗口矩形/页面/选择的交接
         ctx->cfg.Save(ConfigPath());
-        // H-A: 「恢复默认列宽」把 colW_* 软删除为 ""，Save 会把空值写回 —— 这里
-        // 按值过滤剔除，保证重启后配置文件不再残留这些键（重新调过的真实宽度保留）。
-        ui3::StripColWidthKeysFromFile(ConfigPath(), /*onlyEmptyValues=*/true);
+        // H-A: 「恢复默认列宽」/「重置布局」把布局键软删除为 ""，Save 会把空值
+        // 写回 —— 这里按值过滤剔除（colW_*/netcol_* 前缀 + layoutScale/colOrder/
+        // perfZoom 精确键），保证重启后 config.json 不再残留这些键
+        //（重新调过的真实宽度/缩放值保留）。V29-P1-2：范围扩到全部布局键。
+        ui3::StripCfgKeysFromFile(ConfigPath(), {"colW_", "netcol_"},
+                                  {"layoutScale", "colOrder", "perfZoom"},
+                                  /*onlyEmptyValues=*/true);
     }
     tray.Remove();
     ui3::GcHotkeyUnbindWindow();   // F4#10: 退出反注册热键
