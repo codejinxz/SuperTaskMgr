@@ -7,3 +7,17 @@ vcpkg_installed/
 *.ilk
 *.obj
 *.log
+
+# 第三方安装包（Npcap 免费版许可禁止再分发，不得入库；按需从 npcap.com 下载）
+redist/
+*.exe.bak
+
+# 图标生成器产物（可由 scripts/make_logo.bat 重新生成）
+tools/gen_logo.exe
+tools/*.obj
+assets/preview_*.png
+
+# 构建/验证日志与临时产物
+build_log*.txt
+*_selftest*.json
+*.new
