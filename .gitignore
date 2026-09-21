@@ -21,3 +21,7 @@ assets/preview_*.png
 build_log*.txt
 *_selftest*.json
 *.new
+imgui.ini
+dev/
+selftest*.json
+build_*_selftest.json
