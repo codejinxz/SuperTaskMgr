@@ -12,8 +12,8 @@
 | 版本变更记录 | [../CHANGELOG.md](../CHANGELOG.md) |
 | 如何贡献（规范 / 提交约定 / PR 清单 / 红线） | [../CONTRIBUTING.md](../CONTRIBUTING.md) |
 | 安全模型与漏洞报告 | [../SECURITY.md](../SECURITY.md) |
-| 51 份过程记录 + 6 份调研怎么读 | [README.md](README.md)（文档索引） |
-| 历史设计与每轮决策的原始过程 | [phase/01_架构设计文档.md](phase/01_架构设计文档.md) 及 [phase/](phase/) 全部报告 |
+| 5 份设计规格 + 6 份调研怎么读 | [README.md](README.md)（文档索引） |
+| 历史设计与每轮决策的原始过程 | [phase/01_架构设计文档.md](phase/01_架构设计文档.md) 及 [archive/](archive/) 下的阶段/维护/评审报告（索引见 [archive/README.md](archive/README.md)） |
 
 ---
 
@@ -28,7 +28,7 @@
    build\Release\SuperTaskMgr.exe --smoke 150         :: 期望 exit 0
    ```
 2. **读 [ARCHITECTURE.md](ARCHITECTURE.md)**（一页纸的当前架构）——特别是 §5 破坏性操作协议、§8 关键决策、§10 扩展点。
-3. **要改某功能前**，先在 `docs/phase/` **grep 该模块名**，读该主题近几轮的历史评审记录（例如改图表先读 `08_chart_design.md` + `13_review_V27.md`）。**很多坑已经踩过并记录了修法**，这是本仓最高价值的历史资产。
+3. **要改某功能前**，先在 `docs/archive/` **grep 该模块名**，读该主题近几轮的历史评审记录（例如改图表先读 `phase/08_chart_design.md` + `archive/reviews/13_review_V27.md`）。**很多坑已经踩过并记录了修法**，这是本仓最高价值的历史资产。
 4. **动任何涉及进程的代码前**，先确认 §2.1 的进程身份不变量。
 5. 需要了解某块代码在哪，查 §5 模块地图。
 
@@ -103,7 +103,7 @@ build\Release\SuperTaskMgr.exe --autotest dialogclick     :: 六条全 exit 0
 ### 4.4 v1.0.0 转接时的验证快照
 
 - Release / Debug 双配置 **0 错误 0 警告**。
-- `stm_selftest` **176/176 连续两轮通过**（最近一次权威记录见 [phase/16_review_V34.md](phase/16_review_V34.md) §"测试与采样执行记录"）。
+- `stm_selftest` **176/176 连续两轮通过**（最近一次权威记录见 [archive/reviews/16_review_V34.md](archive/reviews/16_review_V34.md) §"测试与采样执行记录"）。
 - `--smoke 150` 与六条 `--autotest` 在同一份源码上的最近一轮已全 PASS（见 V34 报告）。
 - V34 评审发现的 **P1-N1（重置布局漏 U1 新增的 `netAdapterH`/`netmonH` 两键）已在源码中修复**（`ui3/ThemeCfg.h` 的 `LayoutResetExactKeys` 已含两键并通知布局重置代际）——接手时如重跑 `ui_p1_test`，注意该用例的清单断言已同步。
 
@@ -149,7 +149,7 @@ build\Release\SuperTaskMgr.exe --autotest dialogclick     :: 六条全 exit 0
 8. LpcIO 芯片表扩展（SMU/EC 类）。
 9. 若干维持的历史 P2：netcol 加载宽度无合理域钳制、重置布局后表头排序箭头丢失、一键布局跨屏 DPI 取样、字体不随 DPI 缩放（设计口径需明示）。
 
-（更完整的逐轮遗留见 [phase/](phase/) 各维护报告末节。）
+（更完整的逐轮遗留见 [archive/reports/](archive/reports/) 各维护报告末节。）
 
 ### 6.2 用户待办（转接时未完成）
 

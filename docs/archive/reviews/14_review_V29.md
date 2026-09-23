@@ -85,4 +85,4 @@
 ## 备注
 
 - `Pages3.new`（仓库根，0 字节，2026-09-18）为历史遗留空文件，非本轮产物，建议清理（不计入 P 级）。
-- 本报告为唯一新增文件：`docs/phase/14_review_V29.md`。
+- 本报告为唯一新增文件：`docs/archive/reviews/14_review_V29.md`。

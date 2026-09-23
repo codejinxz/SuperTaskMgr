@@ -3,6 +3,8 @@
 > 审计人：审阅者 C｜日期：2026-09-23｜范围：`D:\coding_files\memory` 全仓非源码条目
 > 方法：`ls -A` 全量 + `git ls-files`（527 条）+ `du -sh` 体积 + 引用关系 grep + 敏感信息扫描
 > 说明：本文件仅给出判定与命令；**未删除任何文件、未执行任何 git 操作**。执行由集成者按清单决策。
+>
+> **执行状态（2026-09-23 收尾）**：§3.1 方案 A 已落地——46 份过程产物已归档至 `docs/archive/reviews/`（35 份）与 `docs/archive/reports/`（11 份），`docs/phase/` 顶层保留 5 份设计规格，新增索引 `docs/archive/README.md`；本文件中指向已移动文件的路径引用已同步更新为 `docs/archive/...`。§1.2 所称 `docs/README.md` / `docs/ARCHITECTURE.md`「缺失」亦已由并行 agent 补齐。
 
 ---
 
@@ -191,7 +193,7 @@ captures/
 3. `docs/phase` 700K 中 608K（87%）为 46 份过程产物 —— 采纳 §3.1 后 `docs/` 由 828K 降至约 220K。
 
 **文档内部一致性**
-1. `docs/phase/16_review_V34.md:5/85/94` 与 `docs/phase/13_维护报告.md:15` 仍写 `redist/npcap-1.89.exe`、"手动双击 `redist\npcap-1.89.exe` 默认安装" —— **该路径已不存在**（合规删除后）。属历史记录，若采方案 A 归档即隔离；若保留在 `docs/phase` 顶层，建议在文首加"（历史记录：`redist/` 已按许可移除，抓包请自行从 npcap.com 下载）"。
+1. `docs/archive/reviews/16_review_V34.md:5/85/94` 与 `docs/archive/reports/13_维护报告.md:15` 仍写 `redist/npcap-1.89.exe`、"手动双击 `redist\npcap-1.89.exe` 默认安装" —— **该路径已不存在**（合规删除后）。属历史记录，已随方案 A 归档至 `docs/archive/`，与 `docs/phase/` 顶层隔离。
 2. `README.md` 与 `docs/HANDOVER.md` 对评审份数表述不一（README "34 份独立评审" vs HANDOVER "35 份评审/复核" vs 实际 32 review_V+2 verify_V+1 review_F=35）—— 建议统一为"35 份评审/复核（V1–V34 + F2/V14/V23）"。
 3. `docs/HANDOVER.md:5` 提交数（19）与实际（23）不符。
 4. `third_party/build_log.txt` 与 vendoring 无关，是**唯一的内容损坏文件**（乱码）。
@@ -206,7 +208,7 @@ captures/
 | Token/密钥（`ghp_`/`sk-`/`AKIA`/`xox`/`BEGIN * PRIVATE KEY`/`password=`） | **零命中** |
 | 私人邮箱（`@gmail/@qq/@163` 等） | 零命中 |
 | 机器名/用户名硬编码 | 零命中（`admin` 仅出现为 git 提交 author 与文件系统所属，不在文件内容中） |
-| 本地绝对路径（**文档内**） | **2 处命中，低危**：`docs/phase/04_review_V13.md:3`（`D:\coding_files\memory 全仓`）、`docs/phase/07_review_V18.md:40`（`D:\tmp_stm_v18\probe.cpp`）。建议归档/删除；若保留，将路径脱敏为 `<repo>` |
+| 本地绝对路径（**文档内**） | **2 处命中，低危**：`docs/archive/reviews/04_review_V13.md:3`（`D:\coding_files\memory 全仓`）、`docs/archive/reviews/07_review_V18.md:40`（`D:\tmp_stm_v18\probe.cpp`）。已随方案 A 归档，与 `docs/phase/` 顶层隔离 |
 | 本地绝对路径（**源码内**） | 6 处命中，**无害**：`src/selftest/{wallpaper,control,ui_memcleanup,ui_gc}_test.cpp` 中的 `D:\pics\wall.png`、`D:\games\game.exe` 等均为**测试夹具字符串**，非真实隐私；`src/app/ui3/Wallpaper.cpp` 为路径解析逻辑分支。无需处理 |
 | 其他（日志中的隐私值、设备 ID、序列号） | 零命中；文档中出现的 `stm_f1_autotest`、`autotest_result.log` 为自测产物名，非敏感 |
 

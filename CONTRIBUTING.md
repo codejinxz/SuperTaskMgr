@@ -156,4 +156,4 @@ fix(ui): 确认模态改为每帧 BeginPopupModal，修复点击被吞
 
 - 有疑问或功能建议：开 [Issue](https://github.com/codejinxz/SuperTaskMgr/issues)。
 - 安全相关问题：见 **[SECURITY.md](SECURITY.md)**（请勿在公开 Issue 中报告漏洞细节）。
-- 想了解某个模块的历史决策与踩过的坑：在 `docs/phase/` 中按模块名 grep 历史评审记录（很多坑已记录修法）。
+- 想了解某个模块的历史决策与踩过的坑：在 `docs/archive/` 中按模块名 grep 历史评审记录（很多坑已记录修法）。

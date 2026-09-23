@@ -329,7 +329,7 @@ src/app (UI 壳 + 各页)  ──>  src/ops (破坏性操作/提权/签名/服�
 ## 文档
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — 当前有效的架构说明（分层 / 线程 / 契约 / 数据流 / 关键决策 / 扩展点）。
-- **[docs/README.md](docs/README.md)** — 文档索引（导航 `docs/phase/` 的 51 份阶段报告与 `docs/research/` 的 6 份技术调研）。
+- **[docs/README.md](docs/README.md)** — 文档索引（导航 `docs/phase/` 的 5 份设计规格、`docs/archive/` 的 46 份过程记录与 `docs/research/` 的 6 份技术调研）。
 - **[docs/HANDOVER.md](docs/HANDOVER.md)** — 面向新接手开发者/AI agent 的交接文档（索引 + 增量信息）。
 - **[CHANGELOG.md](CHANGELOG.md)** — 版本变更记录（Keep a Changelog 格式）。
 
