@@ -27,9 +27,14 @@ bool CanElevate() {
 }
 
 bool RelaunchAsAdmin(const std::wstring& args) {
+    // 关键：ExePath() 返回临时 std::wstring，若写成 se.lpFile = ExePath().c_str()
+    // 则临时对象在本语句结束即销毁 —— lpFile 成为悬垂指针。ShellExecuteExW 在
+    // 之后的语句才执行，读到的是已被复用的堆内存（表现为间歇性的
+    // "Windows 找不到文件 'xxxx'"）。必须让字符串活到调用结束。
+    const std::wstring exePath = ExePath();
     SHELLEXECUTEINFOW se{sizeof(se)};
     se.lpVerb = L"runas";
-    se.lpFile = ExePath().c_str();
+    se.lpFile = exePath.c_str();
     se.lpParameters = args.c_str();
     se.nShow = SW_SHOWNORMAL;
     if (!ShellExecuteExW(&se)) {
