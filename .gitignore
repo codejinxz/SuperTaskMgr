@@ -25,3 +25,6 @@ imgui.ini
 dev/
 selftest*.json
 build_*_selftest.json
+
+# 发布产物（构建输出，通过 GitHub Release 分发，不入库）
+release/
